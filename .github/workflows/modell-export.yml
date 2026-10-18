@@ -1,0 +1,90 @@
+name: KI-Modelle exportieren
+
+# Baut die EdgeTAM-Teile, die Qualcomm nicht fertig anbietet (Memory-Attention und
+# Memory-Encoder), prüft sie Zahl für Zahl gegen das Original von Meta und legt sie
+# im Release „modelle-<Version>“ ab. Die Test-App lädt sie beim Bauen von dort.
+# Ändert sich am Export etwas Grundlegendes, steigt MODELLE_VERSION, damit jede
+# Version der Test-App genau weiß, welche Modelle sie enthält.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['tools/export/**', '.github/workflows/modell-export.yml']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: modell-export
+  cancel-in-progress: false
+
+env:
+  MODELLE_VERSION: '1'
+  EDGETAM_COMMIT: 7711e012a30a2402c4eaab637bdb00a521302c91
+  EDGETAM_SHA256: ed2d4850b8792c239689b043c47046ec239b6e808a3d9b6ae676c803fd8780df
+  QNN_VERSION: '2.50.0'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  export:
+    name: Exportieren und prüfen
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Projekt holen
+        uses: actions/checkout@v7
+
+      - name: EdgeTAM holen
+        run: |
+          git clone -q https://github.com/facebookresearch/EdgeTAM.git edgetam
+          git -C edgetam checkout -q "$EDGETAM_COMMIT"
+          echo "$EDGETAM_SHA256  edgetam/checkpoints/edgetam.pt" | sha256sum -c -
+
+      - name: Werkzeuge installieren
+        run: |
+          python3 -m venv venv
+          . venv/bin/activate
+          pip install -q --upgrade pip
+          pip install -q torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu \
+            || pip install -q torch==2.13.0 torchvision==0.28.0
+          pip install -q -r tools/export/requirements.txt
+          python --version
+
+      - name: Exportieren und prüfen
+        run: |
+          . venv/bin/activate
+          mkdir -p out
+          python -I tools/export/edgetam_export.py --repo edgetam \
+            --checkpoint edgetam/checkpoints/edgetam.pt --out out 2>&1 | tee out/export-protokoll.txt
+          pip freeze > out/pakete.txt
+          (cd out && sha256sum *.tflite *.json > pruefsummen.txt && cat pruefsummen.txt)
+
+      # Die Lizenztexte der Qualcomm-Bibliotheken, die in der App stecken, zum Nachlesen.
+      - name: Lizenzen der Qualcomm-Bibliotheken lesen
+        continue-on-error: true
+        run: |
+          set +e
+          command -v pdftotext >/dev/null || sudo apt-get install -y -qq poppler-utils >/dev/null
+          central=https://repo1.maven.org/maven2/com/qualcomm/qti
+          mkdir -p lic
+          for a in qnn-runtime qnn-litert-delegate; do
+            curl -fsSL -o "lic/$a.aar" "$central/$a/$QNN_VERSION/$a-$QNN_VERSION.aar"
+            unzip -o -q "lic/$a.aar" 'LICENSE.pdf' 'NOTICE.txt' -d "lic/$a"
+            { echo "===== $a $QNN_VERSION: LICENSE.pdf"; pdftotext -layout "lic/$a/LICENSE.pdf" - ; } >> out/lizenzen-qualcomm.txt
+          done
+          [ -f lic/qnn-runtime/NOTICE.txt ] && { echo "===== qnn-runtime: NOTICE.txt"; cat lic/qnn-runtime/NOTICE.txt; } >> out/lizenzen-qualcomm.txt
+          wc -c out/lizenzen-qualcomm.txt
+
+      - name: Veröffentlichen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="modelle-$MODELLE_VERSION"
+          notes="EdgeTAM-Teile für den KI-Chip, Version $MODELLE_VERSION (EdgeTAM ${EDGETAM_COMMIT:0:7}). Automatisch erstellt und gegen das Original geprüft."
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --prerelease --latest=false \
+            --target "${{ github.sha }}" --title "KI-Modelle $MODELLE_VERSION" --notes "$notes"
+          gh release upload "$tag" out/* --clobber
