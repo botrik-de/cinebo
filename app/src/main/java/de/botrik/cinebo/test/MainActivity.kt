@@ -58,6 +58,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.Observer
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CancellationException
@@ -140,6 +141,7 @@ class MainActivity : ComponentActivity() {
     private var hintOverride: String? = null
     private var events: JSONArray? = null
     private var recordingSince = 0L
+    private var testStartedAt = 0L
     private var lastScreen = ""
     private var resetArmed = false
 
@@ -250,6 +252,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         logEvent("im Hintergrund")
+        // Ohne sichtbare App filmt die Kamera nicht weiter: Schnell- und Dauertest halten an,
+        // statt mit falschen Werten weiterzulaufen. Nur der Klapptest läuft weiter, weil
+        // Klappen die App kurz in den Hintergrund schicken kann; genau das soll er messen.
+        if (running != null && running != "klapp") requestStop()
         super.onStop()
     }
 
@@ -274,8 +280,7 @@ class MainActivity : ComponentActivity() {
             cameraLoading = false
             try {
                 provider = future.get()
-                showPreviewOnly()
-                setStatus(Phase.IDLE, "Bereit")
+                if (showPreviewOnly()) setStatus(Phase.IDLE, "Bereit")
             } catch (e: Exception) {
                 setStatus(Phase.ERROR, "Kamera ließ sich nicht öffnen: ${e.message ?: e.javaClass.simpleName}")
             }
@@ -304,12 +309,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun showPreviewOnly() {
-        try {
-            bind(null)
-        } catch (e: Exception) {
-            setStatus(Phase.ERROR, "Vorschau ließ sich nicht starten: ${e.message ?: e.javaClass.simpleName}")
-        }
+    /** Nur die Vorschau; gibt zurück, ob sie läuft. Ein Fehler steht danach in der Statuszeile. */
+    private fun showPreviewOnly(): Boolean = try {
+        bind(null)
+        true
+    } catch (e: Exception) {
+        setStatus(Phase.ERROR, "Vorschau ließ sich nicht starten: ${e.message ?: e.javaClass.simpleName}")
+        false
     }
 
     private suspend fun waitForStreaming(timeoutMs: Long) {
@@ -333,7 +339,12 @@ class MainActivity : ComponentActivity() {
     // ---------------------------------------------------------------- Tests
 
     private fun onMainButton() {
-        if (running != null) requestStop() else runQuickTest()
+        if (running == null) {
+            runQuickTest()
+        } else if (SystemClock.elapsedRealtime() - testStartedAt > 1500) {
+            // Ein versehentlicher Doppeltipp beim Starten soll den Test nicht gleich stoppen.
+            requestStop()
+        }
     }
 
     private fun requestStop() {
@@ -351,6 +362,8 @@ class MainActivity : ComponentActivity() {
         stopRequested = false
         failed = false
         doneText = null
+        testStartedAt = SystemClock.elapsedRealtime()
+        archiveErrors()
         backDuringTest.isEnabled = true
         job = lifecycleScope.launch {
             try {
@@ -373,14 +386,27 @@ class MainActivity : ComponentActivity() {
                 hintOverride = null
                 backDuringTest.isEnabled = false
                 store.save(report)
-                showPreviewOnly()
-                if (!failed) {
-                    val done = doneText
-                    if (stopRequested) setStatus(Phase.IDLE, "Gestoppt")
-                    else if (done != null) setStatus(Phase.DONE, done)
+                // Wurde die Ansicht inzwischen geschlossen, nichts mehr an der Kamera ändern.
+                if (lifecycle.currentState.isAtLeast(Lifecycle.State.CREATED)) {
+                    val previewOk = showPreviewOnly()
+                    if (!failed && previewOk) {
+                        val done = doneText
+                        if (stopRequested) setStatus(Phase.IDLE, "Gestoppt")
+                        else if (done != null) setStatus(Phase.DONE, done)
+                    }
+                    render()
                 }
-                render()
             }
+        }
+    }
+
+    /** Fehler aus früheren Läufen bleiben im Bericht, die Fehlerzeile zeigt aber nur neue. */
+    private fun archiveErrors() {
+        for ((key, archive) in listOf("letzterFehler" to "fruehereFehler", "letzterAbsturz" to "fruehereAbstuerze")) {
+            if (!report.has(key)) continue
+            val list = report.optJSONArray(archive) ?: JSONArray().also { report.put(archive, it) }
+            list.put(report.get(key))
+            report.remove(key)
         }
     }
 
@@ -439,15 +465,17 @@ class MainActivity : ComponentActivity() {
 
     private fun runFoldTest() = launchTest {
         val fps = bestFps()
-        hintOverride = if (resources.configuration.smallestScreenWidthDp >= 600) {
-            "Klapp das Handy während der Aufnahme zu, warte drei Sekunden und klapp es wieder auf."
+        // Die Anweisung zum Klappen erscheint erst, wenn die Aufnahme wirklich läuft.
+        hintOverride = "Die Aufnahme startet gleich. Noch nicht klappen, warte auf den nächsten Hinweis."
+        val foldHint = if (resources.configuration.smallestScreenWidthDp >= 600) {
+            "Jetzt zuklappen, drei Sekunden warten und wieder aufklappen."
         } else {
-            "Klapp das Handy während der Aufnahme auf, warte drei Sekunden und klapp es wieder zu."
+            "Jetzt aufklappen, drei Sekunden warten und wieder zuklappen."
         }
         running = "klapp"
         render()
         reveal("klapp")
-        putTest("klapp", record("klapp", fps, FOLD_SECONDS, stabilize = false))
+        putTest("klapp", record("klapp", fps, FOLD_SECONDS, stabilize = false, recordingHint = foldHint))
         doneText = "Klapptest fertig"
     }
 
@@ -504,11 +532,15 @@ class MainActivity : ComponentActivity() {
         fps: Int,
         seconds: Int,
         stabilize: Boolean,
+        recordingHint: String? = null,
         onTick: (Double, RecordingStats?) -> Unit = { _, _ -> }
     ): JSONObject {
         val out = JSONObject()
         out.put("version", appVersion)
         out.put("zeit", nowIso())
+        // Klappen und Lebenszyklus ab dem ersten Moment mitschreiben, auch während die Kamera startet.
+        recordingSince = 0L
+        events = JSONArray()
         out.put(
             "angefragt", JSONObject()
                 .put("groesse", "UHD 16:9")
@@ -531,7 +563,7 @@ class MainActivity : ComponentActivity() {
             bind(videoCapture)
         } catch (e: Exception) {
             out.put("fehler", "Kamera ließ sich so nicht starten: ${e.message ?: e.javaClass.simpleName}")
-            return out
+            return attachEvents(out)
         }
         out.put("kamera", Camera2CameraInfo.from(camera.cameraInfo).cameraId)
         delay(300)
@@ -541,7 +573,7 @@ class MainActivity : ComponentActivity() {
         if (previewSize != null) out.put("vorschau", "${previewSize.width}x${previewSize.height}")
         if (stopRequested) {
             out.put("ende", "gestoppt")
-            return out
+            return attachEvents(out)
         }
 
         val folder = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
@@ -553,8 +585,7 @@ class MainActivity : ComponentActivity() {
         val started = CompletableDeferred<Unit>()
         val finished = CompletableDeferred<VideoRecordEvent.Finalize>()
         var stats: RecordingStats? = null
-        recordingSince = 0L
-        events = JSONArray()
+        frames.reset() // keine Zahlen aus der vorigen Aufnahme, falls diese nie startet
 
         val recording = try {
             var pending = recorder.prepareRecording(this, FileOutputOptions.Builder(file).build())
@@ -576,9 +607,8 @@ class MainActivity : ComponentActivity() {
                 }
             }
         } catch (e: Exception) {
-            events = null
             out.put("fehler", "Aufnahme ließ sich nicht starten: ${e.message ?: e.javaClass.simpleName}")
-            return out
+            return attachEvents(out)
         }
 
         var stoppedByUser = false
@@ -590,13 +620,20 @@ class MainActivity : ComponentActivity() {
             if (started.isCompleted) {
                 val totalMs = seconds * 1000L
                 recBadge.visibility = View.VISIBLE
+                if (recordingHint != null) {
+                    hintOverride = recordingHint
+                    hintText.text = recordingHint
+                }
                 while (!finished.isCompleted) {
                     if (stopRequested) {
                         stoppedByUser = true
                         break
                     }
                     val elapsed = SystemClock.elapsedRealtime() - recordingSince
-                    if (elapsed >= totalMs) break
+                    if (elapsed >= totalMs) {
+                        onTick(elapsed / 1000.0, stats) // letzter Abschnitt, z. B. die Minute 9:30–10:00
+                        break
+                    }
                     val shown = elapsed / 1000
                     recBadge.text = "REC  ${clock(shown)}"
                     setStatus(
@@ -633,9 +670,7 @@ class MainActivity : ComponentActivity() {
         }
         out.put("kameraBilder", frames.toJson())
         out.put("waerme", JSONObject().put("start", heatStart).put("ende", DeviceHeat.read(this)))
-        val log = events
-        events = null
-        if (log != null && log.length() > 0) out.put("ereignisse", log)
+        attachEvents(out)
         if (file.exists() && file.length() > 0) {
             val analysis = try {
                 withContext(Dispatchers.IO) { VideoFileAnalysis.analyze(file, fps) }
@@ -916,13 +951,10 @@ class MainActivity : ComponentActivity() {
         val error = r.optString("fehler")
         if (error.isNotEmpty()) return Mark.FAIL to error
         val list = r.optJSONArray("ereignisse") ?: JSONArray()
-        var screenChanges = 0
+        val screenChanges = screenChanges(r)
         var background = false
         for (i in 0 until list.length()) {
-            when (list.optJSONObject(i)?.optString("art")) {
-                "Bildschirm" -> screenChanges++
-                "im Hintergrund" -> background = true
-            }
+            if (list.optJSONObject(i)?.optString("art") == "im Hintergrund") background = true
         }
         val file = r.optJSONObject("datei")
         val seconds = file?.optDouble("dauerS", 0.0) ?: 0.0
@@ -1017,13 +1049,55 @@ class MainActivity : ComponentActivity() {
     private fun defaultHint(quickDone: Boolean): String {
         val tests = readTests()
         val noMic = if (has(Manifest.permission.RECORD_AUDIO)) "" else " Ohne Mikrofonzugriff laufen die Tests ohne Ton."
+        val quickRedo = listOf("k30", "k60", "stab").firstNotNullOfOrNull { repeatReason(it) }
+        val laterRedo = listOf("klapp", "dauer").firstNotNullOfOrNull { repeatReason(it) }
         return when {
             !has(Manifest.permission.CAMERA) -> "Die Test-App braucht Zugriff auf Kamera und Mikrofon."
             !quickDone -> "Starte den Schnelltest. Er dauert etwa eine Minute: Steckbrief, 4K mit 30 und 60 fps und der Stabilisator.$noMic"
+            quickRedo != null -> quickRedo
             !tests.has("klapp") || !tests.has("dauer") ->
                 "Jetzt Klapptest und Dauertest, beide mit 4K · ${bestFps()}. Danach den Bericht kopieren und mir in den Chat einfügen.$noMic"
+            laterRedo != null -> laterRedo
             else -> "Alles gemessen. Kopiere den Bericht und füge ihn bei mir im Chat ein."
         }
+    }
+
+    /**
+     * Warum ein Test noch einmal laufen sollte, oder null. Ein Fehler, der jedes Mal käme
+     * (etwa eine Einstellung, die die Kamera nicht kann), ist ein Ergebnis und kein Grund.
+     */
+    private fun repeatReason(key: String): String? {
+        val r = readTests().optJSONObject(key) ?: return null
+        if (r.has("ergebnis") || r.has("fehler")) return null
+        val end = r.optString("ende")
+        return when (key) {
+            "klapp" -> when {
+                end == "gestoppt" -> "Der Klapptest wurde gestoppt. Starte ihn bitte noch einmal."
+                screenChanges(r) == 0 ->
+                    "Beim Klapptest wurde kein Klappen erkannt. Starte ihn noch einmal und klapp, sobald der Hinweis erscheint."
+                else -> null
+            }
+            "dauer" -> when (end) {
+                "gestoppt" -> "Der Dauertest wurde vorzeitig gestoppt. Starte ihn bitte noch einmal, er braucht die vollen 10 Minuten."
+                "Kamera wurde geschlossen", "Aufnahme startete nicht" ->
+                    "Der Dauertest brach ab, weil die Kamera geschlossen wurde. Lief die App die ganze Zeit sichtbar, ist das schon ein Ergebnis; sonst wiederhole ihn."
+                else -> null
+            }
+            else -> when (end) {
+                "gestoppt", "Kamera wurde geschlossen", "Aufnahme startete nicht" ->
+                    "Der Schnelltest wurde unterbrochen. Starte ihn bitte noch einmal und lass die App dabei offen."
+                else -> null
+            }
+        }
+    }
+
+    private fun screenChanges(r: JSONObject): Int {
+        val list = r.optJSONArray("ereignisse") ?: return 0
+        var n = 0
+        for (i in 0 until list.length()) {
+            if (list.optJSONObject(i)?.optString("art") == "Bildschirm") n++
+        }
+        return n
     }
 
     // ---------------------------------------------------------------- Oberfläche
@@ -1282,6 +1356,14 @@ class MainActivity : ComponentActivity() {
 
     private fun has(permission: String) =
         ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+
+    /** Hängt die mitgeschriebenen Ereignisse an das Ergebnis und beendet das Mitschreiben. */
+    private fun attachEvents(out: JSONObject): JSONObject {
+        val log = events
+        events = null
+        if (log != null && log.length() > 0) out.put("ereignisse", log)
+        return out
+    }
 
     private fun logEvent(kind: String, details: JSONObject = JSONObject()) {
         val list = events ?: return

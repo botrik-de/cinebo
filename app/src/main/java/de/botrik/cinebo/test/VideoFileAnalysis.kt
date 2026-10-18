@@ -12,7 +12,7 @@ object VideoFileAnalysis {
     fun analyze(file: File, requestedFps: Int): JSONObject {
         val o = JSONObject()
         o.put("angefragteFps", requestedFps)
-        o.put("dateiMB", r1(file.length() / 1048576.0))
+        o.put("dateiMB", r1(file.length() / 1e6))
         val ex = MediaExtractor()
         try {
             ex.setDataSource(file.absolutePath)

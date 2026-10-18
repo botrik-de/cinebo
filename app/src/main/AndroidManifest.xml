@@ -16,7 +16,7 @@
              ob eine laufende Aufnahme das Klappen übersteht. -->
         <activity
             android:name=".MainActivity"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboardHidden|uiMode"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation|uiMode|colorMode|fontScale|fontWeightAdjustment|layoutDirection|locale|touchscreen"
             android:exported="true"
             android:screenOrientation="portrait">
             <intent-filter>
