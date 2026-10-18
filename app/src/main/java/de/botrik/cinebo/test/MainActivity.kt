@@ -944,8 +944,10 @@ class MainActivity : ComponentActivity() {
         }
         val wanted = r.optJSONObject("angefragt")?.optInt("fps", 30) ?: 30
         val fps = file.optDouble("fps")
-        val lost = file.optInt("verloreneBilder")
-        val parts = mutableListOf(sizeText(file), "${de(fps, 1)} fps", lostText(lost))
+        val lost = lostAfterStart(file)
+        val atStart = file.optInt("verloreneBilder") - lost
+        val lostPart = lostText(lost) + if (atStart > 0) " ($atStart beim Start)" else ""
+        val parts = mutableListOf(sizeText(file), "${de(fps, 1)} fps", lostPart)
         if (file.has("mbits")) parts.add("${de(file.optDouble("mbits"), 0)} Mbit/s")
         var mark = if (fps < wanted * 0.95 || lost > 0) Mark.WARN else Mark.OK
         if (wanted >= 60 && fps < 57.0) parts.add("60 fps nicht möglich")
@@ -969,7 +971,7 @@ class MainActivity : ComponentActivity() {
         var mark: Mark
         if (end == null && seconds >= FOLD_SECONDS - 3) {
             parts.add("Aufnahme lief durch")
-            mark = if ((file?.optInt("verloreneBilder") ?: 0) > 0) Mark.WARN else Mark.OK
+            mark = if (file != null && lostAfterStart(file) > 0) Mark.WARN else Mark.OK
         } else {
             parts.add("Aufnahme endete nach ${de(seconds, 0)} s" + if (end != null) ": $end" else "")
             mark = Mark.FAIL
@@ -1037,6 +1039,10 @@ class MainActivity : ComponentActivity() {
         val h = file.optInt("hoehe")
         return if (w > 0 && h > 0) "${max(w, h)} × ${min(w, h)}" else "Größe unbekannt"
     }
+
+    /** Verlorene Bilder ohne die Startlücke; ältere Berichte kennen sie nicht, dann zählt alles. */
+    private fun lostAfterStart(file: JSONObject): Int =
+        if (file.has("verloreneBilderNachStart")) file.optInt("verloreneBilderNachStart") else file.optInt("verloreneBilder")
 
     private fun lostText(n: Int): String = when (n) {
         0 -> "kein Bild verloren"

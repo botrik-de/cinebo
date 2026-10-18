@@ -10,6 +10,7 @@ class FrameStats {
     private var firstTs = 0L
     private var lastTs = 0L
     private var maxGapNs = 0L
+    private var maxGapAtNs = 0L
     private var exposureSumNs = 0L
     private var exposureMaxNs = 0L
     private var isoSum = 0L
@@ -17,7 +18,7 @@ class FrameStats {
 
     @Synchronized
     fun reset() {
-        frames = 0; firstTs = 0; lastTs = 0; maxGapNs = 0
+        frames = 0; firstTs = 0; lastTs = 0; maxGapNs = 0; maxGapAtNs = 0
         exposureSumNs = 0; exposureMaxNs = 0; isoSum = 0; aeRange = ""
     }
 
@@ -28,7 +29,10 @@ class FrameStats {
             firstTs = ts
         } else {
             val gap = ts - lastTs
-            if (gap > maxGapNs) maxGapNs = gap
+            if (gap > maxGapNs) {
+                maxGapNs = gap
+                maxGapAtNs = lastTs - firstTs
+            }
         }
         lastTs = ts
         frames++
@@ -52,6 +56,7 @@ class FrameStats {
             val durS = (lastTs - firstTs) / 1e9
             o.put("fps", r2((frames - 1) / durS))
             o.put("groessteLueckeMs", r2(maxGapNs / 1e6))
+            o.put("groessteLueckeBeiS", r2(maxGapAtNs / 1e9))
             o.put("belichtungMittelMs", r2(exposureSumNs.toDouble() / frames / 1e6))
             o.put("belichtungMaxMs", r2(exposureMaxNs / 1e6))
             o.put("isoMittel", isoSum / frames)

@@ -2,12 +2,16 @@ package de.botrik.cinebo.test
 
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import kotlin.math.roundToInt
 
 /** Zählt in der fertigen MP4-Datei jedes Bild und findet Lücken. */
 object VideoFileAnalysis {
+
+    /** Lücken in der ersten Sekunde gelten als Startlücke. */
+    const val START_WINDOW_S = 1.0
 
     fun analyze(file: File, requestedFps: Int): JSONObject {
         val o = JSONObject()
@@ -67,6 +71,22 @@ object VideoFileAnalysis {
                 o.put("abstandMaxMs", r2(sorted[sorted.size - 1] / 1000.0))
                 o.put("luecken", gaps)
                 o.put("verloreneBilder", lost)
+                // Wo die Lücken liegen: Eine Lücke in der ersten Sekunde entsteht beim Start
+                // der Aufnahme und ist im Video nicht zu sehen; später zählt jede.
+                val where = JSONArray()
+                var lostAfterStart = 0
+                for (i in intervals.indices) {
+                    val gap = intervals[i]
+                    if (gap <= limit) continue
+                    val missing = ((gap / median).roundToInt() - 1).coerceAtLeast(1)
+                    val atS = (times[i] - times[0]) / 1e6
+                    if (atS >= START_WINDOW_S) lostAfterStart += missing
+                    if (where.length() < 30) {
+                        where.put(JSONObject().put("s", r2(atS)).put("ms", r1(gap / 1000.0)).put("bilder", missing))
+                    }
+                }
+                o.put("lueckenBei", where)
+                o.put("verloreneBilderNachStart", lostAfterStart)
                 o.put("mbits", r1(file.length() * 8.0 / durS / 1e6))
             }
         } finally {
