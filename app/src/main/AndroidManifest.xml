@@ -5,6 +5,10 @@
 
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Die KI-Modelle und die QNN-Laufzeit lädt die App einmal selbst, statt sie in der APK mitzuschleppen;
+         von selbst nur im WLAN, im Mobilnetz erst auf Tippen. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <application
         android:allowBackup="false"

@@ -24,26 +24,10 @@ android {
         ndk { abiFilters += "arm64-v8a" }
     }
 
-    // Modelle unkomprimiert, damit sie sich direkt aus der APK in den Speicher abbilden lassen.
-    androidResources {
-        noCompress += "tflite"
-    }
-
     packaging {
         jniLibs {
-            // Der KI-Chip lädt seine Programme (Skel) als Dateien; dafür müssen die
-            // Bibliotheken bei der Installation entpackt werden.
+            // Bibliotheken gepackt in der APK, beim Installieren entpackt: kleinerer Download.
             useLegacyPackaging = true
-            // Nur, was das OPPO Find N6 (Snapdragon 8 Elite Gen 5, Hexagon V81) braucht.
-            // V79 bleibt als Rückfall drin, falls der Chip sich anders meldet.
-            excludes += listOf(
-                "**/libQnnHtpV68Skel.so", "**/libQnnHtpV68Stub.so",
-                "**/libQnnHtpV69Skel.so", "**/libQnnHtpV69Stub.so",
-                "**/libQnnHtpV73Skel.so", "**/libQnnHtpV73Stub.so",
-                "**/libQnnHtpV75Skel.so", "**/libQnnHtpV75Stub.so",
-                "**/libQnnDsp.so", "**/libQnnDspV66Skel.so", "**/libQnnDspV66Stub.so",
-                "**/libQnnGpu.so"
-            )
         }
     }
 
@@ -95,9 +79,10 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
-    // KI: TFLite und Qualcomms QNN-Delegate für den KI-Chip, in der Kombination,
-    // die auch Qualcomms eigene Beispiel-Apps verwenden.
+    // KI: TFLite und Qualcomms QNN-Delegate für den KI-Chip, in der Kombination, die auch
+    // Qualcomms eigene Beispiel-Apps verwenden. Die große QNN-Laufzeit (qnn-runtime, gleiche
+    // Version, QNN_VERSION im Bau-Ablauf) steckt nicht in der APK: Die App lädt sie mit den
+    // Modellen selbst (siehe ModelStore und Npu.loadLibraries).
     implementation("org.tensorflow:tensorflow-lite:2.17.0")
-    implementation("com.qualcomm.qti:qnn-runtime:2.50.0")
     implementation("com.qualcomm.qti:qnn-litert-delegate:2.50.0")
 }

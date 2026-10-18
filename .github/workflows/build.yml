@@ -23,6 +23,10 @@ env:
   CINEBO_VERSION: 0.2.${{ github.run_number }}
   # Welche selbst exportierten EdgeTAM-Teile in die App kommen (Release modelle-<Version>)
   MODELLE_VERSION: '1'
+  # Version von Qualcomms QNN-Laufzeit; muss zum Delegate in app/build.gradle.kts passen
+  QNN_VERSION: '2.50.0'
+  # Größer darf die APK nicht werden; alles Große lädt die App selbst.
+  APK_MAX_MB: '40'
 
 jobs:
   apk:
@@ -42,73 +46,141 @@ jobs:
       - name: Gradle
         uses: gradle/actions/setup-gradle@v6
 
-      # Die Modelle liegen nie im Repo: Qualcomms Modelle kommen von AI Hub, unsere
-      # eigenen EdgeTAM-Teile aus dem Release modelle-<Version> dieses Repos.
-      - name: KI-Modelle holen
+      # Die KI-Modelle und die große QNN-Laufzeit liegen nie im Repo und auch nicht in der APK.
+      # Die Modelle (Qualcomms von AI Hub, unsere EdgeTAM-Teile aus dem Release modelle-<Version>)
+      # landen einmal, für die Übertragung gepackt, im Release ki-modelle-<Satz>. Die QNN-Laufzeit
+      # geben wir nicht weiter (Qualcomms Lizenz erlaubt das nur eingebaut in eine App): Die App
+      # holt Qualcomms Paket selbst von Maven Central und entpackt daraus, was sie braucht. Die
+      # App bekommt nur die Liste mit Adressen, Größen und Prüfsummen und lädt alles selbst, mit
+      # Fortsetzen nach Abbrüchen. Solange sich keine Datei ändert, bleibt der Satz gleich, und
+      # eine neue Test-App lädt nichts neu.
+      - name: KI-Dateien bereitstellen
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          dst=app/src/main/assets/modelle
-          mkdir -p "$dst" dl
-          s3=https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/models
-          curl -fsSL --retry 3 -o dl/depth.zip "$s3/depth_anything_v2/releases/v0.63.0/depth_anything_v2-tflite-float.zip"
-          curl -fsSL --retry 3 -o dl/float.zip "$s3/edgetam/releases/v0.61.0/edgetam-tflite-float.zip"
-          curl -fsSL --retry 3 -o dl/w8a8.zip "$s3/edgetam/releases/v0.61.0/edgetam-tflite-w8a8.zip"
-          for z in depth float w8a8; do unzip -q -o "dl/$z.zip" -d "dl/$z"; done
-          cp dl/depth/*/depth_anything_v2.tflite "$dst/depth_anything_v2.tflite"
-          cp dl/float/*/encoder.tflite "$dst/edgetam_encoder.tflite"
-          cp dl/float/*/video_decoder.tflite "$dst/edgetam_decoder.tflite"
-          cp dl/float/*/memory_encoder.tflite "$dst/edgetam_memory_encoder_qualcomm.tflite"
-          cp dl/w8a8/*/encoder.tflite "$dst/edgetam_encoder_w8a8.tflite"
-          cp dl/w8a8/*/video_decoder.tflite "$dst/edgetam_decoder_w8a8.tflite"
-          cp dl/w8a8/*/memory_encoder.tflite "$dst/edgetam_memory_encoder_w8a8.tflite"
-          rel="https://github.com/${{ github.repository }}/releases/download/modelle-$MODELLE_VERSION"
-          for f in edgetam_memory_attention.tflite edgetam_memory_attention_q4.tflite edgetam_memory_encoder.tflite edgetam_konstanten.json; do
-            curl -fsSL --retry 3 -o "$dst/$f" "$rel/$f"
-          done
-          (cd "$dst" && sha256sum *) | tee modelle-pruefsummen.txt
-          # Jede Datei muss genau die geprüfte sein; sonst bricht der Bau ab.
-          (cd "$dst" && sha256sum -c --quiet "$GITHUB_WORKSPACE/.github/modelle.sha256")
+          set -u
+          # Alles auch in ki-log.txt, damit ein Fehler im Protokoll-Release landet.
+          {
+            roh=dl/ki
+            mkdir -p "$roh"
+            s3=https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/models
+            curl -fsSL --retry 3 -o dl/depth.zip "$s3/depth_anything_v2/releases/v0.63.0/depth_anything_v2-tflite-float.zip"
+            curl -fsSL --retry 3 -o dl/float.zip "$s3/edgetam/releases/v0.61.0/edgetam-tflite-float.zip"
+            curl -fsSL --retry 3 -o dl/w8a8.zip "$s3/edgetam/releases/v0.61.0/edgetam-tflite-w8a8.zip"
+            for z in depth float w8a8; do unzip -q -o "dl/$z.zip" -d "dl/$z"; done
+            cp dl/depth/*/depth_anything_v2.tflite "$roh/depth_anything_v2.tflite"
+            cp dl/float/*/encoder.tflite "$roh/edgetam_encoder.tflite"
+            cp dl/float/*/video_decoder.tflite "$roh/edgetam_decoder.tflite"
+            cp dl/float/*/memory_encoder.tflite "$roh/edgetam_memory_encoder_qualcomm.tflite"
+            cp dl/w8a8/*/encoder.tflite "$roh/edgetam_encoder_w8a8.tflite"
+            cp dl/w8a8/*/video_decoder.tflite "$roh/edgetam_decoder_w8a8.tflite"
+            cp dl/w8a8/*/memory_encoder.tflite "$roh/edgetam_memory_encoder_w8a8.tflite"
+            rel="https://github.com/${{ github.repository }}/releases/download/modelle-$MODELLE_VERSION"
+            for f in edgetam_memory_attention.tflite edgetam_memory_attention_q4.tflite edgetam_memory_encoder.tflite edgetam_konstanten.json; do
+              curl -fsSL --retry 3 -o "$roh/$f" "$rel/$f"
+            done
+            # Qualcomms QNN-Laufzeit für den KI-Chip, genau so, wie die App sie von Maven Central holt.
+            aar="qnn-runtime-$QNN_VERSION.aar"
+            aar_url="https://repo1.maven.org/maven2/com/qualcomm/qti/qnn-runtime/$QNN_VERSION/$aar"
+            qnn_libs="libQnnHtp.so libQnnHtpPrepare.so libQnnSystem.so libQnnHtpV81Stub.so libQnnHtpV81Skel.so libQnnHtpV79Stub.so libQnnHtpV79Skel.so"
+            curl -fsSL --retry 3 -o "dl/$aar" "$aar_url"
+            mkdir -p dl/qnn
+            for f in $qnn_libs; do
+              unzip -q -o -j "dl/$aar" "jni/arm64-v8a/$f" -d dl/qnn
+            done
+            { (cd "$roh" && sha256sum -- *); (cd dl/qnn && sha256sum -- *); (cd dl && sha256sum -- "$aar"); } \
+              | LC_ALL=C sort -k2 > ki-dateien.sha256
+            cat ki-dateien.sha256
+            # Festgeschriebene Dateien müssen genau die geprüften sein; sonst bricht der Bau ab.
+            (cd "$roh" && sha256sum -c --quiet "$GITHUB_WORKSPACE/.github/modelle.sha256")
+
+            # Der Satz heißt nach den Prüfsummen aller fertigen Dateien.
+            satz=$(sha256sum ki-dateien.sha256 | cut -c1-10)
+            tag="ki-modelle-$satz"
+            basis="https://github.com/${{ github.repository }}/releases/download/$tag/"
+            echo "KI_SATZ=$satz" >> "$GITHUB_ENV"
+            vorhanden=$(gh release view "$tag" --json assets --jq '.assets[].name' 2>/dev/null || true)
+            if grep -qx 'liste.json' <<< "$vorhanden"; then
+              echo "KI-Satz $satz liegt schon vollständig im Release $tag."
+            else
+              # shellcheck disable=SC2086
+              python3 .github/ki_dateien.py packen "$roh" dl/laden "$basis" "$satz" \
+                --archiv "dl/$aar" "$aar_url" jni/arm64-v8a $qnn_libs > dl/liste.json
+              gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --prerelease --latest=false \
+                --target "${{ github.sha }}" --title "KI-Modelle für die Test-App ($satz)" \
+                --notes "KI-Modelle der Test-App, für die Übertragung gepackt. Die App lädt sie selbst und prüft jede Datei; liste.json beschreibt den Satz. Die QNN-Laufzeit holt die App direkt von Qualcomm (Maven Central)."
+              gh release upload "$tag" dl/laden/* --clobber
+              # Zuletzt die Liste: Erst mit ihr gilt der Satz als vollständig.
+              gh release upload "$tag" dl/liste.json --clobber
+            fi
+
+            # Alles aus dem Release zurückholen und so prüfen, wie es die App tut.
+            rm -rf dl/release
+            gh release download "$tag" --dir dl/release
+            python3 .github/ki_dateien.py pruefen dl/release/liste.json "$roh" dl/release "$basis" "dl/$aar"
+            mkdir -p app/src/main/assets
+            cp dl/release/liste.json app/src/main/assets/modelle.json
+            python3 .github/ki_dateien.py uebersicht app/src/main/assets/modelle.json | tee ki-dateien.txt
+          } 2>&1 | tee -a ki-log.txt
 
       - name: APK bauen
         shell: bash
         run: ./gradlew :app:assembleRelease --no-daemon --stacktrace 2>&1 | tee build-log.txt
 
-      # Schlägt der Build fehl, liegt das Protokoll als Datei im Release „ci-log“.
+      # Was in der APK steckt und was die App selbst lädt. Danach wacht ki_dateien.py darüber,
+      # dass die APK klein bleibt und jede Bibliothek auf dem Handy findet, was sie braucht.
+      - name: Bau-Info
+        shell: bash
+        run: |
+          {
+            apk=app/build/outputs/apk/release/app-release.apk
+            rm -rf apkx && mkdir -p apkx
+            unzip -q -o "$apk" 'lib/*' -d apkx
+            {
+              echo "CineBo Test $CINEBO_VERSION · Stand ${{ github.sha }} · KI-Satz $KI_SATZ"
+              echo
+              echo "== APK"
+              stat -c '%s Bytes' "$apk"
+              echo
+              echo "== KI-Dateien, die die App beim ersten Start selbst lädt"
+              cat ki-dateien.txt
+              echo
+              echo "== Prüfsummen der fertigen KI-Dateien (sha256)"
+              cat ki-dateien.sha256
+              echo
+              echo "== Bibliotheken: Bytes und Ausrichtung der LOAD-Segmente"
+              for f in apkx/lib/arm64-v8a/*.so dl/qnn/*.so; do
+                case "$f" in apkx/*) wo="APK" ;; *) wo="nachgeladen" ;; esac
+                printf '%s %s %s ' "$(basename "$f")" "$wo" "$(stat -c %s "$f")"
+                readelf -lW "$f" | awk '$1 == "LOAD" {print $NF}' | sort -u | tr '\n' ' '
+                echo
+              done
+            } > bau-info.txt
+            cat bau-info.txt
+            python3 .github/ki_dateien.py apk "$apk" app/src/main/assets/modelle.json "$APK_MAX_MB" dl/qnn
+          } 2>&1 | tee -a pruef-log.txt
+
+      # Schlägt etwas fehl, liegen die Protokolle als Datei im Release „ci-log“.
       - name: Fehlerprotokoll hochladen
         if: failure()
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ ! -f build-log.txt ]; then echo "Kein Protokoll, der Fehler lag vor dem Bauen." > build-log.txt; fi
-          { echo "Lauf ${{ github.run_number }} · Stand ${{ github.sha }}"; echo; cat build-log.txt; } > ci-log.txt
+          {
+            echo "Lauf ${{ github.run_number }} · Stand ${{ github.sha }}"
+            for f in ki-log.txt build-log.txt pruef-log.txt; do
+              if [ -f "$f" ]; then
+                echo
+                echo "== $f"
+                cat "$f"
+              fi
+            done
+          } > ci-log.txt
           gh release view ci-log >/dev/null 2>&1 || gh release create ci-log --prerelease --latest=false \
             --title "Build-Protokoll" --notes "Protokoll des letzten fehlgeschlagenen Builds."
           gh release upload ci-log ci-log.txt --clobber
-
-      # Was in der APK steckt: Prüfsummen der Modelle und wie die Bibliotheken ausgerichtet sind.
-      - name: Bau-Info
-        shell: bash
-        run: |
-          mkdir -p apkx
-          unzip -q -o app/build/outputs/apk/release/app-release.apk 'lib/*' -d apkx
-          {
-            echo "CineBo Test $CINEBO_VERSION · Stand ${{ github.sha }} · Modelle $MODELLE_VERSION"
-            echo
-            echo "== Modelle (sha256)"
-            cat modelle-pruefsummen.txt
-            echo
-            echo "== Bibliotheken: Bytes und Ausrichtung der LOAD-Segmente"
-            for f in apkx/lib/arm64-v8a/*.so; do
-              printf '%s %s ' "$(basename "$f")" "$(stat -c %s "$f")"
-              readelf -lW "$f" | awk '$1 == "LOAD" {print $NF}' | sort -u | tr '\n' ' '
-              echo
-            done
-            echo
-            echo "== APK"
-            stat -c '%s Bytes' app/build/outputs/apk/release/app-release.apk
-          } > bau-info.txt
-          cat bau-info.txt
 
       - name: Als Release veröffentlichen
         shell: bash
@@ -119,5 +191,5 @@ jobs:
           gh release create "test-${{ github.run_number }}" cinebo-test.apk bau-info.txt \
             --target "${{ github.sha }}" \
             --title "CineBo Test $CINEBO_VERSION" \
-            --notes "Testversion $CINEBO_VERSION für das OPPO Find N6: KI-Messung (Stufe 2)." \
+            --notes "Testversion $CINEBO_VERSION für das OPPO Find N6: KI-Messung (Stufe 2). Die KI-Modelle lädt die App beim ersten Start selbst (KI-Satz $KI_SATZ)." \
             --latest

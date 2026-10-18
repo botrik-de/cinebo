@@ -113,12 +113,11 @@ internal class NpuModel private constructor(
     }
 
     companion object {
-        const val FOLDER = "modelle"
 
         fun load(context: Context, asset: String, npu: NpuConfig?, threads: Int = 4): NpuModel {
             val wallStart = System.currentTimeMillis()
             val start = SystemClock.elapsedRealtimeNanos()
-            val model = map(context, "$FOLDER/$asset")
+            val model = map(File(File(context.filesDir, ModelStore.FOLDER), asset))
             val options = Interpreter.Options()
             options.setRuntime(InterpreterApi.Options.TfLiteRuntime.FROM_APPLICATION_ONLY)
             options.setUseNNAPI(false)
@@ -143,18 +142,63 @@ internal class NpuModel private constructor(
             return NpuModel(asset, npu, interpreter, delegate, ms, cached, log)
         }
 
-        private fun map(context: Context, path: String): MappedByteBuffer {
-            context.assets.openFd(path).use { fd ->
-                FileInputStream(fd.fileDescriptor).use { stream ->
-                    return stream.channel.map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
-                }
+        /** Die Modelle liegen nach dem Laden im App-Speicher (siehe [ModelStore]). */
+        private fun map(file: File): MappedByteBuffer {
+            if (!file.exists()) throw IllegalStateException("Modell fehlt: ${file.name}. Die KI-Modelle sind noch nicht geladen.")
+            FileInputStream(file).use { stream ->
+                return stream.channel.map(FileChannel.MapMode.READ_ONLY, 0, file.length())
             }
         }
     }
 }
 
-/** Zugang zum KI-Chip über Qualcomms QNN-Delegate. */
+/**
+ * Zugang zum KI-Chip über Qualcomms QNN-Delegate. In der APK steckt nur der kleine Delegate;
+ * die große QNN-Laufzeit (Laufzeit, Übersetzer, Stub und Skel für den Hexagon-Chip) holt
+ * [ModelStore] direkt aus Qualcomms Paket in den App-Speicher. Vor dem ersten Gebrauch lädt
+ * [loadLibraries] sie, damit QNN sie unter ihrem Namen findet.
+ */
 internal object Npu {
+
+    /**
+     * In dieser Reihenfolge laden: erst, was libQnnHtp.so selbst nachlädt (sie sucht es nur unter
+     * seinem Namen, nicht in ihrem Ordner), dann sie. Der Skel läuft auf dem Chip selbst und
+     * kommt über [QnnDelegate.Options.setSkelLibraryDir] dorthin.
+     */
+    private val LIBRARIES = listOf(
+        "libQnnSystem.so", "libQnnHtpPrepare.so", "libQnnHtpV81Stub.so", "libQnnHtpV79Stub.so", "libQnnHtp.so"
+    )
+
+    /** Nur Rückfall, falls sich der Chip als Hexagon V79 meldet; ein Fehler damit hält nichts auf. */
+    private const val FALLBACK_STUB = "libQnnHtpV79Stub.so"
+
+    @Volatile private var librariesLoaded = false
+    @Volatile private var fallbackError: String? = null
+
+    private fun libDir(context: Context): File = File(context.filesDir, ModelStore.FOLDER)
+
+    /** Lädt die QNN-Bibliotheken aus dem App-Speicher, einmal je Prozess. Wirft bei Fehlern. */
+    @Synchronized
+    fun loadLibraries(context: Context) {
+        if (librariesLoaded) return
+        val dir = libDir(context)
+        for (name in LIBRARIES) {
+            val f = File(dir, name)
+            val optional = name == FALLBACK_STUB
+            if (!f.isFile) {
+                if (optional) continue
+                throw IllegalStateException("QNN-Bibliothek fehlt: $name. Die KI-Modelle sind noch nicht vollständig geladen.")
+            }
+            try {
+                f.setReadOnly() // Android verlangt für nachgeladenen Code schreibgeschützte Dateien
+                System.load(f.absolutePath)
+            } catch (e: Throwable) {
+                if (!optional) throw e
+                fallbackError = e.toString().take(300)
+            }
+        }
+        librariesLoaded = true
+    }
 
     fun cacheDir(context: Context): File = File(context.cacheDir, "qnn").apply { mkdirs() }
 
@@ -179,9 +223,11 @@ internal object Npu {
     }
 
     fun delegate(context: Context, cfg: NpuConfig, token: String): QnnDelegate {
+        loadLibraries(context)
         val o = QnnDelegate.Options()
         o.setBackendType(QnnDelegate.Options.BackendType.HTP_BACKEND)
-        o.setSkelLibraryDir(context.applicationInfo.nativeLibraryDir)
+        o.setLibraryPath(File(libDir(context), "libQnnHtp.so").absolutePath)
+        o.setSkelLibraryDir(libDir(context).absolutePath)
         o.setLogLevel(QnnDelegate.Options.LogLevel.LOG_LEVEL_WARN)
         o.setHtpUseConvHmx(QnnDelegate.Options.HtpUseConvHmx.HTP_CONV_HMX_ON)
         o.setHtpPerformanceMode(
@@ -212,6 +258,7 @@ internal object Npu {
         } catch (_: Exception) {
         }
         try {
+            loadLibraries(context)
             o.put("qnnVersion", QnnDelegate.getVersion().joinToString("."))
             o.put("htpFp16", QnnDelegate.checkCapability(QnnDelegate.Capability.HTP_RUNTIME_FP16))
             o.put("htpQuantisiert", QnnDelegate.checkCapability(QnnDelegate.Capability.HTP_RUNTIME_QUANTIZED))
@@ -223,7 +270,11 @@ internal object Npu {
         File(context.applicationInfo.nativeLibraryDir).listFiles()?.sortedBy { it.name }?.forEach {
             libs.put("${it.name} ${r1(it.length() / 1e6)} MB")
         }
+        libDir(context).listFiles()?.filter { it.name.endsWith(".so") }?.sortedBy { it.name }?.forEach {
+            libs.put("${it.name} ${r1(it.length() / 1e6)} MB (nachgeladen)")
+        }
         o.put("bibliotheken", libs)
+        fallbackError?.let { o.put("rueckfallStubFehler", it) }
         return o
     }
 }

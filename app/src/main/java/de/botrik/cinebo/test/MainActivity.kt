@@ -11,6 +11,8 @@ import android.graphics.drawable.GradientDrawable
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.TotalCaptureResult
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
@@ -141,6 +143,13 @@ class MainActivity : ComponentActivity() {
     private val frames = FrameStats()
     @Volatile private var counting = false
 
+    private val modelStore by lazy { ModelStore(applicationContext) }
+    @Volatile private var modelsOk = false
+    private var downloadJob: Job? = null
+    private var downloadError: String? = null
+    /** Im Mobilnetz lädt die App erst, wenn man tippt (oder sobald WLAN da ist). */
+    private var waitingForWifi = false
+    private val remaining = RemainingTime()
     private val engineLazy = lazy { AiEngine(applicationContext) }
     private val engine by engineLazy
     private val pool = FramePool()
@@ -274,6 +283,8 @@ class MainActivity : ComponentActivity() {
             store.save(report)
         }
         removeOldClips()
+        modelStore.cleanup()
+        modelsOk = modelStore.allReady()
 
         setContentView(buildUi())
         onBackPressedDispatcher.addCallback(this, backDuringTest)
@@ -286,6 +297,90 @@ class MainActivity : ComponentActivity() {
         } else {
             permissionRequest.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
         }
+        if (!modelsOk) startDownload(userAsked = false)
+    }
+
+    // ---------------------------------------------------------------- KI-Modelle laden
+
+    /**
+     * Lädt die KI-Modelle einmal in den App-Speicher; setzt nach Abbrüchen von selbst fort.
+     * Von selbst startet das nur ohne Datenvolumen (WLAN), im Mobilnetz erst auf Tippen.
+     */
+    private fun startDownload(userAsked: Boolean) {
+        if (modelsOk || downloadJob?.isActive == true) return
+        if (!modelStore.hasList) {
+            setStatus(Phase.ERROR, "KI-Modelle: Liste fehlt")
+            render()
+            return
+        }
+        if (!userAsked && onMeteredNetwork()) {
+            waitingForWifi = true
+            setStatus(Phase.IDLE, "KI-Modelle noch nicht geladen")
+            render()
+            return
+        }
+        waitingForWifi = false
+        downloadError = null
+        remaining.reset()
+        val total = modelStore.totalBytes()
+        showDownloadProgress(modelStore.doneBytes(), total, null)
+        downloadJob = lifecycleScope.launch {
+            try {
+                modelStore.download { done, all, retry -> runOnUiThread { showDownloadProgress(done, all, retry) } }
+                modelsOk = modelStore.allReady()
+                if (running == null) {
+                    if (modelsOk) setStatus(Phase.DONE, "KI-Modelle geladen, bereit")
+                    else setStatus(Phase.ERROR, "KI-Modelle unvollständig")
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                downloadError = (e.message ?: e.javaClass.simpleName).take(200)
+                if (running == null) setStatus(Phase.ERROR, "Laden der KI-Modelle unterbrochen")
+            } finally {
+                render()
+            }
+        }
+        render()
+    }
+
+    private fun showDownloadProgress(done: Long, total: Long, retry: ModelStore.Retry?) {
+        if (modelsOk || running != null || total <= 0) return
+        val fraction = (done.toDouble() / total).toFloat()
+        if (retry != null) {
+            remaining.pause()
+            setStatus(Phase.BUSY, "${retry.reason.replaceFirstChar { it.uppercase() }} · neuer Versuch", "in ${retry.inS} s", fraction)
+            return
+        }
+        val left = remaining.update(SystemClock.elapsedRealtime(), done, total)
+        setStatus(Phase.BUSY, "Lädt die KI-Modelle · ${mb(done)} von ${mb(total)} MB", left?.let { remainingText(it) }, fraction)
+    }
+
+    /** Restzeit grob gerundet, damit die Anzeige ruhig bleibt. */
+    private fun remainingText(seconds: Long): String = when {
+        seconds >= 90 -> "noch ${(seconds + 30) / 60} min"
+        seconds >= 10 -> "noch ${(seconds + 4) / 5 * 5} s"
+        else -> "gleich fertig"
+    }
+
+    private fun mb(bytes: Long): String = de(bytes / 1e6, 0)
+
+    /** Mobilnetz oder ein anderes Netz mit Datenvolumen. Ohne Netz gilt das nicht: Dann wartet das Laden von selbst. */
+    private fun onMeteredNetwork(): Boolean = try {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        val caps = cm?.getNetworkCapabilities(cm.activeNetwork)
+        caps != null &&
+            !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) &&
+            !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_TEMPORARILY_NOT_METERED)
+    } catch (_: Exception) {
+        false
+    }
+
+    /** Text des Hauptknopfs, solange die KI-Modelle fehlen. */
+    private fun downloadButtonText(): String = when {
+        downloadJob?.isActive == true -> "KI-Modelle werden geladen …"
+        modelStore.doneBytes() > 0 -> "KI-Modelle weiter laden"
+        else -> "KI-Modelle laden"
     }
 
     override fun onStart() {
@@ -297,6 +392,8 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         logEvent("weiter")
         if (provider == null && !cameraLoading && has(Manifest.permission.CAMERA)) startCamera()
+        // Im Mobilnetz gewartet und jetzt im WLAN: gleich loslegen.
+        if (waitingForWifi && !modelsOk && !onMeteredNetwork()) startDownload(userAsked = false)
     }
 
     override fun onPause() {
@@ -346,7 +443,7 @@ class MainActivity : ComponentActivity() {
             cameraLoading = false
             try {
                 provider = future.get()
-                if (running == null && showPreviewOnly()) setStatus(Phase.IDLE, "Bereit")
+                if (running == null && showPreviewOnly() && modelsOk) setStatus(Phase.IDLE, "Bereit")
             } catch (e: Exception) {
                 setStatus(Phase.ERROR, "Kamera ließ sich nicht öffnen: ${e.message ?: e.javaClass.simpleName}")
             }
@@ -437,6 +534,10 @@ class MainActivity : ComponentActivity() {
     // ---------------------------------------------------------------- Tests
 
     private fun onMainButton() {
+        if (!modelsOk) {
+            startDownload(userAsked = true)
+            return
+        }
         if (running == null) {
             runQuickTest()
         } else if (SystemClock.elapsedRealtime() - testStartedAt > 1500) {
@@ -532,6 +633,7 @@ class MainActivity : ComponentActivity() {
         device.put("waerme", DeviceHeat.read(this))
         DeviceHeat.thresholds(this)?.let { device.put("waermeSchwellen", it) }
         device.put("version", appVersion)
+        device.put("modelle", modelStore.describe())
         device.put("zeit", nowIso())
         report.put("geraet", device)
         val ki = JSONObject().put("version", appVersion).put("zeit", nowIso())
@@ -608,7 +710,7 @@ class MainActivity : ComponentActivity() {
             requestStop()
             return
         }
-        if (running != null) return
+        if (running != null || !modelsOk) return
         launchTest {
             running = "vorschau"
             hintOverride = "Tippe im Kamerabild auf ein Objekt: Die gelbe Markierung folgt ihm. Rechts die Tiefe, hell ist nah."
@@ -1117,6 +1219,7 @@ class MainActivity : ComponentActivity() {
             return Mark.FAIL to "KI-Chip nicht erreichbar: ${it.take(160)}"
         }
         val load = ki()?.optJSONObject("laden") ?: return openRow("kichip")
+        load.optString("fehler").takeIf { it.isNotEmpty() }?.let { return Mark.FAIL to it.take(200) }
         var ok = 0
         var allCached = true
         val errors = mutableListOf<String>()
@@ -1331,6 +1434,18 @@ class MainActivity : ComponentActivity() {
         val tests = readTests()
         val noMic = if (has(Manifest.permission.RECORD_AUDIO)) "" else " Ohne Mikrofonzugriff laufen die Aufnahmen ohne Ton."
         return when {
+            !modelsOk && !modelStore.hasList -> "In dieser Version fehlt die Liste der KI-Modelle. Das ist ein Fehler beim Bauen; " +
+                "bitte sag mir Bescheid."
+            !modelsOk && downloadJob?.isActive == true -> "Die App lädt einmal die KI-Modelle, zusammen ${mb(modelStore.totalBytes())} MB. " +
+                "Lass sie dabei offen. Bricht die Verbindung ab, macht sie von selbst an derselben Stelle weiter. " +
+                "Danach bleiben die Modelle auf dem Handy."
+            !modelsOk && downloadError != null -> "Das Laden der KI-Modelle ist unterbrochen ($downloadError). " +
+                if (modelStore.doneBytes() > 0) "Tippe auf „KI-Modelle weiter laden“, es geht an derselben Stelle weiter."
+                else "Tippe auf „KI-Modelle laden“, um es noch einmal zu versuchen."
+            !modelsOk && waitingForWifi -> "Du bist gerade nicht im WLAN. Die App muss einmal die KI-Modelle laden, zusammen " +
+                "${mb(modelStore.totalBytes())} MB. Im WLAN startet das von selbst; tippe auf „${downloadButtonText()}“, um gleich zu laden."
+            !modelsOk -> "Die App muss einmal die KI-Modelle laden, zusammen ${mb(modelStore.totalBytes())} MB. " +
+                "Tippe auf „${downloadButtonText()}“."
             !has(Manifest.permission.CAMERA) -> "Die Test-App braucht Zugriff auf Kamera und Mikrofon."
             !quickDone -> "Starte den KI-Schnelltest. Er lädt beide KI-Modelle auf den KI-Chip, misst Tempo und Genauigkeit " +
                 "und filmt dann 30 Sekunden in 4K, während beide mitrechnen. Beim ersten Mal dauert das Laden länger; " +
@@ -1367,17 +1482,27 @@ class MainActivity : ComponentActivity() {
         val previewing = running == "vorschau"
         val ready = provider != null
         val quickDone = quickTestDone()
-        mainButton.text = when {
-            busy && !previewing -> "Stopp"
-            quickDone -> "KI-Schnelltest wiederholen"
-            else -> "KI-Schnelltest starten"
+        if (!modelsOk) {
+            mainButton.text = downloadButtonText()
+            mainButton.filled(Palette.text, Palette.background)
+            mainButton.isEnabled = downloadJob?.isActive != true && modelStore.hasList
+            previewButton.text = "KI-Vorschau"
+            previewButton.outlined()
+            previewButton.isEnabled = false
+            longButton.isEnabled = false
+        } else {
+            mainButton.text = when {
+                busy && !previewing -> "Stopp"
+                quickDone -> "KI-Schnelltest wiederholen"
+                else -> "KI-Schnelltest starten"
+            }
+            if (busy && !previewing) mainButton.filled(Palette.red, Color.WHITE) else mainButton.filled(Palette.text, Palette.background)
+            mainButton.isEnabled = (busy && !previewing) || (!busy && ready)
+            previewButton.text = if (previewing) "Vorschau beenden" else "KI-Vorschau"
+            if (previewing) previewButton.filled(Palette.green, Palette.background) else previewButton.outlined()
+            previewButton.isEnabled = previewing || (!busy && ready)
+            longButton.isEnabled = !busy && ready && quickDone
         }
-        if (busy && !previewing) mainButton.filled(Palette.red, Color.WHITE) else mainButton.filled(Palette.text, Palette.background)
-        mainButton.isEnabled = (busy && !previewing) || (!busy && ready)
-        previewButton.text = if (previewing) "Vorschau beenden" else "KI-Vorschau"
-        if (previewing) previewButton.filled(Palette.green, Palette.background) else previewButton.outlined()
-        previewButton.isEnabled = previewing || (!busy && ready)
-        longButton.isEnabled = !busy && ready && quickDone
         val hasReport = report.length() > 0
         copyButton.isEnabled = hasReport && !busy
         shareButton.isEnabled = hasReport && !busy

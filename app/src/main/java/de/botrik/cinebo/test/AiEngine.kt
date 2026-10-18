@@ -101,11 +101,17 @@ internal class AiEngine(private val context: Context) {
      * einem Modell hält die anderen nicht auf; er steht im Ergebnis.
      */
     fun load(ids: List<ModelId>, progress: (done: Int, total: Int, id: ModelId) -> Unit): JSONObject {
+        val out = JSONObject()
+        try {
+            Npu.loadLibraries(context)
+        } catch (e: Throwable) {
+            // Ohne QNN-Bibliotheken kann kein Modell auf den Chip; der Grund steht im Bericht.
+            return out.put("fehler", "QNN-Bibliotheken: $e".take(600))
+        }
         if (!cacheCleaned) {
             Npu.cleanCache(context)
             cacheCleaned = true
         }
-        val out = JSONObject()
         val start = SystemClock.elapsedRealtime()
         val todo = ids.filter { !models.containsKey(it) }
         todo.forEachIndexed { i, id ->
@@ -142,7 +148,7 @@ internal class AiEngine(private val context: Context) {
     }
 
     private fun readNoObjPtr(): FloatArray {
-        val text = context.assets.open("${NpuModel.FOLDER}/edgetam_konstanten.json").bufferedReader().use { it.readText() }
+        val text = java.io.File(java.io.File(context.filesDir, ModelStore.FOLDER), "edgetam_konstanten.json").readText()
         val list = JSONObject(text).getJSONArray("noObjPtr")
         return FloatArray(list.length()) { list.getDouble(it).toFloat() }
     }
