@@ -1,0 +1,61 @@
+name: Test-App bauen
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: test-app
+  cancel-in-progress: false
+
+jobs:
+  apk:
+    name: APK bauen und veröffentlichen
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Projekt holen
+        uses: actions/checkout@v7
+
+      - name: Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: APK bauen
+        shell: bash
+        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace 2>&1 | tee build-log.txt
+
+      # Schlägt der Build fehl, liegt das Protokoll als Datei im Release „ci-log“.
+      - name: Fehlerprotokoll hochladen
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ ! -f build-log.txt ]; then echo "Kein Protokoll, der Fehler lag vor dem Bauen." > build-log.txt; fi
+          { echo "Lauf ${{ github.run_number }} · Stand ${{ github.sha }}"; echo; cat build-log.txt; } > ci-log.txt
+          gh release view ci-log >/dev/null 2>&1 || gh release create ci-log --prerelease --latest=false \
+            --title "Build-Protokoll" --notes "Protokoll des letzten fehlgeschlagenen Builds."
+          gh release upload ci-log ci-log.txt --clobber
+
+      - name: Als Release veröffentlichen
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="0.1.${{ github.run_number }}"
+          cp app/build/outputs/apk/release/app-release.apk cinebo-test.apk
+          gh release create "test-${{ github.run_number }}" cinebo-test.apk \
+            --target "${{ github.sha }}" \
+            --title "Cinebo Test ${version}" \
+            --notes "Testversion ${version} für das OPPO Find N6." \
+            --latest
