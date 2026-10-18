@@ -6,7 +6,9 @@ plugins {
 }
 
 // Jede Version aus GitHub Actions bekommt eine eigene, steigende Nummer.
+// Der Name (z. B. 0.2.7) kommt aus dem Bau-Ablauf, damit App und Release gleich heißen.
 val buildNumber = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+val versionLabel = System.getenv("CINEBO_VERSION") ?: "0.2.$buildNumber"
 
 android {
     namespace = "de.botrik.cinebo.test"
@@ -17,7 +19,32 @@ android {
         minSdk = 33
         targetSdk = 35
         versionCode = buildNumber
-        versionName = "0.1.$buildNumber"
+        versionName = versionLabel
+        // Der KI-Chip und seine Bibliotheken gibt es nur für 64-Bit-ARM.
+        ndk { abiFilters += "arm64-v8a" }
+    }
+
+    // Modelle unkomprimiert, damit sie sich direkt aus der APK in den Speicher abbilden lassen.
+    androidResources {
+        noCompress += "tflite"
+    }
+
+    packaging {
+        jniLibs {
+            // Der KI-Chip lädt seine Programme (Skel) als Dateien; dafür müssen die
+            // Bibliotheken bei der Installation entpackt werden.
+            useLegacyPackaging = true
+            // Nur, was das OPPO Find N6 (Snapdragon 8 Elite Gen 5, Hexagon V81) braucht.
+            // V79 bleibt als Rückfall drin, falls der Chip sich anders meldet.
+            excludes += listOf(
+                "**/libQnnHtpV68Skel.so", "**/libQnnHtpV68Stub.so",
+                "**/libQnnHtpV69Skel.so", "**/libQnnHtpV69Stub.so",
+                "**/libQnnHtpV73Skel.so", "**/libQnnHtpV73Stub.so",
+                "**/libQnnHtpV75Skel.so", "**/libQnnHtpV75Stub.so",
+                "**/libQnnDsp.so", "**/libQnnDspV66Skel.so", "**/libQnnDspV66Stub.so",
+                "**/libQnnGpu.so"
+            )
+        }
     }
 
     // Nur für die Test-App: fester Schlüssel im Projekt, damit sich jede neue
@@ -67,4 +94,10 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+
+    // KI: TFLite und Qualcomms QNN-Delegate für den KI-Chip, in der Kombination,
+    // die auch Qualcomms eigene Beispiel-Apps verwenden.
+    implementation("org.tensorflow:tensorflow-lite:2.17.0")
+    implementation("com.qualcomm.qti:qnn-runtime:2.50.0")
+    implementation("com.qualcomm.qti:qnn-litert-delegate:2.50.0")
 }

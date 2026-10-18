@@ -18,11 +18,17 @@ concurrency:
   group: test-app
   cancel-in-progress: false
 
+env:
+  # Stufe 2 des Machbarkeitstests: Versionen 0.2.x
+  CINEBO_VERSION: 0.2.${{ github.run_number }}
+  # Welche selbst exportierten EdgeTAM-Teile in die App kommen (Release modelle-<Version>)
+  MODELLE_VERSION: '1'
+
 jobs:
   apk:
     name: APK bauen und veröffentlichen
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - name: Projekt holen
         uses: actions/checkout@v7
@@ -35,6 +41,31 @@ jobs:
 
       - name: Gradle
         uses: gradle/actions/setup-gradle@v6
+
+      # Die Modelle liegen nie im Repo: Qualcomms Modelle kommen von AI Hub, unsere
+      # eigenen EdgeTAM-Teile aus dem Release modelle-<Version> dieses Repos.
+      - name: KI-Modelle holen
+        shell: bash
+        run: |
+          dst=app/src/main/assets/modelle
+          mkdir -p "$dst" dl
+          s3=https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/models
+          curl -fsSL --retry 3 -o dl/depth.zip "$s3/depth_anything_v2/releases/v0.63.0/depth_anything_v2-tflite-float.zip"
+          curl -fsSL --retry 3 -o dl/float.zip "$s3/edgetam/releases/v0.61.0/edgetam-tflite-float.zip"
+          curl -fsSL --retry 3 -o dl/w8a8.zip "$s3/edgetam/releases/v0.61.0/edgetam-tflite-w8a8.zip"
+          for z in depth float w8a8; do unzip -q -o "dl/$z.zip" -d "dl/$z"; done
+          cp dl/depth/*/depth_anything_v2.tflite "$dst/depth_anything_v2.tflite"
+          cp dl/float/*/encoder.tflite "$dst/edgetam_encoder.tflite"
+          cp dl/float/*/video_decoder.tflite "$dst/edgetam_decoder.tflite"
+          cp dl/float/*/memory_encoder.tflite "$dst/edgetam_memory_encoder_qualcomm.tflite"
+          cp dl/w8a8/*/encoder.tflite "$dst/edgetam_encoder_w8a8.tflite"
+          cp dl/w8a8/*/video_decoder.tflite "$dst/edgetam_decoder_w8a8.tflite"
+          cp dl/w8a8/*/memory_encoder.tflite "$dst/edgetam_memory_encoder_w8a8.tflite"
+          rel="https://github.com/${{ github.repository }}/releases/download/modelle-$MODELLE_VERSION"
+          for f in edgetam_memory_attention.tflite edgetam_memory_attention_q4.tflite edgetam_memory_encoder.tflite edgetam_konstanten.json; do
+            curl -fsSL --retry 3 -o "$dst/$f" "$rel/$f"
+          done
+          (cd "$dst" && sha256sum *) | tee modelle-pruefsummen.txt
 
       - name: APK bauen
         shell: bash
@@ -53,15 +84,38 @@ jobs:
             --title "Build-Protokoll" --notes "Protokoll des letzten fehlgeschlagenen Builds."
           gh release upload ci-log ci-log.txt --clobber
 
+      # Was in der APK steckt: Prüfsummen der Modelle und wie die Bibliotheken ausgerichtet sind.
+      - name: Bau-Info
+        shell: bash
+        run: |
+          mkdir -p apkx
+          unzip -q -o app/build/outputs/apk/release/app-release.apk 'lib/*' -d apkx
+          {
+            echo "CineBo Test $CINEBO_VERSION · Stand ${{ github.sha }} · Modelle $MODELLE_VERSION"
+            echo
+            echo "== Modelle (sha256)"
+            cat modelle-pruefsummen.txt
+            echo
+            echo "== Bibliotheken: Bytes und Ausrichtung der LOAD-Segmente"
+            for f in apkx/lib/arm64-v8a/*.so; do
+              printf '%s %s ' "$(basename "$f")" "$(stat -c %s "$f")"
+              readelf -lW "$f" | awk '$1 == "LOAD" {print $NF}' | sort -u | tr '\n' ' '
+              echo
+            done
+            echo
+            echo "== APK"
+            stat -c '%s Bytes' app/build/outputs/apk/release/app-release.apk
+          } > bau-info.txt
+          cat bau-info.txt
+
       - name: Als Release veröffentlichen
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version="0.1.${{ github.run_number }}"
           cp app/build/outputs/apk/release/app-release.apk cinebo-test.apk
-          gh release create "test-${{ github.run_number }}" cinebo-test.apk \
+          gh release create "test-${{ github.run_number }}" cinebo-test.apk bau-info.txt \
             --target "${{ github.sha }}" \
-            --title "CineBo Test ${version}" \
-            --notes "Testversion ${version} für das OPPO Find N6." \
+            --title "CineBo Test $CINEBO_VERSION" \
+            --notes "Testversion $CINEBO_VERSION für das OPPO Find N6: KI-Messung (Stufe 2)." \
             --latest

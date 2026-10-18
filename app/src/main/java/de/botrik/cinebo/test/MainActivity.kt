@@ -9,7 +9,6 @@ import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.hardware.camera2.CameraCaptureSession
-import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.TotalCaptureResult
 import android.net.Uri
@@ -19,6 +18,7 @@ import android.os.SystemClock
 import android.provider.Settings
 import android.text.TextUtils
 import android.util.Range
+import android.util.Size
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -41,10 +41,12 @@ import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
-import androidx.camera.core.DynamicRange
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
+import androidx.camera.core.UseCase
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FileOutputOptions
 import androidx.camera.video.Quality
@@ -66,6 +68,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -73,42 +76,46 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.Executors
 import kotlin.coroutines.resume
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 /**
- * Test-App für Phase 1 (Machbarkeitstest): Steckbrief, 4K-Aufnahmen mit 30 und 60 fps,
- * Stabilisator, Klappen während der Aufnahme und ein Dauertest über 10 Minuten.
- * Alles landet in einem Bericht, den man kopieren oder teilen kann.
+ * Test-App, Stufe 2 des Machbarkeitstests: Laufen beide KI-Modelle (Tiefe mit
+ * Depth Anything V2 und Verfolgung mit EdgeTAM) auf dem KI-Chip schnell genug,
+ * auch während einer 4K-Aufnahme und über 10 Minuten? Alles landet in einem Bericht,
+ * den man kopieren oder teilen kann.
  */
 class MainActivity : ComponentActivity() {
 
     private companion object {
-        val ORDER = listOf("steckbrief", "k30", "k60", "stab", "klapp", "dauer")
+        val ORDER = listOf("kichip", "tiefe", "verfolgung", "live", "kidauer")
 
         val TITLES = mapOf(
-            "steckbrief" to "Steckbrief",
-            "k30" to "4K · 30 fps",
-            "k60" to "4K · 60 fps",
-            "stab" to "4K · Stabilisator",
-            "klapp" to "Klapptest · 30 s",
-            "dauer" to "Dauertest · 10 min"
+            "kichip" to "KI-Chip",
+            "tiefe" to "Tiefe · Depth Anything",
+            "verfolgung" to "Verfolgung · EdgeTAM",
+            "live" to "Live mit 4K · 30 s",
+            "kidauer" to "KI-Dauertest · 10 min"
         )
 
         val DESCRIPTIONS = mapOf(
-            "steckbrief" to "Liest aus, was die Kameras fremden Apps erlauben.",
-            "k30" to "10 Sekunden in 3840 × 2160 mit 30 Bildern pro Sekunde.",
-            "k60" to "Prüft, ob 4K auch mit 60 Bildern pro Sekunde geht.",
-            "stab" to "10 Sekunden mit eingeschaltetem Bildstabilisator.",
-            "klapp" to "Klappen während der Aufnahme: Läuft sie weiter?",
-            "dauer" to "10 Minuten 4K am Stück: Wärme, Akku und Bildrate."
+            "kichip" to "Lädt beide KI-Modelle auf den KI-Chip und misst, wie lange das dauert.",
+            "tiefe" to "Wie schnell und wie genau der KI-Chip die Tiefe eines Bildes schätzt.",
+            "verfolgung" to "Wie schnell EdgeTAM ein Objekt Bild für Bild wiederfindet.",
+            "live" to "30 Sekunden 4K mit 30 fps, beide Modelle rechnen auf dem Kamerabild mit.",
+            "kidauer" to "10 Minuten 4K mit beiden Modellen: Tempo, Wärme und Akku."
         )
 
-        const val CLIP_SECONDS = 10
-        const val FOLD_SECONDS = 30
+        const val LIVE_SECONDS = 30
         const val LONG_SECONDS = 600
         const val LOG_EVERY_S = 30.0
+        const val FPS = 30
+
+        /** Ab diesem Tempo (Bilder je Sekunde, beide Modelle zusammen) reicht es für die App. */
+        const val TARGET_HZ = 15.0
 
         val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
         val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
@@ -118,6 +125,7 @@ class MainActivity : ComponentActivity() {
     private enum class Phase(val color: Int) {
         IDLE(Palette.textFaint),
         BUSY(Palette.amber),
+        LIVE(Palette.green),
         REC(Palette.red),
         DONE(Palette.green),
         ERROR(Palette.red)
@@ -132,6 +140,19 @@ class MainActivity : ComponentActivity() {
     private var preview: Preview? = null
     private val frames = FrameStats()
     @Volatile private var counting = false
+
+    private val engineLazy = lazy { AiEngine(applicationContext) }
+    private val engine by engineLazy
+    private val pool = FramePool()
+    private val prep by lazy { FramePrep() }
+    private val analyzerExecutor = Executors.newSingleThreadExecutor { Thread(it, "analyse") }
+    @Volatile private var feeding = false
+    @Volatile private var prepError: String? = null
+    private var analysisSize: String? = null
+    private var liveJob: Job? = null
+    private var liveError: String? = null
+    private var badgeJob: Job? = null
+    @Volatile private var liveVisible = false
 
     private var job: Job? = null
     private var running: String? = null
@@ -156,15 +177,19 @@ class MainActivity : ComponentActivity() {
     // ---------------------------------------------------------------- Ansichten
 
     private lateinit var previewBox: FrameLayout
+    private lateinit var stage: StageLayout
     private lateinit var previewView: PreviewView
+    private lateinit var maskOverlay: MaskOverlay
+    private lateinit var depthView: DepthView
     private lateinit var recBadge: TextView
+    private lateinit var aiBadge: TextView
     private lateinit var permissionPanel: LinearLayout
     private lateinit var statusDot: View
     private lateinit var statusText: TextView
     private lateinit var timeText: TextView
     private lateinit var progress: ProgressLine
     private lateinit var mainButton: PillButton
-    private lateinit var foldButton: PillButton
+    private lateinit var previewButton: PillButton
     private lateinit var longButton: PillButton
     private lateinit var hintText: TextView
     private lateinit var resultScroll: ScrollView
@@ -186,6 +211,34 @@ class MainActivity : ComponentActivity() {
             result: TotalCaptureResult
         ) {
             if (counting) frames.add(result)
+        }
+    }
+
+    /** Bereitet Kamerabilder für die KI vor, aber nur, wenn sie gerade welche braucht. */
+    private val analyzer = ImageAnalysis.Analyzer { image ->
+        try {
+            if (!feeding) return@Analyzer
+            val slot = pool.acquire() ?: return@Analyzer
+            try {
+                prep.fill(image, slot)
+                pool.publish(slot)
+            } catch (e: Throwable) {
+                pool.giveBack(slot)
+                prepError = e.toString().take(300)
+            }
+        } finally {
+            image.close()
+        }
+    }
+
+    /** Bilder der KI für die Vorschau (kommt vom KI-Thread). */
+    private val sink = object : LiveSink {
+        override fun onPictures(depth: IntArray, mask: IntArray, present: Boolean) {
+            previewBox.post {
+                if (!liveVisible) return@post
+                depthView.show(depth)
+                if (present) maskOverlay.showMask(mask) else maskOverlay.clearMask()
+            }
         }
     }
 
@@ -212,7 +265,8 @@ class MainActivity : ComponentActivity() {
         CrashLog.install(this)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        store = ReportStore(this)
+        // Eigener Bericht für Stufe 2; der Bericht von Stufe 1 bleibt unberührt liegen.
+        store = ReportStore(this, "bericht-stufe2.json")
         report = store.load()
         val crash = CrashLog.take(this)
         if (crash != null) {
@@ -252,17 +306,23 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         logEvent("im Hintergrund")
-        // Ohne sichtbare App filmt die Kamera nicht weiter: Schnell- und Dauertest halten an,
-        // statt mit falschen Werten weiterzulaufen. Nur der Klapptest läuft weiter, weil
-        // Klappen die App kurz in den Hintergrund schicken kann; genau das soll er messen.
-        // Geprüft wird nach 1,5 s: Manche Geräte stoppen die App beim Kamerastart ganz kurz.
-        if (running != null && running != "klapp") {
+        // Ohne sichtbare App filmt die Kamera nicht weiter: Tests und Vorschau halten an,
+        // statt mit falschen Werten weiterzulaufen. Geprüft wird nach 1,5 s, weil manche
+        // Geräte die App beim Kamerastart ganz kurz stoppen.
+        if (running != null) {
             previewView.postDelayed({
                 val visible = lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
-                if (!visible && running != null && running != "klapp") requestStop()
+                if (!visible && running != null) requestStop()
             }, 1500)
         }
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        feeding = false
+        if (engineLazy.isInitialized()) engine.shutdown()
+        analyzerExecutor.shutdown()
+        super.onDestroy()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -286,7 +346,7 @@ class MainActivity : ComponentActivity() {
             cameraLoading = false
             try {
                 provider = future.get()
-                if (showPreviewOnly()) setStatus(Phase.IDLE, "Bereit")
+                if (running == null && showPreviewOnly()) setStatus(Phase.IDLE, "Bereit")
             } catch (e: Exception) {
                 setStatus(Phase.ERROR, "Kamera ließ sich nicht öffnen: ${e.message ?: e.javaClass.simpleName}")
             }
@@ -294,9 +354,13 @@ class MainActivity : ComponentActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    /** Verbindet Vorschau und, falls angegeben, Videoaufnahme mit der Hauptkamera. */
+    /**
+     * Verbindet Vorschau, falls angegeben Videoaufnahme, und falls gewünscht Bilder für die KI
+     * mit der Hauptkamera. Schafft die Kamera die Bilder für die KI neben 4K nicht in 1280 × 720,
+     * versucht sie 640 × 360 und zuletzt ganz ohne; was geklappt hat, steht in [analysisSize].
+     */
     @OptIn(ExperimentalCamera2Interop::class)
-    private fun bind(videoCapture: VideoCapture<Recorder>?): Camera {
+    private fun bind(videoCapture: VideoCapture<Recorder>?, withAnalysis: Boolean = false): Camera {
         val p = provider ?: throw IllegalStateException("Kamera noch nicht bereit")
         val builder = Preview.Builder().setResolutionSelector(
             ResolutionSelector.Builder()
@@ -308,12 +372,40 @@ class MainActivity : ComponentActivity() {
         newPreview.setSurfaceProvider(previewView.surfaceProvider)
         p.unbindAll()
         preview = newPreview
-        return if (videoCapture == null) {
-            p.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, newPreview)
-        } else {
-            p.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, newPreview, videoCapture)
+        analysisSize = null
+        if (!withAnalysis) return bindUseCases(p, listOfNotNull(newPreview, videoCapture))
+        var lastError: Exception? = null
+        for (size in listOf(Size(1280, 720), Size(640, 360))) {
+            val analysis = buildAnalysis(size)
+            try {
+                val camera = bindUseCases(p, listOfNotNull(newPreview, videoCapture, analysis))
+                val real = analysis.resolutionInfo?.resolution
+                analysisSize = if (real != null) "${real.width}x${real.height}" else "${size.width}x${size.height}"
+                return camera
+            } catch (e: Exception) {
+                lastError = e
+                p.unbindAll()
+            }
         }
+        analysisSize = "keine: ${lastError?.message ?: "unbekannt"}".take(200)
+        return bindUseCases(p, listOfNotNull(newPreview, videoCapture))
     }
+
+    private fun bindUseCases(p: ProcessCameraProvider, useCases: List<UseCase>): Camera =
+        p.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, *useCases.toTypedArray())
+
+    private fun buildAnalysis(size: Size): ImageAnalysis =
+        ImageAnalysis.Builder()
+            .setResolutionSelector(
+                ResolutionSelector.Builder()
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+                    .setResolutionStrategy(ResolutionStrategy(size, ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
+                    .build()
+            )
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+            .build()
+            .also { it.setAnalyzer(analyzerExecutor, analyzer) }
 
     /** Nur die Vorschau; gibt zurück, ob sie läuft. Ein Fehler steht danach in der Statuszeile. */
     private fun showPreviewOnly(): Boolean = try {
@@ -356,6 +448,7 @@ class MainActivity : ComponentActivity() {
     private fun requestStop() {
         if (running == null) return
         stopRequested = true
+        if (running == "vorschau") engine.requestStop()
         setStatus(Phase.BUSY, "Stoppt …")
     }
 
@@ -387,6 +480,8 @@ class MainActivity : ComponentActivity() {
                 )
                 setStatus(Phase.ERROR, "Fehler: ${e.message ?: e.javaClass.simpleName}")
             } finally {
+                val was = running
+                if (liveJob != null) stopLive()
                 running = null
                 counting = false
                 hintOverride = null
@@ -397,8 +492,11 @@ class MainActivity : ComponentActivity() {
                     val previewOk = showPreviewOnly()
                     if (!failed && previewOk) {
                         val done = doneText
-                        if (stopRequested) setStatus(Phase.IDLE, "Gestoppt")
-                        else if (done != null) setStatus(Phase.DONE, done)
+                        when {
+                            was == "vorschau" -> setStatus(Phase.IDLE, "Bereit")
+                            stopRequested -> setStatus(Phase.IDLE, "Gestoppt")
+                            done != null -> setStatus(Phase.DONE, done)
+                        }
                     }
                     render()
                 }
@@ -416,116 +514,281 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * KI-Schnelltest: KI-Chip prüfen und alle Modelle laden, jedes einzeln messen, mit der
+     * CPU vergleichen und zuletzt 30 Sekunden 4K filmen, während beide mitrechnen.
+     */
     private fun runQuickTest() = launchTest {
-        hintOverride = "Richte die Kamera auf eine Szene, gern mit etwas Bewegung. Der Test dauert etwa eine Minute."
-        running = "steckbrief"
+        hintOverride = "Lass die App offen und richte die Kamera auf eine Szene mit einem Gegenstand in der Mitte. Der Test dauert etwa drei Minuten."
+        val tests = readTests()
+        tests.remove("live")
+        report.remove("ki")
+
+        running = "kichip"
         render()
-        reveal("steckbrief")
-        setStatus(Phase.BUSY, "Liest die Kameradaten …")
-        // Jeder Teil für sich: Ein Fehler in einem Teil soll den Rest nicht verhindern.
-        val profile = withContext(Dispatchers.Default) {
-            val p = try {
-                CameraReport.build(this@MainActivity)
-            } catch (e: Exception) {
-                JSONObject().put("fehler", e.toString())
-            }
-            p.put("encoder", try {
-                CodecReport.build()
-            } catch (e: Exception) {
-                JSONArray().put(e.toString())
-            })
-        }
-        profile.put("cameraX", try {
-            cameraXInfo()
-        } catch (e: Exception) {
-            JSONObject().put("fehler", e.toString())
-        })
-        profile.put("anzeige", displayInfo())
-        profile.put("speicherFreiGB", r1(filesDir.usableSpace / 1e9))
-        profile.put("waerme", DeviceHeat.read(this))
-        DeviceHeat.thresholds(this)?.let { profile.put("waermeSchwellen", it) }
-        profile.put("version", appVersion)
-        profile.put("zeit", nowIso())
-        report.put("steckbrief", profile)
+        reveal("kichip")
+        setStatus(Phase.BUSY, "Prüft den KI-Chip …")
+        val device = withContext(engine.dispatcher) { Npu.info(applicationContext) }
+        device.put("waerme", DeviceHeat.read(this))
+        DeviceHeat.thresholds(this)?.let { device.put("waermeSchwellen", it) }
+        device.put("version", appVersion)
+        device.put("zeit", nowIso())
+        report.put("geraet", device)
+        val ki = JSONObject().put("version", appVersion).put("zeit", nowIso())
+        report.put("ki", ki)
         saveAndRender()
 
-        if (stopRequested) return@launchTest
-        clip("k30", 30, stabilize = false)
-        if (stopRequested) return@launchTest
-        clip("k60", 60, stabilize = false)
-        if (stopRequested) return@launchTest
-        if (stabilizationSupported()) {
-            clip("stab", bestFps(), stabilize = true)
-        } else {
-            putTest("stab", JSONObject().put("ergebnis", "Für Video bietet die Kamera keinen Stabilisator an."))
+        // Frisch laden, damit die Ladezeit zählt; beim zweiten Mal aus dem Zwischenspeicher.
+        withContext(engine.dispatcher) { engine.closeAll() }
+        val load = withContext(engine.dispatcher) {
+            engine.load(ModelId.entries) { done, total, _ ->
+                runOnUiThread { loadingStatus(done, total) }
+            }
         }
-        doneText = "Schnelltest fertig"
-    }
+        ki.put("laden", load)
+        saveAndRender()
+        val usable = withContext(engine.dispatcher) { engine.loaded(ModelId.DEPTH) && engine.loaded(ModelId.ENC) }
+        if (!usable) throw IllegalStateException("Die Modelle laufen nicht auf dem KI-Chip. Die Gründe stehen im Bericht.")
+        if (stopRequested) return@launchTest
 
-    private suspend fun clip(key: String, fps: Int, stabilize: Boolean) {
-        running = key
+        running = "tiefe"
         render()
-        reveal(key)
-        putTest(key, record(key, fps, CLIP_SECONDS, stabilize))
-    }
+        reveal("tiefe")
+        setStatus(Phase.BUSY, "Holt ein Kamerabild …")
+        bind(null, withAnalysis = true)
+        delay(300)
+        waitForStreaming(5000)
+        delay(1500) // Belichtung und Weißabgleich einpendeln lassen
+        val frame = grabFrame()
+            ?: throw IllegalStateException("Die Kamera liefert keine Bilder für die KI (${analysisSize ?: "?"}).")
+        try {
+            ki.put("bild", frameInfo(frame))
+            val bench = withContext(engine.dispatcher) {
+                engine.bench(frame) { what -> runOnUiThread { setStatus(Phase.BUSY, "Misst $what …") } }
+            }
+            ki.put("einzeln", bench)
+            saveAndRender()
+            if (stopRequested) return@launchTest
 
-    private fun runFoldTest() = launchTest {
-        val fps = bestFps()
-        // Die Anweisung zum Klappen erscheint erst, wenn die Aufnahme wirklich läuft.
-        hintOverride = "Die Aufnahme startet gleich. Noch nicht klappen, warte auf den nächsten Hinweis."
-        val foldHint = if (resources.configuration.smallestScreenWidthDp >= 600) {
-            "Jetzt zuklappen, drei Sekunden warten und wieder aufklappen."
-        } else {
-            "Jetzt aufklappen, drei Sekunden warten und wieder zuklappen."
+            running = "verfolgung"
+            render()
+            reveal("verfolgung")
+            val accuracy = withContext(engine.dispatcher) {
+                engine.accuracy(frame) { what -> runOnUiThread { setStatus(Phase.BUSY, "$what …") } }
+            }
+            ki.put("genauigkeit", accuracy)
+            saveAndRender()
+        } finally {
+            pool.release(frame)
         }
-        running = "klapp"
+        withContext(engine.dispatcher) { engine.unloadExtras() }
+        if (stopRequested) return@launchTest
+
+        running = "live"
         render()
-        reveal("klapp")
-        putTest("klapp", record("klapp", fps, FOLD_SECONDS, stabilize = false, recordingHint = foldHint))
-        doneText = "Klapptest fertig"
+        reveal("live")
+        putTest("live", recordWithAi("live", LIVE_SECONDS))
+        doneText = "KI-Schnelltest fertig"
     }
 
     private fun runLongTest() = launchTest {
-        val fps = bestFps()
-        hintOverride = "Lass die App offen und leg das Handy hin, Kamera nach vorn. Die Aufnahme läuft 10 Minuten."
-        running = "dauer"
+        hintOverride = "Leg das Handy hin, Kamera nach vorn auf eine Szene mit einem Gegenstand in der Mitte. Die App bleibt offen, die Aufnahme läuft 10 Minuten."
+        running = "kidauer"
         render()
-        reveal("dauer")
+        reveal("kidauer")
+        putTest("kidauer", recordWithAi("kidauer", LONG_SECONDS))
+        doneText = "KI-Dauertest fertig"
+    }
+
+    /** KI-Vorschau ohne Aufnahme: Tiefe und Verfolgung live ansehen, Objekt antippen. */
+    private fun onPreviewButton() {
+        if (running == "vorschau") {
+            requestStop()
+            return
+        }
+        if (running != null) return
+        launchTest {
+            running = "vorschau"
+            render()
+            hintOverride = "Tippe im Kamerabild auf ein Objekt: Die gelbe Markierung folgt ihm. Rechts die Tiefe, hell ist nah."
+            setStatus(Phase.BUSY, "Bereitet die KI vor …")
+            val load = ensureLiveModels()
+            if (load != null) report.optJSONObject("ki")?.put("ladenVorschau", load)
+            bind(null, withAnalysis = true)
+            startLive(allowStill = false)
+            setStatus(Phase.LIVE, "KI-Vorschau läuft")
+            try {
+                while (!stopRequested && liveJob?.isActive == true) delay(200)
+            } finally {
+                stopLive()
+            }
+            liveError?.let { throw IllegalStateException(it) }
+        }
+    }
+
+    /** Lädt die Modelle für den Live-Betrieb, falls nötig. Gibt das Protokoll zurück oder null. */
+    private suspend fun ensureLiveModels(): JSONObject? {
+        val ready = withContext(engine.dispatcher) { engine.liveReady() }
+        if (ready) return null
+        val ids = ModelId.entries.filter { it.live }
+        val load = withContext(engine.dispatcher) {
+            engine.load(ids) { done, total, _ -> runOnUiThread { loadingStatus(done, total) } }
+        }
+        if (!withContext(engine.dispatcher) { engine.liveReady() }) {
+            report.put("letzteLadung", load)
+            throw IllegalStateException("Die KI-Modelle ließen sich nicht laden. Die Gründe stehen im Bericht.")
+        }
+        return load
+    }
+
+    private fun loadingStatus(done: Int, total: Int) {
+        if (total == 0) return
+        val n = min(done + 1, total)
+        setStatus(Phase.BUSY, "Lädt die Modelle auf den KI-Chip · $n von $total", null, done / total.toFloat())
+    }
+
+    /** Holt ein vorbereitetes Kamerabild; der Aufrufer gibt es mit pool.release zurück. */
+    private suspend fun grabFrame(): FrameSlot? {
+        pool.drain()
+        feeding = true
+        try {
+            return withContext(Dispatchers.IO) { pool.take(6000) }
+        } finally {
+            feeding = false
+            pool.drain()
+        }
+    }
+
+    private fun frameInfo(frame: FrameSlot): JSONObject {
+        val o = JSONObject()
+        o.put("kameraBild", "${frame.width}x${frame.height}")
+        o.put("drehung", frame.rotation)
+        o.put("analyse", analysisSize ?: "?")
+        o.put("vorbereitungMs", r1(frame.prepMs))
+        prepError?.let { o.put("vorbereitungFehler", it) }
+        return o
+    }
+
+    private fun startLive(allowStill: Boolean) {
+        pool.drain()
+        prepError = null
+        liveError = null
+        feeding = true
+        engine.beginLive()
+        engine.stats.reset()
+        pool.resetCounters()
+        liveVisible = true
+        stage.showDepth = true
+        maskOverlay.onTap = { u, v -> engine.track(u, v) }
+        liveJob = lifecycleScope.launch(engine.dispatcher) {
+            try {
+                engine.runLive(pool, sink, allowStill)
+            } catch (e: Throwable) {
+                liveError = "KI-Schleife: $e".take(400)
+            }
+        }
+        startBadge()
+    }
+
+    private suspend fun stopLive() {
+        engine.requestStop()
+        liveJob?.join()
+        liveJob = null
+        feeding = false
+        pool.drain()
+        liveVisible = false
+        maskOverlay.onTap = null
+        maskOverlay.clearMask()
+        depthView.clear()
+        stage.showDepth = false
+        badgeJob?.cancel()
+        badgeJob = null
+        aiBadge.visibility = View.GONE
+    }
+
+    private fun startBadge() {
+        badgeJob?.cancel()
+        aiBadge.text = "KI startet …"
+        aiBadge.visibility = View.VISIBLE
+        badgeJob = lifecycleScope.launch {
+            var lastCycles = engine.stats.cycles()
+            var lastT = SystemClock.elapsedRealtime()
+            while (isActive) {
+                delay(1000)
+                val cycles = engine.stats.cycles()
+                val now = SystemClock.elapsedRealtime()
+                if (cycles < lastCycles) lastCycles = 0
+                val hz = (cycles - lastCycles) * 1000.0 / max(1L, now - lastT)
+                lastCycles = cycles
+                lastT = now
+                aiBadge.text = if (cycles == 0) "KI startet …" else "KI · ${de(hz, 0)} Bilder/s"
+            }
+        }
+    }
+
+    /**
+     * 4K mit 30 fps aufnehmen, während beide Modelle auf den Kamerabildern rechnen.
+     * Alle 30 Sekunden ein Eintrag: Tempo der KI, Bildrate, Wärme und Akku.
+     */
+    private suspend fun recordWithAi(key: String, seconds: Int): JSONObject {
+        setStatus(Phase.BUSY, "Bereitet die KI vor …")
+        val load = ensureLiveModels()
+        startLive(allowStill = true)
         val log = JSONArray()
         var next = LOG_EVERY_S
         var prevFrames = -1L
         var prevTs = 0L
         var prevBytes = 0L
         var prevT = 0.0
-        val result = record("dauer", fps, LONG_SECONDS, stabilize = false) { t, stats ->
-            if (t >= next) {
-                val (count, first, last) = frames.snapshot()
-                val entry = JSONObject().put("s", next.toInt())
-                val fromFrames = if (prevFrames < 0) 1L else prevFrames
-                val fromTs = if (prevFrames < 0) first else prevTs
-                if (last > fromTs) entry.put("fps", r1((count - fromFrames) / ((last - fromTs) / 1e9)))
-                if (stats != null && t > prevT) {
-                    entry.put("mbits", r1((stats.numBytesRecorded - prevBytes) * 8 / (t - prevT) / 1e6))
-                    prevBytes = stats.numBytesRecorded
+        val result = try {
+            record(key, FPS, seconds, stabilize = false, withAnalysis = true, onStart = {
+                engine.stats.reset()
+                pool.resetCounters()
+            }) { t, stats ->
+                if (t >= next) {
+                    val (count, first, last) = frames.snapshot()
+                    val entry = JSONObject().put("s", next.toInt())
+                    val fromFrames = if (prevFrames < 0) 1L else prevFrames
+                    val fromTs = if (prevFrames < 0) first else prevTs
+                    if (last > fromTs) entry.put("fps", r1((count - fromFrames) / ((last - fromTs) / 1e9)))
+                    if (stats != null && t > prevT) {
+                        entry.put("mbits", r1((stats.numBytesRecorded - prevBytes) * 8 / (t - prevT) / 1e6))
+                        prevBytes = stats.numBytesRecorded
+                    }
+                    val window = engine.stats.closeWindow()
+                    entry.put("ki", window)
+                    val heat = DeviceHeat.read(this@MainActivity)
+                    entry.put("waerme", heat)
+                    log.put(entry)
+                    prevFrames = count
+                    prevTs = last
+                    prevT = t
+                    next += LOG_EVERY_S
+                    if (seconds > LIVE_SECONDS) {
+                        val parts = mutableListOf("Läuft")
+                        if (window.has("hz")) parts.add("KI ${de(window.optDouble("hz"), 0)} Bilder/s")
+                        if (entry.has("fps")) parts.add("${de(entry.optDouble("fps"), 1)} fps")
+                        if (heat.has("akkuGrad")) parts.add("Akku ${de(heat.optDouble("akkuGrad"), 1)} °C")
+                        parts.add("Wärmestufe ${heat.optString("stufe")}")
+                        hintOverride = parts.joinToString(" · ")
+                        hintText.text = hintOverride
+                    }
                 }
-                val heat = DeviceHeat.read(this@MainActivity)
-                entry.put("waerme", heat)
-                log.put(entry)
-                prevFrames = count
-                prevTs = last
-                prevT = t
-                next += LOG_EVERY_S
-                val parts = mutableListOf("Läuft")
-                if (heat.has("akkuGrad")) parts.add("Akku ${de(heat.optDouble("akkuGrad"), 1)} °C")
-                parts.add("Wärmestufe ${heat.optString("stufe")}")
-                if (entry.has("fps")) parts.add("${de(entry.optDouble("fps"), 1)} fps")
-                hintOverride = parts.joinToString(" · ")
-                hintText.text = hintOverride
             }
+        } finally {
+            stopLive()
         }
+        val ai = engine.stats.totalJson()
+        ai.put("kameraBilderFuerKi", pool.prepared)
+        ai.put("kameraBilderVerworfen", pool.skipped)
+        ai.put("analyse", analysisSize ?: "?")
+        ai.put("memoryAttention", engine.liveAttn.key)
+        prepError?.let { ai.put("vorbereitungFehler", it) }
+        liveError?.let { ai.put("fehler", it) }
+        result.put("ki", ai)
         result.put("verlauf", log)
-        putTest("dauer", result)
-        doneText = "Dauertest fertig"
+        if (load != null) result.put("laden", load)
+        return result
     }
 
     /**
@@ -538,13 +801,15 @@ class MainActivity : ComponentActivity() {
         fps: Int,
         seconds: Int,
         stabilize: Boolean,
+        withAnalysis: Boolean = false,
         recordingHint: String? = null,
+        onStart: () -> Unit = {},
         onTick: (Double, RecordingStats?) -> Unit = { _, _ -> }
     ): JSONObject {
         val out = JSONObject()
         out.put("version", appVersion)
         out.put("zeit", nowIso())
-        // Klappen und Lebenszyklus ab dem ersten Moment mitschreiben, auch während die Kamera startet.
+        // Lebenszyklus ab dem ersten Moment mitschreiben, auch während die Kamera startet.
         recordingSince = 0L
         events = JSONArray()
         out.put(
@@ -553,6 +818,7 @@ class MainActivity : ComponentActivity() {
                 .put("fps", fps)
                 .put("sekunden", seconds)
                 .put("stabilisator", stabilize)
+                .put("kiBilder", withAnalysis)
         )
         val label = "4K · $fps" + if (stabilize) " · Stabilisator" else ""
         setStatus(Phase.BUSY, "Kamera startet · $label")
@@ -566,12 +832,13 @@ class MainActivity : ComponentActivity() {
         val videoCapture = builder.build()
 
         val camera = try {
-            bind(videoCapture)
+            bind(videoCapture, withAnalysis)
         } catch (e: Exception) {
             out.put("fehler", "Kamera ließ sich so nicht starten: ${e.message ?: e.javaClass.simpleName}")
             return attachEvents(out)
         }
         out.put("kamera", Camera2CameraInfo.from(camera.cameraInfo).cameraId)
+        if (withAnalysis) out.put("analyse", analysisSize ?: "?")
         delay(300)
         waitForStreaming(5000)
         delay(1500) // Belichtung und Weißabgleich einpendeln lassen
@@ -602,6 +869,7 @@ class MainActivity : ComponentActivity() {
                         frames.reset()
                         counting = true
                         recordingSince = SystemClock.elapsedRealtime()
+                        onStart()
                         started.complete(Unit)
                     }
                     is VideoRecordEvent.Status -> stats = event.recordingStats
@@ -653,10 +921,6 @@ class MainActivity : ComponentActivity() {
         } finally {
             counting = false
             recBadge.visibility = View.GONE
-            if (recordingHint != null) {
-                hintOverride = "Aufnahme beendet, wird ausgewertet. Jetzt nicht mehr klappen."
-                hintText.text = hintOverride
-            }
             if (!finished.isCompleted) recording.stop()
         }
 
@@ -697,25 +961,6 @@ class MainActivity : ComponentActivity() {
         return out
     }
 
-    private fun stabilizationSupported(): Boolean {
-        val p = provider ?: return false
-        val back = CameraSelector.DEFAULT_BACK_CAMERA.filter(p.availableCameraInfos).firstOrNull() ?: return false
-        return try {
-            Recorder.getVideoCapabilities(back).isStabilizationSupported
-        } catch (_: Exception) {
-            false
-        }
-    }
-
-    /** 60 fps nur, wenn der Test sie in echtem 4K 16:9 geschafft hat. Sonst 30. */
-    private fun bestFps(): Int {
-        val file = readTests().optJSONObject("k60")?.optJSONObject("datei") ?: return 30
-        val fps = file.optDouble("fps", 0.0)
-        val w = file.optInt("breite")
-        val h = file.optInt("hoehe")
-        return if (fps >= 57.0 && max(w, h) >= 3840 && min(w, h) >= 2160) 60 else 30
-    }
-
     private fun finalizeText(code: Int): String = when (code) {
         0 -> "ok"
         1 -> "unbekannter Fehler"
@@ -741,73 +986,6 @@ class MainActivity : ComponentActivity() {
         else -> "Zustand $state"
     }
 
-    // ---------------------------------------------------------------- Steckbrief-Zusätze
-
-    @OptIn(ExperimentalCamera2Interop::class)
-    private fun cameraXInfo(): JSONObject {
-        val o = JSONObject()
-        val p = provider ?: return o.put("fehler", "Kamera nicht bereit")
-        val list = JSONArray()
-        for (info in p.availableCameraInfos) {
-            val c2 = Camera2CameraInfo.from(info)
-            val facing = when (c2.getCameraCharacteristic(CameraCharacteristics.LENS_FACING)) {
-                CameraCharacteristics.LENS_FACING_BACK -> "hinten"
-                CameraCharacteristics.LENS_FACING_FRONT -> "vorne"
-                else -> "extern"
-            }
-            list.put(JSONObject().put("id", c2.cameraId).put("richtung", facing))
-        }
-        o.put("kameras", list)
-        val back = CameraSelector.DEFAULT_BACK_CAMERA.filter(p.availableCameraInfos).firstOrNull()
-            ?: return o.put("fehler", "keine Rückkamera")
-        o.put("standardKamera", Camera2CameraInfo.from(back).cameraId)
-        val zoom = back.zoomState.value
-        if (zoom != null) o.put("zoom", "${r2(zoom.minZoomRatio.toDouble())} bis ${r2(zoom.maxZoomRatio.toDouble())}")
-        try {
-            val caps = Recorder.getVideoCapabilities(back)
-            val qualities = JSONObject()
-            for (range in caps.supportedDynamicRanges) {
-                qualities.put(dynamicRangeName(range), JSONArray(caps.getSupportedQualities(range).map { qualityName(it) }))
-            }
-            o.put("videoQualitaeten", qualities)
-            o.put("videoStabilisator", caps.isStabilizationSupported)
-        } catch (e: Exception) {
-            o.put("videoFehler", e.toString())
-        }
-        return o
-    }
-
-    private fun dynamicRangeName(range: DynamicRange): String = when (range) {
-        DynamicRange.SDR -> "SDR"
-        DynamicRange.HLG_10_BIT -> "HLG 10 bit"
-        DynamicRange.HDR10_10_BIT -> "HDR10"
-        DynamicRange.HDR10_PLUS_10_BIT -> "HDR10+"
-        DynamicRange.DOLBY_VISION_10_BIT -> "Dolby Vision 10 bit"
-        DynamicRange.DOLBY_VISION_8_BIT -> "Dolby Vision 8 bit"
-        else -> "Kodierung ${range.encoding}, ${range.bitDepth} bit"
-    }
-
-    private fun qualityName(q: Quality): String = when (q) {
-        Quality.UHD -> "UHD"
-        Quality.FHD -> "FHD"
-        Quality.HD -> "HD"
-        Quality.SD -> "SD"
-        else -> q.toString()
-    }
-
-    private fun displayInfo(): JSONObject {
-        val o = JSONObject()
-        val c = resources.configuration
-        o.put("dp", screenKey(c))
-        o.put("dichteDpi", c.densityDpi)
-        val d = display
-        if (d != null) {
-            o.put("hz", JSONArray(d.supportedModes.map { r1(it.refreshRate.toDouble()) }.distinct().sorted()))
-            o.put("hzJetzt", r1(d.refreshRate.toDouble()))
-        }
-        return o
-    }
-
     // ---------------------------------------------------------------- Bericht
 
     private fun readTests(): JSONObject = report.optJSONObject("tests") ?: JSONObject()
@@ -823,14 +1001,13 @@ class MainActivity : ComponentActivity() {
         render()
     }
 
-    private fun quickTestDone(): Boolean {
-        val tests = readTests()
-        return report.has("steckbrief") && tests.has("k30") && tests.has("k60") && tests.has("stab")
-    }
+    private fun ki(): JSONObject? = report.optJSONObject("ki")
+
+    private fun quickTestDone(): Boolean = ki()?.has("einzeln") == true && readTests().has("live")
 
     private fun reportText(): String {
         val o = JSONObject()
-        o.put("app", JSONObject().put("name", "CineBo Test").put("version", appVersion).put("erstellt", nowIso()))
+        o.put("app", JSONObject().put("name", "CineBo Test").put("stufe", 2).put("version", appVersion).put("erstellt", nowIso()))
         val keys = report.keys()
         while (keys.hasNext()) {
             val k = keys.next()
@@ -841,7 +1018,7 @@ class MainActivity : ComponentActivity() {
 
     private fun copyReport() {
         val clipboard = getSystemService(ClipboardManager::class.java)
-        clipboard.setPrimaryClip(ClipData.newPlainText("CineBo-Testbericht", reportText()))
+        clipboard.setPrimaryClip(ClipData.newPlainText("CineBo-KI-Bericht", reportText()))
         copyButton.text = "Kopiert"
         copyButton.postDelayed({ copyButton.text = "Bericht kopieren" }, 1800)
     }
@@ -850,14 +1027,14 @@ class MainActivity : ComponentActivity() {
         try {
             val folder = File(cacheDir, "berichte").apply { mkdirs() }
             folder.listFiles()?.forEach { it.delete() }
-            val file = File(folder, "cinebo-testbericht-${fileStamp()}.json")
+            val file = File(folder, "cinebo-ki-bericht-${fileStamp()}.json")
             file.writeText(reportText())
             val uri = FileProvider.getUriForFile(this, "$packageName.dateien", file)
             val send = Intent(Intent.ACTION_SEND).apply {
                 type = "text/plain"
                 putExtra(Intent.EXTRA_STREAM, uri)
-                putExtra(Intent.EXTRA_SUBJECT, "CineBo-Testbericht")
-                clipData = ClipData.newRawUri("CineBo-Testbericht", uri)
+                putExtra(Intent.EXTRA_SUBJECT, "CineBo-KI-Bericht")
+                clipData = ClipData.newRawUri("CineBo-KI-Bericht", uri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             startActivity(Intent.createChooser(send, "Bericht teilen"))
@@ -891,140 +1068,178 @@ class MainActivity : ComponentActivity() {
 
     private fun summary(key: String): Pair<Mark, String> {
         if (running == key) return Mark.RUNNING to "läuft …"
-        val data = if (key == "steckbrief") report.optJSONObject("steckbrief") else readTests().optJSONObject(key)
-        if (data == null) return Mark.OPEN to DESCRIPTIONS.getValue(key)
         return when (key) {
-            "steckbrief" -> profileSummary(data)
-            "klapp" -> foldSummary(data)
-            "dauer" -> longSummary(data)
-            else -> clipSummary(data)
+            "kichip" -> chipSummary()
+            "tiefe" -> depthSummary()
+            "verfolgung" -> trackSummary()
+            else -> readTests().optJSONObject(key)?.let { liveSummary(key, it) }
+                ?: (Mark.OPEN to DESCRIPTIONS.getValue(key))
         }
     }
 
-    private fun profileSummary(s: JSONObject): Pair<Mark, String> {
-        val cams = s.optJSONArray("kameras")
-            ?: return Mark.FAIL to ("Keine Kameradaten" + s.optString("fehler").let { if (it.isEmpty()) "" else ": $it" })
-        val mainId = s.optJSONObject("cameraX")?.optString("standardKamera").orEmpty()
-        var main: JSONObject? = null
-        var videoBokeh = false
-        var vendorBokeh = false
-        for (i in 0 until cams.length()) {
-            val c = cams.optJSONObject(i) ?: continue
-            if (c.optString("id") == mainId) main = c
-            val modes = c.optJSONArray("bokehModi")
-            if (modes != null) {
-                for (j in 0 until modes.length()) {
-                    if (modes.optJSONObject(j)?.optString("modus") == "BOKEH_VIDEO") videoBokeh = true
-                }
+    private fun openRow(key: String): Pair<Mark, String> = Mark.OPEN to DESCRIPTIONS.getValue(key)
+
+    private fun chipSummary(): Pair<Mark, String> {
+        val device = report.optJSONObject("geraet")
+        device?.optString("fehler")?.takeIf { it.isNotEmpty() }?.let {
+            return Mark.FAIL to "KI-Chip nicht erreichbar: ${it.take(160)}"
+        }
+        val load = ki()?.optJSONObject("laden") ?: return openRow("kichip")
+        var ok = 0
+        var allCached = true
+        val errors = mutableListOf<String>()
+        val partial = mutableListOf<String>()
+        for (id in ModelId.entries) {
+            val m = load.optJSONObject(id.key) ?: continue
+            if (m.has("fehler")) {
+                errors += id.title
+                continue
             }
-            val vendor = c.optJSONArray("herstellerModi")
-            if (vendor != null) {
-                for (j in 0 until vendor.length()) {
-                    if (vendor.optString(j) == "BOKEH") vendorBokeh = true
-                }
+            ok++
+            if (!m.optBoolean("ausZwischenspeicher")) allCached = false
+            val chip = m.optJSONObject("aufDemChip")
+            if (chip != null && chip.optInt("schritte") < chip.optInt("vonSchritten")) {
+                partial += "${id.title} (${chip.optInt("schritte")} von ${chip.optInt("vonSchritten")})"
             }
         }
-        val parts = mutableListOf("${cams.length()} Kameras")
-        val maxFps = main?.optJSONObject("maxFpsJeGroesse")?.optString("3840x2160")?.toDoubleOrNull()
-        if (maxFps != null) parts.add("4K 16:9 bis ${de(maxFps, 0)} fps")
-        parts.add("Video-Bokeh " + if (videoBokeh) "ja" else "nein")
-        parts.add("Hersteller-Bokeh " + if (vendorBokeh) "ja" else "nein")
-        return Mark.OK to parts.joinToString(" · ")
+        val parts = mutableListOf<String>()
+        device?.optString("qnnVersion")?.takeIf { it.isNotEmpty() }?.let { parts += "QNN $it" }
+        val seconds = load.optDouble("gesamtMs", 0.0) / 1000.0
+        parts += "$ok Modelle in ${de(seconds, if (seconds < 10) 1 else 0)} s geladen" +
+            if (allCached && ok > 0) ", aus dem Zwischenspeicher" else ""
+        var mark = Mark.OK
+        if (errors.isNotEmpty()) {
+            parts += "Fehler bei: ${errors.joinToString()}"
+            mark = if (ok == 0) Mark.FAIL else Mark.WARN
+        }
+        if (partial.isNotEmpty()) {
+            parts += "nur teilweise auf dem Chip: ${partial.joinToString()}"
+            if (mark == Mark.OK) mark = Mark.WARN
+        }
+        return mark to parts.joinToString(" · ")
     }
 
-    private fun clipSummary(r: JSONObject): Pair<Mark, String> {
-        val note = r.optString("ergebnis")
-        if (note.isNotEmpty()) return Mark.WARN to note
+    private fun depthSummary(): Pair<Mark, String> {
+        val ki = ki() ?: return openRow("tiefe")
+        val m = ki.optJSONObject("einzeln")?.optJSONObject("modelle")?.optJSONObject(ModelId.DEPTH.key)
+            ?.optJSONObject("imModell") ?: return openRow("tiefe")
+        val ms = m.optDouble("medianMs")
+        val parts = mutableListOf("${de(ms, 0)} ms je Bild auf dem KI-Chip (${de(1000.0 / ms, 0)} Bilder/s)")
+        var mark = if (ms <= 1000.0 / TARGET_HZ) Mark.OK else Mark.WARN
+        val acc = ki.optJSONObject("genauigkeit")?.optJSONObject("tiefe")
+        if (acc != null) {
+            if (acc.has("cpuMs")) parts += "CPU ${de(acc.optDouble("cpuMs"), 0)} ms"
+            val dev = acc.optDouble("abweichungProzent", Double.NaN)
+            if (!dev.isNaN()) {
+                parts += "weicht ${de(dev, 1)} % von der CPU ab"
+                if (dev > 5.0) mark = Mark.WARN
+            }
+            if (acc.has("ungueltigeWerte")) {
+                parts += "${acc.optInt("ungueltigeWerte")} ungültige Werte"
+                mark = Mark.FAIL
+            }
+        }
+        return mark to parts.joinToString(" · ")
+    }
+
+    private fun trackSummary(): Pair<Mark, String> {
+        val ki = ki() ?: return openRow("verfolgung")
+        val per = ki.optJSONObject("einzeln")?.optJSONObject("jeBild") ?: return openRow("verfolgung")
+        fun median(name: String) = per.optJSONObject(name)?.optDouble("medianMs", Double.NaN) ?: Double.NaN
+        val track = median("verfolgung")
+        val both = median("beide")
+        val parts = mutableListOf("${de(track, 0)} ms je Bild (${de(1000.0 / track, 0)} Bilder/s)")
+        parts += "Encoder ${de(median("encoder"), 0)} · Speicher lesen ${de(median("speicherAttention"), 0)} · " +
+            "Decoder ${de(median("decoder"), 0)} · Speicher schreiben ${de(median("speicherEncoder"), 0)} ms"
+        var mark = Mark.OK
+        if (!both.isNaN()) {
+            val hz = 1000.0 / both
+            parts += "mit Tiefe zusammen ${de(both, 0)} ms (${de(hz, 0)} Bilder/s)"
+            if (hz < TARGET_HZ) mark = Mark.WARN
+        }
+        val acc = ki.optJSONObject("genauigkeit")?.optJSONObject("verfolgung")
+        if (acc != null) {
+            val iou = acc.optDouble("folgeMaskeGleich", Double.NaN)
+            if (!iou.isNaN()) {
+                parts += "Maske zu ${(iou * 100).roundToInt()} % wie auf der CPU"
+                if (iou < 0.9) mark = Mark.WARN
+            }
+        }
+        return mark to parts.joinToString(" · ")
+    }
+
+    private fun liveSummary(key: String, r: JSONObject): Pair<Mark, String> {
         val error = r.optString("fehler")
         if (error.isNotEmpty()) return Mark.FAIL to error
+        val ai = r.optJSONObject("ki")
+        val aiError = ai?.optString("fehler").orEmpty()
+        if (aiError.isNotEmpty()) return Mark.FAIL to aiError
         val file = r.optJSONObject("datei")
-        if (file == null || !file.has("fps")) {
+        val parts = mutableListOf<String>()
+        var mark = Mark.OK
+        if (key == "kidauer" && file != null && file.has("dauerS")) parts += "${clock(file.optDouble("dauerS").toLong())} min"
+        if (ai != null && ai.has("hz")) {
+            val hz = ai.optDouble("hz")
+            var text = "KI ${de(hz, 0)} Bilder/s"
+            val log = r.optJSONArray("verlauf")
+            if (key == "kidauer" && log != null && log.length() > 1) {
+                var lo = Double.MAX_VALUE
+                var hi = 0.0
+                for (i in 0 until log.length()) {
+                    val w = log.optJSONObject(i)?.optJSONObject("ki")?.optDouble("hz", Double.NaN) ?: Double.NaN
+                    if (w.isNaN()) continue
+                    lo = min(lo, w)
+                    hi = max(hi, w)
+                }
+                if (lo <= hi) text = "KI ${de(lo, 0)} bis ${de(hi, 0)} Bilder/s"
+                if (lo < TARGET_HZ) mark = Mark.WARN
+            }
+            parts += text
+            if (hz < TARGET_HZ) mark = Mark.WARN
+            if (ai.optInt("aufStandbild") > 0) {
+                parts += "ohne Kamerabilder für die KI (Standbild)"
+                mark = Mark.WARN
+            }
+        } else {
+            parts += "KI lief nicht mit"
+            mark = Mark.WARN
+        }
+        if (file != null && file.has("fps")) {
+            val fps = file.optDouble("fps")
+            val lost = lostAfterStart(file)
+            parts += "${sizeText(file)} mit ${de(fps, 1)} fps"
+            parts += lostText(lost)
+            if (fps < FPS * 0.95 || lost > 0) mark = Mark.WARN
+        } else {
             val reason = endNote(r) ?: file?.optString("fehler")?.ifEmpty { null } ?: "keine auswertbare Aufnahme"
             return Mark.FAIL to reason.replaceFirstChar { it.uppercase() }
         }
-        val wanted = r.optJSONObject("angefragt")?.optInt("fps", 30) ?: 30
-        val fps = file.optDouble("fps")
-        val lost = lostAfterStart(file)
-        val atStart = file.optInt("verloreneBilder") - lost
-        val lostPart = lostText(lost) + if (atStart > 0) " ($atStart beim Start)" else ""
-        val parts = mutableListOf(sizeText(file), "${de(fps, 1)} fps", lostPart)
-        if (file.has("mbits")) parts.add("${de(file.optDouble("mbits"), 0)} Mbit/s")
-        var mark = if (fps < wanted * 0.95 || lost > 0) Mark.WARN else Mark.OK
-        if (wanted >= 60 && fps < 57.0) parts.add("60 fps nicht möglich")
-        val end = endNote(r)
-        if (end != null) {
-            parts.add(end)
+        ai?.optInt("objektGefundenProzent", -1)?.takeIf { it >= 0 }?.let { parts += "Objekt in $it % der Bilder gefunden" }
+        if (key == "kidauer") {
+            val heat = r.optJSONObject("waerme")
+            val start = heat?.optJSONObject("start")
+            val stop = heat?.optJSONObject("ende")
+            if (start != null && stop != null) {
+                if (start.has("akkuGrad") && stop.has("akkuGrad")) {
+                    parts += "Akku ${de(start.optDouble("akkuGrad"), 1)} → ${de(stop.optDouble("akkuGrad"), 1)} °C"
+                }
+                if (start.has("akkuProzent") && stop.has("akkuProzent")) {
+                    parts += "${start.optInt("akkuProzent")} → ${stop.optInt("akkuProzent")} %"
+                }
+            }
+            var hottest = "keine"
+            val log = r.optJSONArray("verlauf") ?: JSONArray()
+            for (i in 0 until log.length()) {
+                val stage = log.optJSONObject(i)?.optJSONObject("waerme")?.optString("stufe").orEmpty()
+                if (DeviceHeat.stageOrder.indexOf(stage) > DeviceHeat.stageOrder.indexOf(hottest)) hottest = stage
+            }
+            parts += "Wärmestufe höchstens $hottest"
+            if (DeviceHeat.stageOrder.indexOf(hottest) >= 2) mark = Mark.WARN
+        }
+        endNote(r)?.let {
+            parts += it
             mark = Mark.WARN
         }
-        return mark to parts.joinToString(" · ")
-    }
-
-    private fun foldSummary(r: JSONObject): Pair<Mark, String> {
-        val error = r.optString("fehler")
-        if (error.isNotEmpty()) return Mark.FAIL to error
-        val screenChanges = screenChanges(r)
-        val background = eventsDuringRecording(r, "im Hintergrund") > 0
-        val file = r.optJSONObject("datei")
-        val seconds = file?.optDouble("dauerS", 0.0) ?: 0.0
-        val end = endNote(r)
-        val parts = mutableListOf<String>()
-        var mark: Mark
-        if (end == null && seconds >= FOLD_SECONDS - 3) {
-            parts.add("Aufnahme lief durch")
-            mark = if (file != null && lostAfterStart(file) > 0) Mark.WARN else Mark.OK
-        } else {
-            parts.add("Aufnahme endete nach ${de(seconds, 0)} s" + if (end != null) ": $end" else "")
-            mark = Mark.FAIL
-        }
-        // Geklappt hat er, wenn der Bildschirm wechselte oder die App dabei in den Hintergrund ging.
-        if (screenChanges == 0 && !background) {
-            parts.add("kein Klappen erkannt, bitte wiederholen")
-            if (mark == Mark.OK) mark = Mark.WARN
-        } else if (screenChanges > 0) {
-            parts.add("$screenChanges× Bildschirm gewechselt")
-        }
-        if (file != null && file.has("abstandMaxMs")) {
-            parts.add("längste Lücke ${de(file.optDouble("abstandMaxMs"), 0)} ms")
-        }
-        if (background) parts.add("App war kurz im Hintergrund")
-        return mark to parts.joinToString(" · ")
-    }
-
-    private fun longSummary(r: JSONObject): Pair<Mark, String> {
-        val (baseMark, baseText) = clipSummary(r)
-        if (baseMark == Mark.FAIL) return baseMark to baseText
-        var mark = baseMark
-        val parts = mutableListOf<String>()
-        val file = r.optJSONObject("datei")
-        if (file != null && file.has("dauerS")) parts.add("${clock(file.optDouble("dauerS").toLong())} min")
-        parts.add(baseText)
-        val log = r.optJSONArray("verlauf") ?: JSONArray()
-        var slowest = Double.MAX_VALUE
-        var hottest = "keine"
-        for (i in 0 until log.length()) {
-            val e = log.optJSONObject(i) ?: continue
-            if (e.has("fps")) slowest = min(slowest, e.optDouble("fps"))
-            val stage = e.optJSONObject("waerme")?.optString("stufe").orEmpty()
-            if (DeviceHeat.stageOrder.indexOf(stage) > DeviceHeat.stageOrder.indexOf(hottest)) hottest = stage
-        }
-        val wanted = r.optJSONObject("angefragt")?.optInt("fps", 30) ?: 30
-        if (slowest != Double.MAX_VALUE && slowest < wanted * 0.95) {
-            parts.add("langsamste 30 s: ${de(slowest, 1)} fps")
-            mark = Mark.WARN
-        }
-        val heat = r.optJSONObject("waerme")
-        val start = heat?.optJSONObject("start")
-        val stop = heat?.optJSONObject("ende")
-        if (start != null && stop != null) {
-            if (start.has("akkuGrad") && stop.has("akkuGrad")) {
-                parts.add("Akku ${de(start.optDouble("akkuGrad"), 1)} → ${de(stop.optDouble("akkuGrad"), 1)} °C")
-            }
-            if (start.has("akkuProzent") && stop.has("akkuProzent")) {
-                parts.add("${start.optInt("akkuProzent")} → ${stop.optInt("akkuProzent")} %")
-            }
-        }
-        parts.add("Wärmestufe höchstens $hottest")
-        if (DeviceHeat.stageOrder.indexOf(hottest) >= 2) mark = Mark.WARN
         return mark to parts.joinToString(" · ")
     }
 
@@ -1037,10 +1252,14 @@ class MainActivity : ComponentActivity() {
     private fun sizeText(file: JSONObject): String {
         val w = file.optInt("breite")
         val h = file.optInt("hoehe")
-        return if (w > 0 && h > 0) "${max(w, h)} × ${min(w, h)}" else "Größe unbekannt"
+        return when {
+            max(w, h) >= 3840 && min(w, h) >= 2160 -> "4K"
+            w > 0 && h > 0 -> "${max(w, h)} × ${min(w, h)}"
+            else -> "Größe unbekannt"
+        }
     }
 
-    /** Verlorene Bilder ohne die Startlücke; ältere Berichte kennen sie nicht, dann zählt alles. */
+    /** Verlorene Bilder ohne die Startlücke. */
     private fun lostAfterStart(file: JSONObject): Int =
         if (file.has("verloreneBilderNachStart")) file.optInt("verloreneBilderNachStart") else file.optInt("verloreneBilder")
 
@@ -1061,78 +1280,54 @@ class MainActivity : ComponentActivity() {
 
     private fun defaultHint(quickDone: Boolean): String {
         val tests = readTests()
-        val noMic = if (has(Manifest.permission.RECORD_AUDIO)) "" else " Ohne Mikrofonzugriff laufen die Tests ohne Ton."
-        val quickRedo = listOf("k30", "k60", "stab").firstNotNullOfOrNull { repeatReason(it) }
-        val laterRedo = listOf("klapp", "dauer").firstNotNullOfOrNull { repeatReason(it) }
+        val noMic = if (has(Manifest.permission.RECORD_AUDIO)) "" else " Ohne Mikrofonzugriff laufen die Aufnahmen ohne Ton."
         return when {
             !has(Manifest.permission.CAMERA) -> "Die Test-App braucht Zugriff auf Kamera und Mikrofon."
-            !quickDone -> "Starte den Schnelltest. Er dauert etwa eine Minute: Steckbrief, 4K mit 30 und 60 fps und der Stabilisator.$noMic"
-            quickRedo != null -> quickRedo
-            !tests.has("klapp") || !tests.has("dauer") ->
-                "Jetzt Klapptest und Dauertest, beide mit 4K · ${bestFps()}. Danach den Bericht kopieren und mir in den Chat einfügen.$noMic"
-            laterRedo != null -> laterRedo
-            else -> "Alles gemessen. Kopiere den Bericht und füge ihn bei mir im Chat ein."
+            !quickDone -> "Starte den KI-Schnelltest. Er lädt beide KI-Modelle auf den KI-Chip, misst Tempo und Genauigkeit " +
+                "und filmt dann 30 Sekunden in 4K, während beide mitrechnen. Beim ersten Mal dauert das Laden länger; " +
+                "rechne mit etwa drei Minuten.$noMic"
+            repeatReason("live") != null -> repeatReason("live")!!
+            !tests.has("kidauer") -> "Jetzt der KI-Dauertest: Handy hinlegen, Kamera auf eine Szene mit einem Gegenstand " +
+                "in der Mitte. Vorher kannst du in der KI-Vorschau auf Dinge tippen und zusehen, wie die Markierung folgt.$noMic"
+            repeatReason("kidauer") != null -> repeatReason("kidauer")!!
+            else -> "Alles gemessen. Kopiere den Bericht und füge ihn bei mir im Chat ein. " +
+                "In der KI-Vorschau kannst du Tiefe und Verfolgung weiter ausprobieren."
         }
     }
 
-    /**
-     * Warum ein Test noch einmal laufen sollte, oder null. Ein Fehler, der jedes Mal käme
-     * (etwa eine Einstellung, die die Kamera nicht kann), ist ein Ergebnis und kein Grund.
-     */
+    /** Warum ein Test noch einmal laufen sollte, oder null. */
     private fun repeatReason(key: String): String? {
         val r = readTests().optJSONObject(key) ?: return null
-        if (r.has("ergebnis") || r.has("fehler")) return null
-        val end = r.optString("ende")
-        return when (key) {
-            "klapp" -> when {
-                end == "gestoppt" -> "Der Klapptest wurde gestoppt. Starte ihn bitte noch einmal."
-                screenChanges(r) == 0 && eventsDuringRecording(r, "im Hintergrund") == 0 ->
-                    "Beim Klapptest wurde kein Klappen erkannt. Starte ihn noch einmal und klapp, sobald der Hinweis erscheint."
-                else -> null
+        if (r.has("fehler")) return null
+        return when (r.optString("ende")) {
+            "gestoppt" -> if (key == "kidauer") {
+                "Der KI-Dauertest wurde vorzeitig gestoppt. Starte ihn bitte noch einmal, er braucht die vollen 10 Minuten."
+            } else {
+                "Der KI-Schnelltest wurde unterbrochen. Starte ihn bitte noch einmal und lass die App dabei offen."
             }
-            "dauer" -> when (end) {
-                "gestoppt" -> "Der Dauertest wurde vorzeitig gestoppt. Starte ihn bitte noch einmal, er braucht die vollen 10 Minuten."
-                "Kamera wurde geschlossen", "Aufnahme startete nicht" ->
-                    "Der Dauertest brach ab, weil die Kamera geschlossen wurde. Lief die App die ganze Zeit sichtbar, ist das schon ein Ergebnis; sonst wiederhole ihn."
-                else -> null
-            }
-            else -> when (end) {
-                "gestoppt", "Kamera wurde geschlossen", "Aufnahme startete nicht" ->
-                    "Der Schnelltest wurde unterbrochen. Starte ihn bitte noch einmal und lass die App dabei offen."
-                else -> null
-            }
+            "Kamera wurde geschlossen", "Aufnahme startete nicht" ->
+                "Die Aufnahme brach ab, weil die Kamera geschlossen wurde. Lief die App die ganze Zeit sichtbar, ist das schon ein Ergebnis; sonst wiederhole den Test."
+            else -> null
         }
-    }
-
-    private fun screenChanges(r: JSONObject): Int = eventsDuringRecording(r, "Bildschirm")
-
-    /** Wie oft ein Ereignis während der Aufnahme kam; davor (Kamerastart) und danach zählt nicht. */
-    private fun eventsDuringRecording(r: JSONObject, kind: String): Int {
-        val list = r.optJSONArray("ereignisse") ?: return 0
-        val limit = (r.optJSONObject("angefragt")?.optInt("sekunden", FOLD_SECONDS) ?: FOLD_SECONDS) + 1.0
-        var n = 0
-        for (i in 0 until list.length()) {
-            val e = list.optJSONObject(i) ?: continue
-            val s = e.optDouble("s", -1.0)
-            if (e.optString("art") == kind && s >= 0.0 && s <= limit) n++
-        }
-        return n
     }
 
     // ---------------------------------------------------------------- Oberfläche
 
     private fun render() {
         val busy = running != null
+        val previewing = running == "vorschau"
         val ready = provider != null
         val quickDone = quickTestDone()
         mainButton.text = when {
-            busy -> "Stopp"
-            quickDone -> "Schnelltest wiederholen"
-            else -> "Schnelltest starten"
+            busy && !previewing -> "Stopp"
+            quickDone -> "KI-Schnelltest wiederholen"
+            else -> "KI-Schnelltest starten"
         }
-        if (busy) mainButton.filled(Palette.red, Color.WHITE) else mainButton.filled(Palette.text, Palette.background)
-        mainButton.isEnabled = busy || ready
-        foldButton.isEnabled = !busy && ready && quickDone
+        if (busy && !previewing) mainButton.filled(Palette.red, Color.WHITE) else mainButton.filled(Palette.text, Palette.background)
+        mainButton.isEnabled = (busy && !previewing) || (!busy && ready)
+        previewButton.text = if (previewing) "Vorschau beenden" else "KI-Vorschau"
+        if (previewing) previewButton.filled(Palette.green, Palette.background) else previewButton.outlined()
+        previewButton.isEnabled = previewing || (!busy && ready)
         longButton.isEnabled = !busy && ready && quickDone
         val hasReport = report.length() > 0
         copyButton.isEnabled = hasReport && !busy
@@ -1182,6 +1377,32 @@ class MainActivity : ComponentActivity() {
         resultScroll.post { resultScroll.smoothScrollTo(0, max(0, resultCard.top + row.top - dp(8f))) }
     }
 
+    /** Kleine Plakette über dem Bild, z. B. REC oder das Tempo der KI. */
+    private fun badge(dotColor: Int?): TextView = label(12f, Color.WHITE, Fonts.medium).apply {
+        background = GradientDrawable().apply {
+            setColor(0x99000000.toInt())
+            cornerRadius = dpf(13f)
+        }
+        setPadding(dp(if (dotColor != null) 9f else 10f), dp(4f), dp(11f), dp(4f))
+        if (dotColor != null) {
+            compoundDrawablePadding = dp(6f)
+            setCompoundDrawablesRelativeWithIntrinsicBounds(dot(dotColor, 7f), null, null, null)
+        }
+        fontFeatureSettings = "tnum"
+        gravity = Gravity.CENTER_VERTICAL
+        maxLines = 1
+        ellipsize = TextUtils.TruncateAt.END
+    }
+
+    private fun panel(): FrameLayout = FrameLayout(this).apply {
+        background = GradientDrawable().apply {
+            setColor(Color.BLACK)
+            cornerRadius = dpf(16f)
+        }
+        outlineProvider = ViewOutlineProvider.BACKGROUND
+        clipToOutline = true
+    }
+
     private fun buildUi(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1193,14 +1414,13 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        // Schriftzug aus dem Logo, daneben eine kleine Plakette „TEST“
         val wordmark = ImageView(this).apply {
             setImageResource(R.drawable.wordmark)
             contentDescription = "CineBo"
             adjustViewBounds = true
         }
-        val badge = label(11f, Palette.textDim, Fonts.medium).apply {
-            text = "TEST"
+        val stageBadge = label(11f, Palette.textDim, Fonts.medium).apply {
+            text = "TEST · KI"
             letterSpacing = 0.08f
             includeFontPadding = false
             setLineSpacing(0f, 1f)
@@ -1215,46 +1435,50 @@ class MainActivity : ComponentActivity() {
             fontFeatureSettings = "tnum"
         }
         header.addView(wordmark, lp(WRAP, dp(20f)))
-        header.addView(badge, lp(WRAP, WRAP).apply { marginStart = dp(10f) })
+        header.addView(stageBadge, lp(WRAP, WRAP).apply { marginStart = dp(10f) })
         header.addView(View(this), lp(0, 1, 1f))
         header.addView(version, lp(WRAP, WRAP))
         root.addView(header, lp(MATCH, dp(48f)))
 
-        // Vorschau mit Aufnahme-Anzeige
-        previewBox = FrameLayout(this).apply {
-            background = GradientDrawable().apply {
-                setColor(Color.BLACK)
-                cornerRadius = dpf(18f)
-            }
-            outlineProvider = ViewOutlineProvider.BACKGROUND
-            clipToOutline = true
-        }
+        // Bühne: Kamerabild mit Maske, daneben die Tiefe
+        previewBox = FrameLayout(this)
+        val cameraPanel = panel()
         previewView = PreviewView(this).apply {
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
             scaleType = PreviewView.ScaleType.FIT_CENTER
             setBackgroundColor(Color.BLACK)
         }
-        previewBox.addView(previewView, FrameLayout.LayoutParams(MATCH, MATCH))
-        recBadge = label(13f, Color.WHITE, Fonts.medium).apply {
-            background = GradientDrawable().apply {
-                setColor(0x99000000.toInt())
-                cornerRadius = dpf(14f)
-            }
-            setPadding(dp(10f), dp(5f), dp(12f), dp(5f))
-            compoundDrawablePadding = dp(7f)
-            setCompoundDrawablesRelativeWithIntrinsicBounds(dot(Palette.red, 8f), null, null, null)
-            fontFeatureSettings = "tnum"
-            gravity = Gravity.CENTER_VERTICAL
-            visibility = View.GONE
-        }
-        previewBox.addView(recBadge, FrameLayout.LayoutParams(WRAP, WRAP).apply {
+        cameraPanel.addView(previewView, FrameLayout.LayoutParams(MATCH, MATCH))
+        maskOverlay = MaskOverlay(this)
+        cameraPanel.addView(maskOverlay, FrameLayout.LayoutParams(MATCH, MATCH))
+        recBadge = badge(Palette.red).apply { visibility = View.GONE }
+        cameraPanel.addView(recBadge, FrameLayout.LayoutParams(WRAP, WRAP).apply {
             gravity = Gravity.TOP or Gravity.START
-            setMargins(dp(12f), dp(12f), 0, 0)
+            setMargins(dp(10f), dp(10f), dp(10f), 0)
         })
+        aiBadge = badge(Palette.green).apply { visibility = View.GONE }
+        cameraPanel.addView(aiBadge, FrameLayout.LayoutParams(WRAP, WRAP).apply {
+            gravity = Gravity.BOTTOM or Gravity.START
+            setMargins(dp(10f), 0, dp(10f), dp(10f))
+        })
+        val depthPanel = panel()
+        depthView = DepthView(this)
+        depthPanel.addView(depthView, FrameLayout.LayoutParams(MATCH, MATCH))
+        val depthBadge = badge(null).apply { text = "Tiefe · hell ist nah" }
+        depthPanel.addView(depthBadge, FrameLayout.LayoutParams(WRAP, WRAP).apply {
+            gravity = Gravity.TOP or Gravity.START
+            setMargins(dp(10f), dp(10f), dp(10f), 0)
+        })
+        stage = StageLayout(this, cameraPanel, depthPanel)
+        previewBox.addView(stage, FrameLayout.LayoutParams(MATCH, MATCH))
         permissionPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             setPadding(dp(24f), dp(24f), dp(24f), dp(24f))
+            background = GradientDrawable().apply {
+                setColor(Palette.surface)
+                cornerRadius = dpf(16f)
+            }
             visibility = View.GONE
         }
         val permissionText = label(15f, Palette.text).apply {
@@ -1293,15 +1517,15 @@ class MainActivity : ComponentActivity() {
         mainButton = PillButton(this).apply { setOnClickListener { onMainButton() } }
         root.addView(mainButton, lp(MATCH, dp(52f)).apply { topMargin = dp(14f) })
         val pair = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        foldButton = PillButton(this).apply {
-            text = "Klapptest · 30 s"
-            setOnClickListener { runFoldTest() }
+        previewButton = PillButton(this).apply {
+            text = "KI-Vorschau"
+            setOnClickListener { onPreviewButton() }
         }
         longButton = PillButton(this).apply {
-            text = "Dauertest · 10 min"
+            text = "KI-Dauertest · 10 min"
             setOnClickListener { runLongTest() }
         }
-        pair.addView(foldButton, lp(0, dp(48f), 1f).apply { marginEnd = dp(5f) })
+        pair.addView(previewButton, lp(0, dp(48f), 1f).apply { marginEnd = dp(5f) })
         pair.addView(longButton, lp(0, dp(48f), 1f).apply { marginStart = dp(5f) })
         root.addView(pair, lp(MATCH, WRAP).apply { topMargin = dp(10f) })
         hintText = label(13f, Palette.textDim)
@@ -1369,7 +1593,7 @@ class MainActivity : ComponentActivity() {
 
     private fun lp(width: Int, height: Int, weight: Float = 0f) = LinearLayout.LayoutParams(width, height, weight)
 
-    private fun previewHeight(config: Configuration): Int = dp(max(180f, config.screenHeightDp * 0.30f))
+    private fun previewHeight(config: Configuration): Int = dp(max(200f, config.screenHeightDp * 0.36f))
 
     private fun screenKey(config: Configuration) = "${config.screenWidthDp}x${config.screenHeightDp}"
 

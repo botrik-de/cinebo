@@ -17,3 +17,7 @@ keystore.properties
 *.mp4
 *.mov
 *.m4v
+
+# KI-Modelle kommen beim Bauen aus den Releases, nie ins Repo
+app/src/main/assets/modelle/
+*.tflite

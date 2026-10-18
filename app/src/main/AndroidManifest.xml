@@ -12,6 +12,11 @@
         android:label="CineBo Test"
         android:theme="@android:style/Theme.Material.NoActionBar">
 
+        <!-- Zugang zum KI-Chip (Hexagon) über Qualcomms FastRPC-Bibliothek des Herstellers. -->
+        <uses-native-library
+            android:name="libcdsprpc.so"
+            android:required="false" />
+
         <!-- Auf- und Zuklappen startet die Ansicht nicht neu: So lässt sich prüfen,
              ob eine laufende Aufnahme das Klappen übersteht. -->
         <activity

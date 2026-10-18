@@ -6,9 +6,9 @@ import org.json.JSONObject
 import java.io.File
 
 /** Hebt den Bericht auf, damit nach einem Absturz oder Neustart nichts verloren geht. */
-internal class ReportStore(context: Context) {
+internal class ReportStore(context: Context, name: String = "bericht.json") {
 
-    private val file = File(context.filesDir, "bericht.json")
+    private val file = File(context.filesDir, name)
 
     fun load(): JSONObject = try {
         if (file.exists()) JSONObject(file.readText()) else JSONObject()
