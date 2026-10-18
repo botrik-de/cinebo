@@ -3,6 +3,12 @@ name: Test-App bauen
 on:
   push:
     branches: [main]
+    # Änderungen nur an Prüf- und Export-Abläufen bauen keine neue Test-App.
+    paths-ignore:
+      - 'README.md'
+      - '.github/workflows/modelle.yml'
+      - '.github/workflows/modell-export.yml'
+      - 'tools/export/**'
   workflow_dispatch:
 
 permissions:
