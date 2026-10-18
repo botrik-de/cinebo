@@ -9,7 +9,7 @@
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
-        android:label="Cinebo Test"
+        android:label="CineBo Test"
         android:theme="@android:style/Theme.Material.NoActionBar">
 
         <!-- Auf- und Zuklappen startet die Ansicht nicht neu: So lässt sich prüfen,

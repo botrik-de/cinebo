@@ -56,6 +56,6 @@ jobs:
           cp app/build/outputs/apk/release/app-release.apk cinebo-test.apk
           gh release create "test-${{ github.run_number }}" cinebo-test.apk \
             --target "${{ github.sha }}" \
-            --title "Cinebo Test ${version}" \
+            --title "CineBo Test ${version}" \
             --notes "Testversion ${version} für das OPPO Find N6." \
             --latest

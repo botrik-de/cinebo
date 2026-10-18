@@ -17,10 +17,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.SystemClock
 import android.provider.Settings
-import android.text.SpannableStringBuilder
-import android.text.Spanned
 import android.text.TextUtils
-import android.text.style.ForegroundColorSpan
 import android.util.Range
 import android.view.Gravity
 import android.view.View
@@ -28,6 +25,7 @@ import android.view.ViewGroup
 import android.view.ViewOutlineProvider
 import android.view.WindowManager
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -787,7 +785,7 @@ class MainActivity : ComponentActivity() {
 
     private fun reportText(): String {
         val o = JSONObject()
-        o.put("app", JSONObject().put("name", "Cinebo Test").put("version", appVersion).put("erstellt", nowIso()))
+        o.put("app", JSONObject().put("name", "CineBo Test").put("version", appVersion).put("erstellt", nowIso()))
         val keys = report.keys()
         while (keys.hasNext()) {
             val k = keys.next()
@@ -798,7 +796,7 @@ class MainActivity : ComponentActivity() {
 
     private fun copyReport() {
         val clipboard = getSystemService(ClipboardManager::class.java)
-        clipboard.setPrimaryClip(ClipData.newPlainText("Cinebo-Testbericht", reportText()))
+        clipboard.setPrimaryClip(ClipData.newPlainText("CineBo-Testbericht", reportText()))
         copyButton.text = "Kopiert"
         copyButton.postDelayed({ copyButton.text = "Bericht kopieren" }, 1800)
     }
@@ -813,8 +811,8 @@ class MainActivity : ComponentActivity() {
             val send = Intent(Intent.ACTION_SEND).apply {
                 type = "text/plain"
                 putExtra(Intent.EXTRA_STREAM, uri)
-                putExtra(Intent.EXTRA_SUBJECT, "Cinebo-Testbericht")
-                clipData = ClipData.newRawUri("Cinebo-Testbericht", uri)
+                putExtra(Intent.EXTRA_SUBJECT, "CineBo-Testbericht")
+                clipData = ClipData.newRawUri("CineBo-Testbericht", uri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             startActivity(Intent.createChooser(send, "Bericht teilen"))
@@ -1102,15 +1100,30 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        val title = label(20f, Palette.text, Fonts.medium).apply {
-            text = SpannableStringBuilder("Cinebo")
-                .append(" Test", ForegroundColorSpan(Palette.textDim), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        // Schriftzug aus dem Logo, daneben eine kleine Plakette „TEST“
+        val wordmark = ImageView(this).apply {
+            setImageResource(R.drawable.wordmark)
+            contentDescription = "CineBo"
+            adjustViewBounds = true
+        }
+        val badge = label(11f, Palette.textDim, Fonts.medium).apply {
+            text = "TEST"
+            letterSpacing = 0.08f
+            includeFontPadding = false
+            setLineSpacing(0f, 1f)
+            setPadding(dp(7f), dp(3f), dp(7f), dp(3f))
+            background = GradientDrawable().apply {
+                cornerRadius = dpf(5f)
+                setStroke(dp(1f), Palette.line)
+            }
         }
         val version = label(13f, Palette.textFaint).apply {
             text = "Version $appVersion"
             fontFeatureSettings = "tnum"
         }
-        header.addView(title, lp(0, WRAP, 1f))
+        header.addView(wordmark, lp(WRAP, dp(20f)))
+        header.addView(badge, lp(WRAP, WRAP).apply { marginStart = dp(10f) })
+        header.addView(View(this), lp(0, 1, 1f))
         header.addView(version, lp(WRAP, WRAP))
         root.addView(header, lp(MATCH, dp(48f)))
 

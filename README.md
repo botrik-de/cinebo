@@ -1,10 +1,10 @@
-# Cinebo
+# CineBo
 
 Eine Kamera-App für das OPPO Find N6, die beim Filmen live ein natürliches Bokeh erzeugt. Die Schärfe liegt automatisch oder per Tippen auf Personen und Objekten.
 
 ## Stand
 
-Phase 1: Machbarkeitstest. Die Test-App „Cinebo Test“ prüft, ob das Handy Kamera, Aufnahme und Wärme in 4K live schafft.
+Phase 1: Machbarkeitstest. Die Test-App „CineBo Test“ prüft, ob das Handy Kamera, Aufnahme und Wärme in 4K live schafft.
 
 ## Test-App
 
