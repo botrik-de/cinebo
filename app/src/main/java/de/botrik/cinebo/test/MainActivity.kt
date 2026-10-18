@@ -255,7 +255,13 @@ class MainActivity : ComponentActivity() {
         // Ohne sichtbare App filmt die Kamera nicht weiter: Schnell- und Dauertest halten an,
         // statt mit falschen Werten weiterzulaufen. Nur der Klapptest läuft weiter, weil
         // Klappen die App kurz in den Hintergrund schicken kann; genau das soll er messen.
-        if (running != null && running != "klapp") requestStop()
+        // Geprüft wird nach 1,5 s: Manche Geräte stoppen die App beim Kamerastart ganz kurz.
+        if (running != null && running != "klapp") {
+            previewView.postDelayed({
+                val visible = lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+                if (!visible && running != null && running != "klapp") requestStop()
+            }, 1500)
+        }
         super.onStop()
     }
 
@@ -647,6 +653,10 @@ class MainActivity : ComponentActivity() {
         } finally {
             counting = false
             recBadge.visibility = View.GONE
+            if (recordingHint != null) {
+                hintOverride = "Aufnahme beendet, wird ausgewertet. Jetzt nicht mehr klappen."
+                hintText.text = hintOverride
+            }
             if (!finished.isCompleted) recording.stop()
         }
 
@@ -950,12 +960,8 @@ class MainActivity : ComponentActivity() {
     private fun foldSummary(r: JSONObject): Pair<Mark, String> {
         val error = r.optString("fehler")
         if (error.isNotEmpty()) return Mark.FAIL to error
-        val list = r.optJSONArray("ereignisse") ?: JSONArray()
         val screenChanges = screenChanges(r)
-        var background = false
-        for (i in 0 until list.length()) {
-            if (list.optJSONObject(i)?.optString("art") == "im Hintergrund") background = true
-        }
+        val background = eventsDuringRecording(r, "im Hintergrund") > 0
         val file = r.optJSONObject("datei")
         val seconds = file?.optDouble("dauerS", 0.0) ?: 0.0
         val end = endNote(r)
@@ -968,10 +974,11 @@ class MainActivity : ComponentActivity() {
             parts.add("Aufnahme endete nach ${de(seconds, 0)} s" + if (end != null) ": $end" else "")
             mark = Mark.FAIL
         }
-        if (screenChanges == 0) {
+        // Geklappt hat er, wenn der Bildschirm wechselte oder die App dabei in den Hintergrund ging.
+        if (screenChanges == 0 && !background) {
             parts.add("kein Klappen erkannt, bitte wiederholen")
             if (mark == Mark.OK) mark = Mark.WARN
-        } else {
+        } else if (screenChanges > 0) {
             parts.add("$screenChanges× Bildschirm gewechselt")
         }
         if (file != null && file.has("abstandMaxMs")) {
@@ -1073,7 +1080,7 @@ class MainActivity : ComponentActivity() {
         return when (key) {
             "klapp" -> when {
                 end == "gestoppt" -> "Der Klapptest wurde gestoppt. Starte ihn bitte noch einmal."
-                screenChanges(r) == 0 ->
+                screenChanges(r) == 0 && eventsDuringRecording(r, "im Hintergrund") == 0 ->
                     "Beim Klapptest wurde kein Klappen erkannt. Starte ihn noch einmal und klapp, sobald der Hinweis erscheint."
                 else -> null
             }
@@ -1091,11 +1098,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun screenChanges(r: JSONObject): Int {
+    private fun screenChanges(r: JSONObject): Int = eventsDuringRecording(r, "Bildschirm")
+
+    /** Wie oft ein Ereignis während der Aufnahme kam; davor (Kamerastart) und danach zählt nicht. */
+    private fun eventsDuringRecording(r: JSONObject, kind: String): Int {
         val list = r.optJSONArray("ereignisse") ?: return 0
+        val limit = (r.optJSONObject("angefragt")?.optInt("sekunden", FOLD_SECONDS) ?: FOLD_SECONDS) + 1.0
         var n = 0
         for (i in 0 until list.length()) {
-            if (list.optJSONObject(i)?.optString("art") == "Bildschirm") n++
+            val e = list.optJSONObject(i) ?: continue
+            val s = e.optDouble("s", -1.0)
+            if (e.optString("art") == kind && s >= 0.0 && s <= limit) n++
         }
         return n
     }
