@@ -1,0 +1,19 @@
+# Gradle und Android Studio
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Signaturschlüssel nie einchecken
+*.jks
+*.keystore
+keystore.properties
+
+# Videos und Testclips nie einchecken
+*.mp4
+*.mov
+*.m4v
