@@ -392,10 +392,24 @@ class MainActivity : ComponentActivity() {
         render()
         reveal("steckbrief")
         setStatus(Phase.BUSY, "Liest die Kameradaten …")
+        // Jeder Teil für sich: Ein Fehler in einem Teil soll den Rest nicht verhindern.
         val profile = withContext(Dispatchers.Default) {
-            CameraReport.build(this@MainActivity).put("encoder", CodecReport.build())
+            val p = try {
+                CameraReport.build(this@MainActivity)
+            } catch (e: Exception) {
+                JSONObject().put("fehler", e.toString())
+            }
+            p.put("encoder", try {
+                CodecReport.build()
+            } catch (e: Exception) {
+                JSONArray().put(e.toString())
+            })
         }
-        profile.put("cameraX", cameraXInfo())
+        profile.put("cameraX", try {
+            cameraXInfo()
+        } catch (e: Exception) {
+            JSONObject().put("fehler", e.toString())
+        })
         profile.put("anzeige", displayInfo())
         profile.put("speicherFreiGB", r1(filesDir.usableSpace / 1e9))
         profile.put("waerme", DeviceHeat.read(this))
@@ -544,23 +558,29 @@ class MainActivity : ComponentActivity() {
         recordingSince = 0L
         events = JSONArray()
 
-        var pending = recorder.prepareRecording(this, FileOutputOptions.Builder(file).build())
-        if (audio) pending = pending.withAudioEnabled()
-        val recording = pending.start(ContextCompat.getMainExecutor(this)) { event ->
-            when (event) {
-                is VideoRecordEvent.Start -> {
-                    frames.reset()
-                    counting = true
-                    recordingSince = SystemClock.elapsedRealtime()
-                    started.complete(Unit)
-                }
-                is VideoRecordEvent.Status -> stats = event.recordingStats
-                is VideoRecordEvent.Finalize -> {
-                    counting = false
-                    stats = event.recordingStats
-                    finished.complete(event)
+        val recording = try {
+            var pending = recorder.prepareRecording(this, FileOutputOptions.Builder(file).build())
+            if (audio) pending = pending.withAudioEnabled()
+            pending.start(ContextCompat.getMainExecutor(this)) { event ->
+                when (event) {
+                    is VideoRecordEvent.Start -> {
+                        frames.reset()
+                        counting = true
+                        recordingSince = SystemClock.elapsedRealtime()
+                        started.complete(Unit)
+                    }
+                    is VideoRecordEvent.Status -> stats = event.recordingStats
+                    is VideoRecordEvent.Finalize -> {
+                        counting = false
+                        stats = event.recordingStats
+                        finished.complete(event)
+                    }
                 }
             }
+        } catch (e: Exception) {
+            events = null
+            out.put("fehler", "Aufnahme ließ sich nicht starten: ${e.message ?: e.javaClass.simpleName}")
+            return out
         }
 
         var stoppedByUser = false
@@ -619,7 +639,14 @@ class MainActivity : ComponentActivity() {
         events = null
         if (log != null && log.length() > 0) out.put("ereignisse", log)
         if (file.exists() && file.length() > 0) {
-            out.put("datei", withContext(Dispatchers.IO) { VideoFileAnalysis.analyze(file, fps) })
+            val analysis = try {
+                withContext(Dispatchers.IO) { VideoFileAnalysis.analyze(file, fps) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                JSONObject().put("fehler", "Auswertung ging nicht: ${e.message ?: e.javaClass.simpleName}")
+            }
+            out.put("datei", analysis)
         } else {
             out.put("datei", JSONObject().put("fehler", "keine Datei"))
         }
@@ -832,7 +859,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun profileSummary(s: JSONObject): Pair<Mark, String> {
-        val cams = s.optJSONArray("kameras") ?: return Mark.FAIL to "Keine Kameradaten"
+        val cams = s.optJSONArray("kameras")
+            ?: return Mark.FAIL to ("Keine Kameradaten" + s.optString("fehler").let { if (it.isEmpty()) "" else ": $it" })
         val mainId = s.optJSONObject("cameraX")?.optString("standardKamera").orEmpty()
         var main: JSONObject? = null
         var videoBokeh = false
