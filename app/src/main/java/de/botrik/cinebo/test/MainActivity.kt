@@ -114,8 +114,8 @@ class MainActivity : ComponentActivity() {
         const val LOG_EVERY_S = 30.0
         const val FPS = 30
 
-        /** Ab diesem Tempo (Bilder je Sekunde, beide Modelle zusammen) reicht es für die App. */
-        const val TARGET_HZ = 15.0
+        /** Ziel aus dem Plan: Die KI schafft 10–15 Durchgänge pro Sekunde (beide Modelle zusammen). */
+        const val TARGET_HZ = 10.0
 
         val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
         val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
@@ -559,8 +559,10 @@ class MainActivity : ComponentActivity() {
         delay(300)
         waitForStreaming(5000)
         delay(1500) // Belichtung und Weißabgleich einpendeln lassen
-        val frame = grabFrame()
-            ?: throw IllegalStateException("Die Kamera liefert keine Bilder für die KI (${analysisSize ?: "?"}).")
+        val frame = grabFrame() ?: throw IllegalStateException(
+            "Die Kamera liefert keine Bilder für die KI (${analysisSize ?: "?"})" +
+                (prepError?.let { ". Vorbereitung: $it" } ?: ".")
+        )
         try {
             ki.put("bild", frameInfo(frame))
             val bench = withContext(engine.dispatcher) {
@@ -609,8 +611,8 @@ class MainActivity : ComponentActivity() {
         if (running != null) return
         launchTest {
             running = "vorschau"
-            render()
             hintOverride = "Tippe im Kamerabild auf ein Objekt: Die gelbe Markierung folgt ihm. Rechts die Tiefe, hell ist nah."
+            render()
             setStatus(Phase.BUSY, "Bereitet die KI vor …")
             val load = ensureLiveModels()
             if (load != null) report.optJSONObject("ki")?.put("ladenVorschau", load)
@@ -628,11 +630,16 @@ class MainActivity : ComponentActivity() {
 
     /** Lädt die Modelle für den Live-Betrieb, falls nötig. Gibt das Protokoll zurück oder null. */
     private suspend fun ensureLiveModels(): JSONObject? {
-        val ready = withContext(engine.dispatcher) { engine.liveReady() }
+        // Die Einzelmessung hat die schnellere Memory-Attention gewählt; die gilt auch nach einem Neustart.
+        val chosen = ki()?.optJSONObject("einzeln")?.optString("liveMemoryAttention").orEmpty()
+        val preferred = ModelId.entries.firstOrNull { it.key == chosen }
+        val ready = withContext(engine.dispatcher) {
+            if (preferred != null) engine.preferAttention(preferred)
+            engine.liveReady()
+        }
         if (ready) return null
-        val ids = ModelId.entries.filter { it.live }
         val load = withContext(engine.dispatcher) {
-            engine.load(ids) { done, total, _ -> runOnUiThread { loadingStatus(done, total) } }
+            engine.load(engine.liveSet()) { done, total, _ -> runOnUiThread { loadingStatus(done, total) } }
         }
         if (!withContext(engine.dispatcher) { engine.liveReady() }) {
             report.put("letzteLadung", load)
@@ -721,7 +728,7 @@ class MainActivity : ComponentActivity() {
                 val hz = (cycles - lastCycles) * 1000.0 / max(1L, now - lastT)
                 lastCycles = cycles
                 lastT = now
-                aiBadge.text = if (cycles == 0) "KI startet …" else "KI · ${de(hz, 0)} Bilder/s"
+                aiBadge.text = if (cycles == 0) "KI startet …" else "KI · ${de(hz, 0)}/s"
             }
         }
     }
@@ -740,11 +747,26 @@ class MainActivity : ComponentActivity() {
         var prevTs = 0L
         var prevBytes = 0L
         var prevT = 0.0
+        // Die KI-Zahlen gelten nur für die Zeit der Aufnahme: Beim Ende der Aufnahme werden sie
+        // festgehalten und die KI angehalten, bevor die Datei ausgewertet wird.
+        var aiTotal: JSONObject? = null
+        var prepared = 0L
+        var skipped = 0L
         val result = try {
-            record(key, FPS, seconds, stabilize = false, withAnalysis = true, onStart = {
-                engine.stats.reset()
-                pool.resetCounters()
-            }) { t, stats ->
+            record(
+                key, FPS, seconds, stabilize = false, withAnalysis = true,
+                onStart = {
+                    engine.stats.reset()
+                    pool.resetCounters()
+                },
+                onStop = {
+                    aiTotal = engine.stats.totalJson()
+                    prepared = pool.prepared
+                    skipped = pool.skipped
+                    engine.requestStop()
+                },
+                shouldStop = { liveJob?.isActive == false }
+            ) { t, stats ->
                 if (t >= next) {
                     val (count, first, last) = frames.snapshot()
                     val entry = JSONObject().put("s", next.toInt())
@@ -766,7 +788,7 @@ class MainActivity : ComponentActivity() {
                     next += LOG_EVERY_S
                     if (seconds > LIVE_SECONDS) {
                         val parts = mutableListOf("Läuft")
-                        if (window.has("hz")) parts.add("KI ${de(window.optDouble("hz"), 0)} Bilder/s")
+                        if (window.has("hz")) parts.add("KI ${de(window.optDouble("hz"), 0)}/s")
                         if (entry.has("fps")) parts.add("${de(entry.optDouble("fps"), 1)} fps")
                         if (heat.has("akkuGrad")) parts.add("Akku ${de(heat.optDouble("akkuGrad"), 1)} °C")
                         parts.add("Wärmestufe ${heat.optString("stufe")}")
@@ -778,9 +800,9 @@ class MainActivity : ComponentActivity() {
         } finally {
             stopLive()
         }
-        val ai = engine.stats.totalJson()
-        ai.put("kameraBilderFuerKi", pool.prepared)
-        ai.put("kameraBilderVerworfen", pool.skipped)
+        val ai = aiTotal ?: engine.stats.totalJson()
+        ai.put("kameraBilderFuerKi", if (aiTotal != null) prepared else pool.prepared)
+        ai.put("kameraBilderVerworfen", if (aiTotal != null) skipped else pool.skipped)
         ai.put("analyse", analysisSize ?: "?")
         ai.put("memoryAttention", engine.liveAttn.key)
         prepError?.let { ai.put("vorbereitungFehler", it) }
@@ -804,6 +826,8 @@ class MainActivity : ComponentActivity() {
         withAnalysis: Boolean = false,
         recordingHint: String? = null,
         onStart: () -> Unit = {},
+        onStop: () -> Unit = {},
+        shouldStop: () -> Boolean = { false },
         onTick: (Double, RecordingStats?) -> Unit = { _, _ -> }
     ): JSONObject {
         val out = JSONObject()
@@ -886,6 +910,7 @@ class MainActivity : ComponentActivity() {
         }
 
         var stoppedByUser = false
+        var aborted = false
         try {
             val waitUntil = SystemClock.elapsedRealtime() + 8000
             while (!started.isCompleted && !finished.isCompleted && SystemClock.elapsedRealtime() < waitUntil) {
@@ -901,6 +926,10 @@ class MainActivity : ComponentActivity() {
                 while (!finished.isCompleted) {
                     if (stopRequested) {
                         stoppedByUser = true
+                        break
+                    }
+                    if (shouldStop()) {
+                        aborted = true
                         break
                     }
                     val elapsed = SystemClock.elapsedRealtime() - recordingSince
@@ -920,6 +949,7 @@ class MainActivity : ComponentActivity() {
             }
         } finally {
             counting = false
+            onStop()
             recBadge.visibility = View.GONE
             if (!finished.isCompleted) recording.stop()
         }
@@ -931,6 +961,7 @@ class MainActivity : ComponentActivity() {
             end.hasError() -> finalizeText(end.error)
             !started.isCompleted -> "Aufnahme startete nicht"
             stoppedByUser -> "gestoppt"
+            aborted -> "abgebrochen, weil die KI nicht mehr lief"
             else -> "ok"
         }
         out.put("ende", endText)
@@ -1124,7 +1155,7 @@ class MainActivity : ComponentActivity() {
         val m = ki.optJSONObject("einzeln")?.optJSONObject("modelle")?.optJSONObject(ModelId.DEPTH.key)
             ?.optJSONObject("imModell") ?: return openRow("tiefe")
         val ms = m.optDouble("medianMs")
-        val parts = mutableListOf("${de(ms, 0)} ms je Bild auf dem KI-Chip (${de(1000.0 / ms, 0)} Bilder/s)")
+        val parts = mutableListOf("${de(ms, 0)} ms je Durchgang auf dem KI-Chip, also bis zu ${de(1000.0 / ms, 0)} pro Sekunde")
         var mark = if (ms <= 1000.0 / TARGET_HZ) Mark.OK else Mark.WARN
         val acc = ki.optJSONObject("genauigkeit")?.optJSONObject("tiefe")
         if (acc != null) {
@@ -1148,13 +1179,13 @@ class MainActivity : ComponentActivity() {
         fun median(name: String) = per.optJSONObject(name)?.optDouble("medianMs", Double.NaN) ?: Double.NaN
         val track = median("verfolgung")
         val both = median("beide")
-        val parts = mutableListOf("${de(track, 0)} ms je Bild (${de(1000.0 / track, 0)} Bilder/s)")
+        val parts = mutableListOf("${de(track, 0)} ms je Durchgang, also bis zu ${de(1000.0 / track, 0)} pro Sekunde")
         parts += "Encoder ${de(median("encoder"), 0)} · Speicher lesen ${de(median("speicherAttention"), 0)} · " +
             "Decoder ${de(median("decoder"), 0)} · Speicher schreiben ${de(median("speicherEncoder"), 0)} ms"
         var mark = Mark.OK
         if (!both.isNaN()) {
             val hz = 1000.0 / both
-            parts += "mit Tiefe zusammen ${de(both, 0)} ms (${de(hz, 0)} Bilder/s)"
+            parts += "mit der Tiefe zusammen ${de(both, 0)} ms, also bis zu ${de(hz, 0)} Durchgänge pro Sekunde"
             if (hz < TARGET_HZ) mark = Mark.WARN
         }
         val acc = ki.optJSONObject("genauigkeit")?.optJSONObject("verfolgung")
@@ -1180,7 +1211,7 @@ class MainActivity : ComponentActivity() {
         if (key == "kidauer" && file != null && file.has("dauerS")) parts += "${clock(file.optDouble("dauerS").toLong())} min"
         if (ai != null && ai.has("hz")) {
             val hz = ai.optDouble("hz")
-            var text = "KI ${de(hz, 0)} Bilder/s"
+            var text = "KI: ${de(hz, 0)} Durchgänge pro Sekunde"
             val log = r.optJSONArray("verlauf")
             if (key == "kidauer" && log != null && log.length() > 1) {
                 var lo = Double.MAX_VALUE
@@ -1191,13 +1222,17 @@ class MainActivity : ComponentActivity() {
                     lo = min(lo, w)
                     hi = max(hi, w)
                 }
-                if (lo <= hi) text = "KI ${de(lo, 0)} bis ${de(hi, 0)} Bilder/s"
+                if (lo <= hi) text = "KI: ${de(lo, 0)} bis ${de(hi, 0)} Durchgänge pro Sekunde"
                 if (lo < TARGET_HZ) mark = Mark.WARN
             }
             parts += text
             if (hz < TARGET_HZ) mark = Mark.WARN
             if (ai.optInt("aufStandbild") > 0) {
                 parts += "ohne Kamerabilder für die KI (Standbild)"
+                mark = Mark.WARN
+            }
+            aspectNote(ai.optString("analyse"))?.let {
+                parts += it
                 mark = Mark.WARN
             }
         } else {
@@ -1214,7 +1249,10 @@ class MainActivity : ComponentActivity() {
             val reason = endNote(r) ?: file?.optString("fehler")?.ifEmpty { null } ?: "keine auswertbare Aufnahme"
             return Mark.FAIL to reason.replaceFirstChar { it.uppercase() }
         }
-        ai?.optInt("objektGefundenProzent", -1)?.takeIf { it >= 0 }?.let { parts += "Objekt in $it % der Bilder gefunden" }
+        ai?.optInt("objektGefundenProzent", -1)?.takeIf { it >= 0 }?.let { parts += "Objekt in $it % der Durchgänge gefunden" }
+        ai?.optJSONObject("ms")?.optJSONObject("alterErgebnis")?.optDouble("median", Double.NaN)?.takeIf { !it.isNaN() }?.let {
+            parts += "Ergebnis ${de(it, 0)} ms nach dem Kamerabild fertig"
+        }
         if (key == "kidauer") {
             val heat = r.optJSONObject("waerme")
             val start = heat?.optJSONObject("start")
@@ -1241,6 +1279,16 @@ class MainActivity : ComponentActivity() {
             mark = Mark.WARN
         }
         return mark to parts.joinToString(" · ")
+    }
+
+    /** Liefert die Kamera die KI-Bilder nicht in 16:9, sitzt die Markierung nicht genau auf dem Bild. */
+    private fun aspectNote(size: String?): String? {
+        val m = Regex("(\\d+)x(\\d+)").find(size ?: return null) ?: return null
+        val w = m.groupValues[1].toDouble()
+        val h = m.groupValues[2].toDouble()
+        if (w <= 0 || h <= 0) return null
+        val ratio = max(w, h) / min(w, h)
+        return if (kotlin.math.abs(ratio - 16.0 / 9.0) > 0.03) "KI-Bilder nicht in 16:9 ($size), Markierung kann versetzt sein" else null
     }
 
     private fun endNote(r: JSONObject): String? = when (val end = r.optString("ende")) {

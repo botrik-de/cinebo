@@ -80,7 +80,19 @@ internal class AiEngine(private val context: Context) {
 
     fun liveReady(): Boolean = liveSet().all { models.containsKey(it) } && tracker != null
 
-    private fun liveSet(): List<ModelId> = listOf(ModelId.DEPTH, ModelId.ENC, ModelId.DEC, liveAttn, ModelId.MEMENC)
+    /** Die Modelle, die live laufen; die Memory-Attention ist die zuletzt gewählte. */
+    fun liveSet(): List<ModelId> = listOf(ModelId.DEPTH, ModelId.ENC, ModelId.DEC, liveAttn, ModelId.MEMENC)
+
+    /**
+     * Übernimmt die Memory-Attention, die die Einzelmessung als schnellere gewählt hat
+     * (steht im Bericht), damit Dauertest und Vorschau auch nach einem Neustart dieselbe nehmen.
+     */
+    fun preferAttention(id: ModelId) {
+        if (id != ModelId.ATTN && id != ModelId.ATTN4) return
+        if (id == liveAttn) return
+        liveAttn = id
+        buildTracker()
+    }
 
     // ------------------------------------------------------------ Laden
 
@@ -490,6 +502,7 @@ internal class AiEngine(private val context: Context) {
     /** Vor jedem Start von [runLive] aufrufen (auf dem Hauptthread), damit ein frühes Stopp nicht verloren geht. */
     fun beginLive() {
         stopLive = false
+        pendingTap = null
     }
 
     fun requestStop() {
@@ -529,17 +542,22 @@ internal class AiEngine(private val context: Context) {
                     val depthNative = depth.lastNativeMs
                     val tap = pendingTap
                     if (tap != null) pendingTap = null
-                    if (tap != null || !t.started) {
+                    // Startbild: neu angetippt oder der erste Durchgang (Mitte des Bildes).
+                    val startFrame = tap != null || !t.started
+                    if (startFrame) {
                         t.start(slot.enc, tap?.get(0) ?: 0.5f, tap?.get(1) ?: 0.5f)
                     } else {
                         t.step(slot.enc)
                     }
                     val aiMs = (System.nanoTime() - start) / 1e6
-                    val ageMs = (SystemClock.elapsedRealtimeNanos() - slot.timestampNs) / 1e6
+                    // Wie alt das Ergebnis ist, gemessen ab dem Zeitstempel des Kamerabilds.
+                    // Je nach Gerät zählt die Kamera ab Systemstart mit oder ohne Tiefschlaf.
+                    val age = if (fromPool) frameAgeMs(slot.timestampNs) else Double.NaN
                     stats.add(
-                        aiMs = aiMs, depthMs = depthNative, encMs = t.encMs, attnMs = t.attnMs, decMs = t.decMs,
+                        aiMs = aiMs, depthMs = depthNative, encMs = t.encMs,
+                        attnMs = if (startFrame) Double.NaN else t.attnMs, decMs = t.decMs,
                         memMs = t.memMs, trackMs = t.totalMs, prepMs = slot.prepMs,
-                        ageMs = if (fromPool && ageMs > 0 && ageMs < 2000) ageMs else Double.NaN,
+                        ageMs = age, resultAgeMs = age + aiMs,
                         present = t.present, restart = tap != null, still = !fromPool
                     )
                     if (sink != null) {
@@ -556,6 +574,13 @@ internal class AiEngine(private val context: Context) {
         } finally {
             liveRunning = false
         }
+    }
+
+    private fun frameAgeMs(timestampNs: Long): Double {
+        val realtime = (SystemClock.elapsedRealtimeNanos() - timestampNs) / 1e6
+        if (realtime in 0.0..2000.0) return realtime
+        val monotonic = (System.nanoTime() - timestampNs) / 1e6
+        return if (monotonic in 0.0..2000.0) monotonic else Double.NaN
     }
 
     companion object {
@@ -583,7 +608,10 @@ internal class LiveStats {
         }
     }
 
-    private val names = listOf("ki", "tiefe", "encoder", "speicherAttention", "decoder", "speicherEncoder", "verfolgung", "vorbereitung", "alterBild")
+    private val names = listOf(
+        "ki", "tiefe", "encoder", "speicherAttention", "decoder", "speicherEncoder", "verfolgung",
+        "vorbereitung", "alterBild", "alterErgebnis"
+    )
     private val window = names.associateWith { Series() }
     private val total = names.associateWith { Series() }
     private var windowStart = SystemClock.elapsedRealtime()
@@ -612,9 +640,10 @@ internal class LiveStats {
     @Synchronized
     fun add(
         aiMs: Double, depthMs: Double, encMs: Double, attnMs: Double, decMs: Double, memMs: Double,
-        trackMs: Double, prepMs: Double, ageMs: Double, present: Boolean, restart: Boolean, still: Boolean
+        trackMs: Double, prepMs: Double, ageMs: Double, resultAgeMs: Double,
+        present: Boolean, restart: Boolean, still: Boolean
     ) {
-        val values = listOf(aiMs, depthMs, encMs, if (restart) Double.NaN else attnMs, decMs, memMs, trackMs, prepMs, ageMs)
+        val values = listOf(aiMs, depthMs, encMs, attnMs, decMs, memMs, trackMs, prepMs, ageMs, resultAgeMs)
         for ((i, name) in names.withIndex()) {
             window.getValue(name).add(values[i])
             total.getValue(name).add(values[i])

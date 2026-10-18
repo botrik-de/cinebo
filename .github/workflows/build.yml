@@ -66,6 +66,8 @@ jobs:
             curl -fsSL --retry 3 -o "$dst/$f" "$rel/$f"
           done
           (cd "$dst" && sha256sum *) | tee modelle-pruefsummen.txt
+          # Jede Datei muss genau die geprüfte sein; sonst bricht der Bau ab.
+          (cd "$dst" && sha256sum -c --quiet "$GITHUB_WORKSPACE/.github/modelle.sha256")
 
       - name: APK bauen
         shell: bash
