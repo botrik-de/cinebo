@@ -538,6 +538,9 @@ internal class AiEngine(private val context: Context) {
                 }
                 try {
                     val start = System.nanoTime()
+                    // Wie alt das Kamerabild ist, wenn die KI es aufnimmt. Je nach Gerät zählt die
+                    // Kamera ab Systemstart mit oder ohne Tiefschlaf.
+                    val age = if (fromPool) frameAgeMs(slot.timestampNs) else Double.NaN
                     depth.run(arrayOf(slot.depth))
                     val depthNative = depth.lastNativeMs
                     val tap = pendingTap
@@ -550,9 +553,7 @@ internal class AiEngine(private val context: Context) {
                         t.step(slot.enc)
                     }
                     val aiMs = (System.nanoTime() - start) / 1e6
-                    // Wie alt das Ergebnis ist, gemessen ab dem Zeitstempel des Kamerabilds.
-                    // Je nach Gerät zählt die Kamera ab Systemstart mit oder ohne Tiefschlaf.
-                    val age = if (fromPool) frameAgeMs(slot.timestampNs) else Double.NaN
+                    // Das Ergebnis ist fertig, wenn das Bild so alt ist wie beim Aufnehmen plus die Rechenzeit.
                     stats.add(
                         aiMs = aiMs, depthMs = depthNative, encMs = t.encMs,
                         attnMs = if (startFrame) Double.NaN else t.attnMs, decMs = t.decMs,

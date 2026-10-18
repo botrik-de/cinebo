@@ -656,6 +656,7 @@ class MainActivity : ComponentActivity() {
 
     /** Holt ein vorbereitetes Kamerabild; der Aufrufer gibt es mit pool.release zurück. */
     private suspend fun grabFrame(): FrameSlot? {
+        prepError = null
         pool.drain()
         feeding = true
         try {
