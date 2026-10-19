@@ -10,6 +10,10 @@ plugins {
 val buildNumber = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
 val versionLabel = System.getenv("CINEBO_VERSION") ?: "0.2.$buildNumber"
 
+// Eine Stelle für Qualcomms QNN-Version (gradle.properties): Der Delegate in der App und die
+// QNN-Laufzeit, die die App selbst lädt, müssen zusammenpassen.
+val qnnVersion: String = providers.gradleProperty("cinebo.qnnVersion").get()
+
 android {
     namespace = "de.botrik.cinebo.test"
     compileSdk = 35
@@ -81,8 +85,8 @@ dependencies {
 
     // KI: TFLite und Qualcomms QNN-Delegate für den KI-Chip, in der Kombination, die auch
     // Qualcomms eigene Beispiel-Apps verwenden. Die große QNN-Laufzeit (qnn-runtime, gleiche
-    // Version, QNN_VERSION im Bau-Ablauf) steckt nicht in der APK: Die App lädt sie mit den
-    // Modellen selbst (siehe ModelStore und Npu.loadLibraries).
+    // Version) steckt nicht in der APK: Die App lädt sie mit den Modellen selbst
+    // (siehe ModelStore und Npu.loadLibraries).
     implementation("org.tensorflow:tensorflow-lite:2.17.0")
-    implementation("com.qualcomm.qti:qnn-litert-delegate:2.50.0")
+    implementation("com.qualcomm.qti:qnn-litert-delegate:$qnnVersion")
 }

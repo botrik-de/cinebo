@@ -31,13 +31,13 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Die KI-Modelle und die große QNN-Laufzeit stecken nicht in der App: Sie werden einmal geladen
- * und bleiben dann auf dem Handy. Welche Dateien dazugehören, steht in assets/modelle.json (beim
- * Bauen erzeugt). Jede fertige Datei kommt aus einer Quelle: einzeln aus unserem Release, meist
- * gepackt (gzip), oder aus einem Archiv, etwa Qualcomms QNN-Paket direkt von Maven Central (die
- * Lizenz erlaubt nicht, die Bibliotheken einzeln weiterzugeben). Bricht die Verbindung ab, geht
- * es an derselben Stelle weiter. Jede Quelle und jede fertige Datei wird Byte für Byte geprüft;
- * erst dann gilt eine Datei als fertig.
+ * Die KI-Modelle und die große QNN-Laufzeit stecken nicht in der App: Sie werden einmal
+ * heruntergeladen und bleiben dann auf dem Handy. Welche Dateien dazugehören, steht in
+ * assets/modelle.json (beim Bauen erzeugt). Jede fertige Datei kommt aus einer Quelle: einzeln
+ * aus unserem Release, meist gepackt (gzip), oder aus einem Archiv, etwa Qualcomms QNN-Paket
+ * direkt von Maven Central (die Lizenz erlaubt nicht, die Bibliotheken einzeln weiterzugeben).
+ * Bricht die Verbindung ab, geht es an derselben Stelle weiter. Jede Quelle und jede fertige
+ * Datei wird Byte für Byte geprüft; erst dann gilt eine Datei als fertig.
  */
 internal class ModelStore(private val context: Context) {
 
@@ -60,15 +60,37 @@ internal class ModelStore(private val context: Context) {
         val pathInArchive: String?,
     )
 
-    /** Ein Versuch ist gescheitert; der nächste kommt in [inS] Sekunden. */
+    /**
+     * Pause im Laden: [inS] Sekunden bis zum nächsten Versuch nach einem Fehler, oder 0, solange
+     * auf etwas gewartet wird (WLAN, Internet) oder neu verbunden wird. [reason] steht in Worten da.
+     */
     class Retry(val inS: Int, val reason: String)
 
-    /** Stand des Ladens in Bytes der Übertragung; [retry] ist gesetzt, solange auf einen neuen Versuch gewartet wird. */
+    /** Stand des Ladens in Bytes der Übertragung; [retry] ist gesetzt, solange es gerade nicht vorangeht. */
     fun interface Progress {
         fun update(done: Long, total: Long, retry: Retry?)
     }
 
+    /** Was nach einem endgültigen Fehler hilft. */
+    enum class Kind {
+        /** Verbindung: später noch einmal versuchen, es geht an derselben Stelle weiter. */
+        NETWORK,
+
+        /** Speicher auf dem Handy: Platz schaffen, dann weiter. */
+        STORAGE,
+
+        /** Liste und Server passen nicht zusammen: ein Fehler beim Bauen. */
+        BUILD,
+    }
+
+    /** Das Laden hat endgültig aufgehört; [message] nennt den Grund in Worten. */
+    class Failure(val kind: Kind, message: String, cause: Throwable? = null) : Exception(message, cause)
+
     val dir: File = File(context.filesDir, FOLDER).apply { mkdirs() }
+
+    /** Das letzte technische Problem beim Laden, für den Bericht. */
+    @Volatile var lastProblem: String? = null
+        private set
 
     private val list: JSONObject? by lazy {
         try {
@@ -81,10 +103,11 @@ internal class ModelStore(private val context: Context) {
     /** Kennung des Satzes, z. B. für den Bericht. */
     val version: String get() = list?.optString("version").orEmpty()
 
-    /** Quellen und fertige Dateien; leer, wenn die Liste fehlt oder nicht stimmt. */
+    /** Quellen und fertige Dateien; leer, wenn die Liste fehlt, ein anderes Format hat oder nicht stimmt. */
     private val parsed: Pair<List<Source>, List<Entry>> by lazy {
         try {
             val o = list ?: return@lazy emptyList<Source>() to emptyList()
+            require(o.optInt("format", 0) == LIST_FORMAT) { "Listenformat passt nicht" }
             val sourceList = o.getJSONArray("quellen")
             val sources = List(sourceList.length()) { i ->
                 val s = sourceList.getJSONObject(i)
@@ -133,7 +156,7 @@ internal class ModelStore(private val context: Context) {
         return name
     }
 
-    /** Ohne Liste lässt sich nichts laden; das wäre ein Fehler beim Bauen. */
+    /** Ohne gültige Liste lässt sich nichts laden; das wäre ein Fehler beim Bauen. */
     val hasList: Boolean get() = entries.isNotEmpty()
 
     fun file(name: String): File = File(dir, name)
@@ -198,15 +221,17 @@ internal class ModelStore(private val context: Context) {
         .put("fertig", entries.count { ready(it) })
         .put("mbUebertragung", r1(totalBytes() / 1e6))
         .put("mbAufDemHandy", r1(storageBytes() / 1e6))
+        .apply { lastProblem?.let { put("letztesProblem", it) } }
 
     /**
-     * Lädt alle fehlenden Dateien und meldet den Stand an [progress]. Läuft schon ein Download
-     * (etwa von einer früheren Ansicht), wartet dieser hier, bis jener fertig ist. Wirft erst,
-     * wenn es nach vielen Versuchen nicht weitergeht oder etwas grundsätzlich nicht passt.
+     * Lädt alle fehlenden Dateien und meldet den Stand an [progress]. Vor jeder Verbindung fragt es
+     * [gate]: Kommt ein Grund zurück (etwa „wartet auf WLAN“), wartet es, ohne das als Fehler zu
+     * zählen. Läuft schon ein Download (etwa von einer früheren Ansicht), wartet dieser hier, bis
+     * jener fertig ist. Wirft [Failure], wenn es endgültig nicht weitergeht.
      */
-    suspend fun download(progress: Progress) = withContext(Dispatchers.IO) {
+    suspend fun download(gate: () -> String? = { null }, progress: Progress) = withContext(Dispatchers.IO) {
         LOCK.withLock {
-            check(hasList) { "die Liste der KI-Modelle fehlt in der App" }
+            if (!hasList) throw Failure(Kind.BUILD, "die Liste der KI-Modelle fehlt oder ist ungültig")
             val total = totalBytes()
             checkSpace()
             progress.update(doneBytes(), total, null)
@@ -221,15 +246,16 @@ internal class ModelStore(private val context: Context) {
                 }
                 var damaged = 0
                 while (true) {
-                    fetch(s) { retry -> progress.update(doneBytes(), total, retry) }
+                    fetch(s, gate) { retry -> progress.update(doneBytes(), total, retry) }
                     val p = part(s)
                     if (sha256(p) == s.sha256) {
                         install(s, p, missing)
                         break
                     }
-                    // Beschädigt angekommen: einmal ganz neu laden, dann aufgeben.
+                    // Anders angekommen als erwartet: einmal ganz neu laden, dann aufgeben.
                     p.delete()
-                    if (++damaged >= 2) throw LoadException("${s.name} kam zweimal beschädigt an")
+                    lastProblem = "${s.name}: Prüfsumme der Übertragung falsch"
+                    if (++damaged >= 2) throw Failure(Kind.BUILD, "${s.name} kam zweimal anders an als erwartet")
                 }
                 progress.update(doneBytes(), total, null)
             }
@@ -239,9 +265,11 @@ internal class ModelStore(private val context: Context) {
     private fun adopt(e: Entry): Boolean {
         val f = file(e.name)
         if (f.length() != e.bytes || sha256(f) != e.sha256) return false
-        marker(e).writeText(e.sha256)
+        writeMarker(e)
         return true
     }
+
+    private fun writeMarker(e: Entry) = storage { marker(e).writeText(e.sha256) }
 
     /**
      * Macht aus der geprüften Übertragung die fertigen Dateien: aus einem Archiv entpackt, aus
@@ -249,52 +277,71 @@ internal class ModelStore(private val context: Context) {
      */
     private fun install(s: Source, p: File, missing: List<Entry>) {
         when {
-            s.archive -> ZipFile(p).use { zip ->
-                for (e in missing) {
-                    val item = zip.getEntry(e.pathInArchive) ?: throw IllegalStateException("${e.name} fehlt in ${s.name}")
-                    unpack(e, zip.getInputStream(item))
+            s.archive -> {
+                val zip = try {
+                    ZipFile(p)
+                } catch (io: IOException) {
+                    lastProblem = technical(io)
+                    throw Failure(Kind.BUILD, "${s.name} lässt sich nicht öffnen", io)
+                }
+                zip.use {
+                    for (e in missing) {
+                        val item = zip.getEntry(e.pathInArchive) ?: throw Failure(Kind.BUILD, "${e.name} fehlt in ${s.name}")
+                        unpack(e) { zip.getInputStream(item) }
+                    }
                 }
             }
-            s.gzip -> unpack(missing.single(), GZIPInputStream(FileInputStream(p), BUFFER))
+            s.gzip -> storage("Lesen auf dem Handy gescheitert") { FileInputStream(p) }.use { raw ->
+                unpack(missing.single()) { GZIPInputStream(raw, BUFFER) }
+            }
             else -> {
                 val e = missing.single()
-                FileOutputStream(p, true).use { it.fd.sync() }
+                storage { FileOutputStream(p, true).use { it.fd.sync() } }
                 replace(p, file(e.name))
-                marker(e).writeText(e.sha256)
+                writeMarker(e)
             }
         }
         p.delete()
     }
 
-    /** Schreibt [input] in die fertige Datei, prüft dabei Größe und Prüfsumme und bestätigt sie. */
-    private fun unpack(e: Entry, input: InputStream) {
+    /** Schreibt, was [open] liefert, in die fertige Datei, prüft Größe und Prüfsumme und bestätigt sie. */
+    private fun unpack(e: Entry, open: () -> InputStream) {
         val tmp = unpacked(e)
         val md = MessageDigest.getInstance("SHA-256")
         var n = 0L
-        input.use { source ->
-            FileOutputStream(tmp).use { out ->
-                val buffer = ByteArray(BUFFER)
-                while (true) {
-                    val r = source.read(buffer)
-                    if (r < 0) break
-                    md.update(buffer, 0, r)
-                    out.write(buffer, 0, r)
-                    n += r
+        try {
+            open().use { input ->
+                storage { FileOutputStream(tmp) }.use { out ->
+                    val buffer = ByteArray(BUFFER)
+                    while (true) {
+                        val r = input.read(buffer)
+                        if (r < 0) break
+                        md.update(buffer, 0, r)
+                        storage { out.write(buffer, 0, r) }
+                        n += r
+                    }
+                    storage { out.fd.sync() }
                 }
-                out.fd.sync()
             }
+        } catch (io: IOException) {
+            tmp.delete()
+            lastProblem = technical(io)
+            throw Failure(Kind.STORAGE, "${e.name} ließ sich nicht entpacken", io)
+        } catch (f: Failure) {
+            tmp.delete()
+            throw f
         }
         if (n != e.bytes || hex(md.digest()) != e.sha256) {
             tmp.delete()
-            throw IllegalStateException("${e.name} passt entpackt nicht zur Liste")
+            throw Failure(Kind.BUILD, "${e.name} passt entpackt nicht zur Liste")
         }
         replace(tmp, file(e.name))
-        marker(e).writeText(e.sha256)
+        writeMarker(e)
     }
 
     private fun replace(from: File, to: File) {
         to.delete()
-        if (!from.renameTo(to)) throw LoadException("${to.name} ließ sich nicht ablegen")
+        if (!from.renameTo(to)) throw Failure(Kind.STORAGE, "${to.name} ließ sich nicht ablegen")
     }
 
     /**
@@ -314,54 +361,68 @@ internal class ModelStore(private val context: Context) {
         need += largestPacked
         val free = dir.usableSpace
         if (free in 1 until need) {
-            throw IllegalStateException("zu wenig Speicher frei: nötig ${mb(need)} MB, frei ${mb(free)} MB")
+            throw Failure(Kind.STORAGE, "zu wenig Speicher frei, nötig ${mb(need)} MB, frei ${mb(free)} MB")
         }
     }
 
-    /** Lädt eine Quelle vollständig in ihre .part-Datei; setzt nach Abbrüchen fort. */
-    private suspend fun fetch(s: Source, report: (Retry?) -> Unit) {
+    /**
+     * Lädt eine Quelle vollständig in ihre .part-Datei. Bricht ein Versuch ab, endet er vorzeitig
+     * oder kommt nichts, folgt eine Pause und der nächste Versuch an derselben Stelle. Als Fehler
+     * zählt nur, was nicht vorankommt; nach [MAX_FAILURES] Fehlern in Folge ist Schluss.
+     */
+    private suspend fun fetch(s: Source, gate: () -> String?, report: (Retry?) -> Unit) {
         val p = part(s)
         if (p.length() > s.bytes) p.delete()
         if (s.bytes == 0L) {
-            p.createNewFile() // leere Datei: nichts zu übertragen
+            storage { p.createNewFile() } // leere Datei: nichts zu übertragen
             return
         }
         var failures = 0
         var restarts = 0
+        var notFound = 0
         var lastReport = 0L
+        var paused = false
         while (p.length() < s.bytes) {
             currentCoroutineContext().ensureActive()
+            paused = waitForGate(gate, report) || paused
+            if (paused) report(Retry(0, "verbindet …"))
             val have = p.length()
-            var received = 0L
+            var problem: String? = null
             try {
                 val conn = open(s.url, have)
                 try {
                     val code = conn.responseCode
-                    // Fehlt die Datei auf dem Server, hilft Warten nicht.
-                    if (code == HttpURLConnection.HTTP_NOT_FOUND) throw IllegalStateException("${s.name} fehlt auf dem Server")
+                    if (code == HttpURLConnection.HTTP_NOT_FOUND) {
+                        // Ein kurzer Aussetzer des Servers ist möglich; fehlt die Datei wirklich, hilft Warten nicht.
+                        if (++notFound >= MAX_NOT_FOUND) throw Failure(Kind.BUILD, "${s.name} fehlt auf dem Server")
+                        throw LoadException("Datei auf dem Server nicht gefunden", "HTTP 404")
+                    }
                     if (code == HTTP_RANGE_NOT_SATISFIABLE) {
                         // Den angefragten Bereich gibt es nicht: von vorn, aber nicht endlos.
-                        if (++restarts > MAX_RESTARTS) throw IllegalStateException("${s.name} passt auf dem Server nicht zur Liste")
+                        if (++restarts > MAX_RESTARTS) throw Failure(Kind.BUILD, "${s.name} passt auf dem Server nicht zur Liste")
                         p.delete()
                         continue
                     }
                     if (code != HttpURLConnection.HTTP_OK && code != HttpURLConnection.HTTP_PARTIAL) {
-                        throw LoadException("Server meldet $code")
+                        throw LoadException("Server meldet $code", "HTTP $code")
                     }
-                    // Ohne Teilbereich schickt der Server die ganze Datei; dann von vorn schreiben.
+                    // Ohne Teilbereich schickt der Server die ganze Datei; dann von vorn, aber nicht endlos.
                     val append = code == HttpURLConnection.HTTP_PARTIAL
+                    if (!append && have > 0 && ++restarts > MAX_RESTARTS) {
+                        throw Failure(Kind.NETWORK, "Server kann nicht an derselben Stelle weitermachen")
+                    }
                     checkResponse(s, conn, append, have)
                     conn.inputStream.use { input ->
-                        FileOutputStream(p, append).use { out ->
+                        storage { FileOutputStream(p, append) }.use { out ->
                             val buffer = ByteArray(BUFFER)
                             while (true) {
                                 val n = input.read(buffer)
                                 if (n < 0) break
-                                out.write(buffer, 0, n)
-                                received += n
+                                storage { out.write(buffer, 0, n) }
                                 val now = System.nanoTime() / 1_000_000
                                 if (now - lastReport >= REPORT_MS) {
                                     lastReport = now
+                                    paused = false
                                     report(null)
                                 }
                                 currentCoroutineContext().ensureActive()
@@ -372,43 +433,51 @@ internal class ModelStore(private val context: Context) {
                     conn.disconnect()
                 }
             } catch (io: IOException) {
-                // Wer Daten bekommen hat, kam voran: Dann zählen nur die Fehler seitdem.
-                if (received > 0) failures = 0
-                val why = reason(io)
-                if (++failures > MAX_FAILURES) throw LoadException("$why, $MAX_FAILURES Versuche ohne Fortschritt", io)
-                pause(failures, why, report)
+                problem = reason(io)
+                lastProblem = technical(io)
+            }
+            val now = p.length()
+            if (now >= s.bytes) {
+                if (now == s.bytes) break
+                // Mehr bekommen als erwartet: verwerfen und neu anfangen, aber nicht endlos.
+                p.delete()
+                if (++restarts > MAX_RESTARTS) throw Failure(Kind.BUILD, "${s.name} ist auf dem Server größer als laut Liste")
                 continue
             }
-            when {
-                p.length() > s.bytes -> {
-                    // Mehr bekommen als erwartet: verwerfen und neu anfangen, aber nicht endlos.
-                    p.delete()
-                    if (++restarts > MAX_RESTARTS) throw IllegalStateException("${s.name} ist auf dem Server größer als laut Liste")
-                }
-                received == 0L -> {
-                    // Antwort ohne Daten: wie ein Fehler behandeln, damit die Schleife nicht leer dreht.
-                    if (++failures > MAX_FAILURES) throw LoadException("Server liefert keine Daten, $MAX_FAILURES Versuche ohne Fortschritt")
-                    pause(failures, "Server liefert keine Daten", report)
-                }
-                else -> failures = 0
-            }
+            // Nicht bis zum Ende gekommen: Abbruch, vorzeitiges Ende oder gar keine Daten.
+            if (now > have) failures = 0
+            val why = problem ?: if (now > have) "Verbindung abgebrochen" else "Server liefert keine Daten"
+            if (++failures > MAX_FAILURES) throw Failure(Kind.NETWORK, "$why, $MAX_FAILURES Versuche ohne Fortschritt")
+            pause(failures, why, report)
+            paused = true
         }
         report(null)
+    }
+
+    /** Wartet, solange [gate] einen Grund nennt; gibt zurück, ob gewartet wurde. */
+    private suspend fun waitForGate(gate: () -> String?, report: (Retry?) -> Unit): Boolean {
+        var waited = false
+        while (true) {
+            val why = gate() ?: return waited
+            waited = true
+            report(Retry(0, why))
+            delay(GATE_POLL_MS)
+        }
     }
 
     /** Prüft, ob der Server dieselbe Datei meint wie die Liste und an der richtigen Stelle weitermacht. */
     private fun checkResponse(s: Source, conn: HttpURLConnection, partial: Boolean, have: Long) {
         val size = if (partial) {
             val m = CONTENT_RANGE.find(conn.getHeaderField("Content-Range").orEmpty())
-                ?: throw LoadException("Teilantwort ohne Bereichsangabe")
+                ?: throw LoadException("Server antwortet unerwartet", "Teilantwort ohne Content-Range")
             val start = m.groupValues[1].toLong()
-            if (start != have) throw LoadException("Teilantwort ab Byte $start statt $have")
+            if (start != have) throw LoadException("Server antwortet unerwartet", "Teilantwort ab Byte $start statt $have")
             m.groupValues[3].toLongOrNull() ?: -1L
         } else {
             conn.contentLengthLong
         }
         if (size >= 0 && size != s.bytes) {
-            throw IllegalStateException("${s.name} ist auf dem Server $size Bytes groß, laut Liste ${s.bytes}")
+            throw Failure(Kind.BUILD, "${s.name} ist auf dem Server $size Bytes groß, laut Liste ${s.bytes}")
         }
     }
 
@@ -438,7 +507,8 @@ internal class ModelStore(private val context: Context) {
                 if (from > 0) c.setRequestProperty("Range", "bytes=$from-")
                 val code = c.responseCode
                 if (code !in 300..399) return c
-                val location = c.getHeaderField("Location") ?: throw LoadException("Weiterleitung ohne Ziel")
+                val location = c.getHeaderField("Location")
+                    ?: throw LoadException("Server antwortet unerwartet", "Weiterleitung ohne Location")
                 target = URL(target, location)
             } catch (io: IOException) {
                 c.disconnect()
@@ -446,15 +516,15 @@ internal class ModelStore(private val context: Context) {
             }
             c.disconnect()
         }
-        throw LoadException("zu viele Weiterleitungen")
+        throw LoadException("Server antwortet unerwartet", "mehr als $MAX_REDIRECTS Weiterleitungen")
     }
 
-    /** Fehler mit einem Grund, der schon in Worten dasteht. */
-    private class LoadException(message: String, cause: Throwable? = null) : IOException(message, cause)
+    /** Netzfehler mit einem Grund in Worten ([friendly]) und den Einzelheiten für den Bericht. */
+    private class LoadException(val friendly: String, technical: String) : IOException(technical)
 
     /** Der Grund in Worten, die auch ohne Technik verständlich sind. */
     private fun reason(io: IOException): String = when (io) {
-        is LoadException -> io.message.orEmpty()
+        is LoadException -> io.friendly
         is UnknownHostException -> "keine Internetverbindung"
         is SocketTimeoutException -> "Zeitüberschreitung"
         is ConnectException -> "Server nicht erreichbar"
@@ -463,15 +533,35 @@ internal class ModelStore(private val context: Context) {
         else -> "Verbindung gestört"
     }
 
+    private fun technical(t: Throwable): String = "${t.javaClass.simpleName}: ${t.message}".take(300)
+
+    /**
+     * Führt Dateiarbeit auf dem Handy aus. Scheitert sie, ist das kein Netzfehler: Es gibt keine
+     * Wiederholung, sondern gleich einen [Failure] mit Grund, bei vollem Speicher ausdrücklich.
+     */
+    private inline fun <T> storage(what: String = "Speichern auf dem Handy gescheitert", block: () -> T): T = try {
+        block()
+    } catch (io: IOException) {
+        lastProblem = technical(io)
+        throw Failure(Kind.STORAGE, if (isFull(io)) "zu wenig Speicher frei" else what, io)
+    }
+
+    private fun isFull(e: Throwable): Boolean = generateSequence(e) { it.cause }.any { t ->
+        val m = t.message.orEmpty()
+        "ENOSPC" in m || m.contains("No space left", ignoreCase = true)
+    }
+
     private fun sha256(file: File): String {
         if (!file.exists()) return ""
         val md = MessageDigest.getInstance("SHA-256")
-        FileInputStream(file).use { input ->
-            val buffer = ByteArray(BUFFER)
-            while (true) {
-                val n = input.read(buffer)
-                if (n < 0) break
-                md.update(buffer, 0, n)
+        storage("Lesen auf dem Handy gescheitert") {
+            FileInputStream(file).use { input ->
+                val buffer = ByteArray(BUFFER)
+                while (true) {
+                    val n = input.read(buffer)
+                    if (n < 0) break
+                    md.update(buffer, 0, n)
+                }
             }
         }
         return hex(md.digest())
@@ -484,11 +574,16 @@ internal class ModelStore(private val context: Context) {
     companion object {
         const val FOLDER = "modelle"
         const val LIST = "modelle.json"
+
+        /** Muss zu LISTEN_FORMAT in .github/ki_dateien.py passen. */
+        const val LIST_FORMAT = 1
         private const val BUFFER = 256 * 1024
         private const val MAX_FAILURES = 25
-        private const val MAX_RESTARTS = 2
+        private const val MAX_RESTARTS = 3
+        private const val MAX_NOT_FOUND = 3
         private const val MAX_REDIRECTS = 6
         private const val MAX_PAUSE_MS = 30_000L
+        private const val GATE_POLL_MS = 2_000L
         private const val REPORT_MS = 250L
         private const val CONNECT_TIMEOUT_MS = 20_000
         private const val READ_TIMEOUT_MS = 30_000
@@ -503,7 +598,8 @@ internal class ModelStore(private val context: Context) {
 
 /**
  * Schätzt aus dem Fortschritt, wie lange das Laden noch dauert. Mittelt gleitend über einige
- * Sekunden, damit kurze Aussetzer die Anzeige nicht springen lassen.
+ * Sekunden, damit kurze Aussetzer die Anzeige nicht springen lassen. Lücken ohne Meldung (Prüfen,
+ * Entpacken, neu Verbinden) zählen nicht als langsames Laden.
  */
 internal class RemainingTime {
     private var lastMs = 0L
@@ -524,12 +620,12 @@ internal class RemainingTime {
 
     /** Neuer Stand; gibt die geschätzten Sekunden bis zum Ende zurück oder null, solange es dafür zu früh ist. */
     fun update(nowMs: Long, done: Long, total: Long): Long? {
-        if (lastMs == 0L || done < lastBytes) {
+        val dt = nowMs - lastMs
+        if (lastMs == 0L || done < lastBytes || dt > MAX_GAP_MS) {
             lastMs = nowMs
             lastBytes = done
             return estimate(done, total)
         }
-        val dt = nowMs - lastMs
         if (dt >= MIN_STEP_MS) {
             val now = (done - lastBytes).toDouble() / dt
             rate = if (measuredMs == 0L) now else rate + (1 - exp(-dt / MEMORY_MS)) * (now - rate)
@@ -547,6 +643,7 @@ internal class RemainingTime {
 
     private companion object {
         const val MIN_STEP_MS = 200L
+        const val MAX_GAP_MS = 2_000L
         const val MEMORY_MS = 5000.0
         const val SETTLE_MS = 3000L
     }

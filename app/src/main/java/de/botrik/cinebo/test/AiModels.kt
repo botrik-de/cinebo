@@ -144,7 +144,7 @@ internal class NpuModel private constructor(
 
         /** Die Modelle liegen nach dem Laden im App-Speicher (siehe [ModelStore]). */
         private fun map(file: File): MappedByteBuffer {
-            if (!file.exists()) throw IllegalStateException("Modell fehlt: ${file.name}. Die KI-Modelle sind noch nicht geladen.")
+            if (!file.exists()) throw IllegalStateException("Modell fehlt: ${file.name}. Die KI-Modelle sind noch nicht heruntergeladen.")
             FileInputStream(file).use { stream ->
                 return stream.channel.map(FileChannel.MapMode.READ_ONLY, 0, file.length())
             }
@@ -161,12 +161,15 @@ internal class NpuModel private constructor(
 internal object Npu {
 
     /**
-     * In dieser Reihenfolge laden: erst, was libQnnHtp.so selbst nachlädt (sie sucht es nur unter
-     * seinem Namen, nicht in ihrem Ordner), dann sie. Der Skel läuft auf dem Chip selbst und
-     * kommt über [QnnDelegate.Options.setSkelLibraryDir] dorthin.
+     * Vorab geladen, damit QNN sie in jedem Fall findet: libQnnSystem.so und den Stub laden der
+     * Delegate und libQnnHtp.so womöglich nur unter ihrem Namen, und den kennt der Linker nur für
+     * schon geladene Bibliotheken oder solche aus der APK. Die große libQnnHtpPrepare.so
+     * (Übersetzer für den Chip) holt libQnnHtp.so selbst aus ihrem eigenen Ordner, und nur solange
+     * sie sie braucht; vorab geladen bliebe sie dauerhaft im Speicher. Der Skel läuft auf dem Chip
+     * und kommt über [QnnDelegate.Options.setSkelLibraryDir] dorthin.
      */
     private val LIBRARIES = listOf(
-        "libQnnSystem.so", "libQnnHtpPrepare.so", "libQnnHtpV81Stub.so", "libQnnHtpV79Stub.so", "libQnnHtp.so"
+        "libQnnSystem.so", "libQnnHtpV81Stub.so", "libQnnHtpV79Stub.so", "libQnnHtp.so"
     )
 
     /** Nur Rückfall, falls sich der Chip als Hexagon V79 meldet; ein Fehler damit hält nichts auf. */
@@ -187,10 +190,10 @@ internal object Npu {
             val optional = name == FALLBACK_STUB
             if (!f.isFile) {
                 if (optional) continue
-                throw IllegalStateException("QNN-Bibliothek fehlt: $name. Die KI-Modelle sind noch nicht vollständig geladen.")
+                throw IllegalStateException("QNN-Bibliothek fehlt: $name. Die KI-Modelle sind noch nicht vollständig heruntergeladen.")
             }
             try {
-                f.setReadOnly() // Android verlangt für nachgeladenen Code schreibgeschützte Dateien
+                f.setReadOnly() // die geprüfte Datei soll niemand mehr unbemerkt ändern
                 System.load(f.absolutePath)
             } catch (e: Throwable) {
                 if (!optional) throw e

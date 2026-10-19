@@ -21,3 +21,6 @@ keystore.properties
 # KI-Modelle und ihre Liste entstehen beim Bauen, nie im Repo
 app/src/main/assets/modelle.json
 *.tflite
+
+# Python-Zwischenspeicher
+__pycache__/

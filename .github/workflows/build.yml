@@ -23,8 +23,6 @@ env:
   CINEBO_VERSION: 0.2.${{ github.run_number }}
   # Welche selbst exportierten EdgeTAM-Teile in die App kommen (Release modelle-<Version>)
   MODELLE_VERSION: '1'
-  # Version von Qualcomms QNN-Laufzeit; muss zum Delegate in app/build.gradle.kts passen
-  QNN_VERSION: '2.50.0'
   # Größer darf die APK nicht werden; alles Große lädt die App selbst.
   APK_MAX_MB: '40'
 
@@ -81,6 +79,9 @@ jobs:
               curl -fsSL --retry 3 -o "$roh/$f" "$rel/$f"
             done
             # Qualcomms QNN-Laufzeit für den KI-Chip, genau so, wie die App sie von Maven Central holt.
+            # Die Version steht an einer Stelle (gradle.properties), passend zum Delegate in der App.
+            QNN_VERSION=$(sed -n 's/^cinebo\.qnnVersion=//p' gradle.properties)
+            if [ -z "$QNN_VERSION" ]; then echo "cinebo.qnnVersion fehlt in gradle.properties"; exit 1; fi
             aar="qnn-runtime-$QNN_VERSION.aar"
             aar_url="https://repo1.maven.org/maven2/com/qualcomm/qti/qnn-runtime/$QNN_VERSION/$aar"
             qnn_libs="libQnnHtp.so libQnnHtpPrepare.so libQnnSystem.so libQnnHtpV81Stub.so libQnnHtpV81Skel.so libQnnHtpV79Stub.so libQnnHtpV79Skel.so"
@@ -95,22 +96,36 @@ jobs:
             # Festgeschriebene Dateien müssen genau die geprüften sein; sonst bricht der Bau ab.
             (cd "$roh" && sha256sum -c --quiet "$GITHUB_WORKSPACE/.github/modelle.sha256")
 
-            # Der Satz heißt nach den Prüfsummen aller fertigen Dateien.
-            satz=$(sha256sum ki-dateien.sha256 | cut -c1-10)
+            # Der Satz heißt nach den Prüfsummen aller fertigen Dateien und dem Aufbau der Liste.
+            satz=$( { cat ki-dateien.sha256; python3 .github/ki_dateien.py format; } | sha256sum | cut -c1-10)
             tag="ki-modelle-$satz"
             basis="https://github.com/${{ github.repository }}/releases/download/$tag/"
             echo "KI_SATZ=$satz" >> "$GITHUB_ENV"
-            vorhanden=$(gh release view "$tag" --json assets --jq '.assets[].name' 2>/dev/null || true)
+            cp .github/ki-lizenzen.txt dl/LIZENZEN.txt
+            # Nur „gibt es nicht“ heißt neu anlegen; jeder andere Fehler der Abfrage bricht ab.
+            if ausgabe=$(gh release view "$tag" --json assets --jq '.assets[].name' 2>&1); then
+              vorhanden="$ausgabe"
+              anlegen=0
+            elif grep -qi 'release not found' <<< "$ausgabe"; then
+              vorhanden=""
+              anlegen=1
+            else
+              echo "GitHub-Abfrage zu $tag gescheitert: $ausgabe"
+              exit 1
+            fi
             if grep -qx 'liste.json' <<< "$vorhanden"; then
+              # Ein vollständiger Satz wird nie überschrieben: Ältere Apps laden genau diese Dateien.
               echo "KI-Satz $satz liegt schon vollständig im Release $tag."
             else
               # shellcheck disable=SC2086
               python3 .github/ki_dateien.py packen "$roh" dl/laden "$basis" "$satz" \
                 --archiv "dl/$aar" "$aar_url" jni/arm64-v8a $qnn_libs > dl/liste.json
-              gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --prerelease --latest=false \
-                --target "${{ github.sha }}" --title "KI-Modelle für die Test-App ($satz)" \
-                --notes "KI-Modelle der Test-App, für die Übertragung gepackt. Die App lädt sie selbst und prüft jede Datei; liste.json beschreibt den Satz. Die QNN-Laufzeit holt die App direkt von Qualcomm (Maven Central)."
-              gh release upload "$tag" dl/laden/* --clobber
+              if [ "$anlegen" = 1 ]; then
+                gh release create "$tag" --prerelease --latest=false \
+                  --target "${{ github.sha }}" --title "KI-Modelle für die Test-App ($satz)" \
+                  --notes "KI-Modelle der Test-App, für die Übertragung gepackt. Die App lädt sie selbst und prüft jede Datei; liste.json beschreibt den Satz, LIZENZEN.txt nennt die Lizenzen. Die QNN-Laufzeit holt die App direkt von Qualcomm (Maven Central)."
+              fi
+              gh release upload "$tag" dl/laden/* dl/LIZENZEN.txt --clobber
               # Zuletzt die Liste: Erst mit ihr gilt der Satz als vollständig.
               gh release upload "$tag" dl/liste.json --clobber
             fi
@@ -118,6 +133,11 @@ jobs:
             # Alles aus dem Release zurückholen und so prüfen, wie es die App tut.
             rm -rf dl/release
             gh release download "$tag" --dir dl/release
+            # Die Lizenztexte darf jeder Bau auf den neuesten Stand bringen; die App liest sie nicht.
+            if ! cmp -s dl/LIZENZEN.txt dl/release/LIZENZEN.txt; then
+              gh release upload "$tag" dl/LIZENZEN.txt --clobber
+              cp dl/LIZENZEN.txt dl/release/LIZENZEN.txt
+            fi
             python3 .github/ki_dateien.py pruefen dl/release/liste.json "$roh" dl/release "$basis" "dl/$aar"
             mkdir -p app/src/main/assets
             cp dl/release/liste.json app/src/main/assets/modelle.json

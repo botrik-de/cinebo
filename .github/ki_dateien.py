@@ -5,6 +5,7 @@
     ki_dateien.py pruefen    LISTE ROH RELEASE BASIS [ARCHIV-DATEI...]
     ki_dateien.py uebersicht LISTE
     ki_dateien.py apk        APK LISTE MAX-MB ORDNER...
+    ki_dateien.py format     gibt das Listenformat aus (fließt in den Namen des Satzes ein)
 
 packen: Jede Datei in ROH wird eine Quelle in unserem Release (Adresse BASIS + Name). Gepackt
 (gzip) wird sie, wenn das mindestens 5 % spart; die Übertragung landet in LADEN. Ein Archiv
@@ -13,6 +14,7 @@ Dateien PRAEFIX/NAME. Die Liste kommt auf die Standardausgabe.
 
 pruefen: Prüft die Liste gegen die fertigen Dateien in ROH, die Übertragungen im Ordner
 RELEASE (so, wie sie wirklich im Release liegen) und die Archive, alles so, wie es die App tut.
+Im Release müssen außerdem die Lizenztexte liegen (LIZENZEN.txt).
 
 apk: Wacht darüber, dass die APK klein bleibt, nichts doppelt enthält, was die App selbst
 lädt, und dass jede Bibliothek auf dem Handy findet, was sie braucht.
@@ -22,12 +24,20 @@ import hashlib
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
 import zipfile
+import zlib
 
 MINDEST_ERSPARNIS = 0.05
+
+# Aufbau der Liste; muss zu ModelStore.LIST_FORMAT in der App passen. Ändert sich der Aufbau,
+# ändert sich damit auch der Name des Satzes, und eine neue App bekommt nie eine alte Liste.
+LISTEN_FORMAT = 1
+
+LIZENZEN = 'LIZENZEN.txt'
 
 # Was Android jeder App mitgibt; libcdsprpc.so gibt der Hersteller frei (uses-native-library).
 SYSTEM_BIBLIOTHEKEN = {
@@ -52,6 +62,14 @@ def liste_lesen(pfad):
         return json.load(f)
 
 
+def gzip_packen(daten):
+    """gzip mit festem Kopf: ohne Name und Zeit, Betriebssystem „unbekannt“ (wie gzip -n)."""
+    k = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+    roh = k.compress(daten) + k.flush()
+    kopf = b'\x1f\x8b\x08\x00' + b'\x00\x00\x00\x00' + b'\x02\xff'
+    return kopf + roh + struct.pack('<II', zlib.crc32(daten) & 0xffffffff, len(daten) & 0xffffffff)
+
+
 def fehler_melden(fehler):
     if fehler:
         for f in fehler:
@@ -73,7 +91,7 @@ def packen(argumente):
     quellen, dateien = [], []
     for name in sorted(os.listdir(roh)):
         daten = lesen(os.path.join(roh, name))
-        gepackt = gzip.compress(daten, compresslevel=9, mtime=0)
+        gepackt = gzip_packen(daten)
         gz = len(daten) > 0 and len(gepackt) <= len(daten) * (1 - MINDEST_ERSPARNIS)
         lade_name, lade_daten = (name + '.gz', gepackt) if gz else (name, daten)
         with open(os.path.join(laden, lade_name), 'wb') as f:
@@ -93,7 +111,8 @@ def packen(argumente):
     namen = [d['name'] for d in dateien]
     if len(set(namen)) != len(namen):
         raise SystemExit('Doppelte Dateinamen in der Liste: %s' % sorted({n for n in namen if namen.count(n) > 1}))
-    json.dump({'version': satz, 'quellen': quellen, 'dateien': dateien}, sys.stdout, indent=1, ensure_ascii=False)
+    json.dump({'format': LISTEN_FORMAT, 'version': satz, 'quellen': quellen, 'dateien': dateien},
+              sys.stdout, indent=1, ensure_ascii=False)
     print()
 
 
@@ -103,6 +122,10 @@ def pruefen(liste_pfad, roh, release, basis, *archiv_dateien):
     dateien = liste.get('dateien', [])
     archive = {os.path.basename(a): a for a in archiv_dateien}
     fehler = []
+    if liste.get('format') != LISTEN_FORMAT:
+        fehler.append('Listenformat %s, erwartet %s' % (liste.get('format'), LISTEN_FORMAT))
+    if not os.path.exists(os.path.join(release, LIZENZEN)):
+        fehler.append('%s fehlt im Release' % LIZENZEN)
 
     # Jede Datei aus unserem Release liegt fertig in ROH, und umgekehrt.
     eigene = sorted(d['name'] for d in dateien if not quellen.get(d['quelle'], {}).get('archiv'))
@@ -113,7 +136,7 @@ def pruefen(liste_pfad, roh, release, basis, *archiv_dateien):
     if genutzt != set(quellen):
         fehler.append('Quellen ohne Datei oder Dateien ohne Quelle: %s' % sorted(genutzt ^ set(quellen)))
 
-    erwartet = {'liste.json'}
+    erwartet = {'liste.json', LIZENZEN}
     for q in quellen.values():
         if q.get('archiv'):
             pfad = archive.get(q['name'])
@@ -229,6 +252,8 @@ if __name__ == '__main__':
         uebersicht(*argumente)
     elif befehl == 'apk' and len(argumente) >= 4:
         apk(*argumente)
+    elif befehl == 'format' and not argumente:
+        print('liste-format %d' % LISTEN_FORMAT)
     else:
         print(__doc__, file=sys.stderr)
         sys.exit(2)
