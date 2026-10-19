@@ -80,12 +80,24 @@ jobs:
           [ -f lic/qnn-runtime/NOTICE.txt ] && { echo "===== qnn-runtime: NOTICE.txt"; cat lic/qnn-runtime/NOTICE.txt; } >> out/lizenzen-qualcomm.txt
           wc -c out/lizenzen-qualcomm.txt
 
+      # Ein Release modelle-<Version> wird nie überschrieben: Die Test-App prüft seine Dateien gegen
+      # .github/modelle.sha256. Läuft der Export erneut, vergleicht er nur und meldet Unterschiede;
+      # für geänderte Modelle steigt MODELLE_VERSION.
       - name: Veröffentlichen
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="modelle-$MODELLE_VERSION"
           notes="EdgeTAM-Teile für den KI-Chip, Version $MODELLE_VERSION (EdgeTAM ${EDGETAM_COMMIT:0:7}). Automatisch erstellt und gegen das Original geprüft."
-          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --prerelease --latest=false \
-            --target "${{ github.sha }}" --title "KI-Modelle $MODELLE_VERSION" --notes "$notes"
-          gh release upload "$tag" out/* --clobber
+          if ausgabe=$(gh release view "$tag" --json assets --jq '.assets[].name' 2>&1); then
+            echo "Release $tag gibt es schon; es bleibt unverändert. Vergleich mit dem neuen Export:"
+            gh release download "$tag" --pattern pruefsummen.txt --output alt-pruefsummen.txt --clobber
+            diff alt-pruefsummen.txt out/pruefsummen.txt && echo "Gleich." || echo "Hinweis: Der neue Export weicht ab (siehe oben)."
+          elif grep -qi 'release not found' <<< "$ausgabe"; then
+            gh release create "$tag" --prerelease --latest=false \
+              --target "${{ github.sha }}" --title "KI-Modelle $MODELLE_VERSION" --notes "$notes"
+            gh release upload "$tag" out/*
+          else
+            echo "GitHub-Abfrage zu $tag gescheitert: $ausgabe"
+            exit 1
+          fi
