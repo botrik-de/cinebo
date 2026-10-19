@@ -119,10 +119,6 @@ class MainActivity : ComponentActivity() {
         /** Ziel aus dem Plan: Die KI schafft 10–15 Durchgänge pro Sekunde (beide Modelle zusammen). */
         const val TARGET_HZ = 10.0
 
-        /** Worauf das Herunterladen der KI-Modelle warten kann. */
-        const val WAIT_WIFI = "wartet auf WLAN"
-        const val WAIT_INTERNET = "wartet auf Internet"
-
         val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
         val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
     }
@@ -152,7 +148,7 @@ class MainActivity : ComponentActivity() {
     /** Läuft das Herunterladen? Eigenes Feld, denn im finally des Jobs gilt der Job selbst noch als aktiv. */
     private var downloading = false
     private var downloadFailure: ModelStore.Failure? = null
-    /** Worauf das Herunterladen gerade wartet ([WAIT_WIFI], [WAIT_INTERNET]), sonst null. */
+    /** Worauf das Herunterladen gerade wartet ([DownloadUi.WAIT_WIFI], [DownloadUi.WAIT_INTERNET]), sonst null. */
     private var downloadWaiting: String? = null
     /** Datenvolumen darf genutzt werden: „Trotzdem jetzt herunterladen“ wurde getippt. */
     @Volatile private var allowMetered = false
@@ -315,12 +311,14 @@ class MainActivity : ComponentActivity() {
      * Lädt die KI-Modelle einmal in den App-Speicher herunter; setzt nach Abbrüchen von selbst
      * fort. Ohne Datenvolumen (WLAN) geht es gleich los; im Mobilnetz wartet es aufs WLAN, bis
      * jemand „Trotzdem jetzt herunterladen“ tippt. Ohne Netz wartet es, bis das Handy online ist.
+     * Wie es ausging, steht danach im Bericht, auch ohne Test.
      */
     private fun startDownload() {
         if (modelsOk || downloading) return
         if (!modelStore.hasList) {
             downloadFailure = ModelStore.Failure(ModelStore.Kind.BUILD, "die Liste der KI-Modelle fehlt oder ist ungültig")
-            setStatus(Phase.ERROR, "KI-Modelle: Liste fehlt oder ist ungültig")
+            noteDownload(null)
+            showIdleStatus()
             render()
             return
         }
@@ -328,8 +326,10 @@ class MainActivity : ComponentActivity() {
         downloadFailure = null
         downloadWaiting = null
         remaining.reset()
+        val startedAt = SystemClock.elapsedRealtime()
         showDownloadProgress(modelStore.doneBytes(), modelStore.totalBytes(), null)
         lifecycleScope.launch {
+            var closed = false
             try {
                 modelStore.download(gate = { networkGate() }) { done, all, retry ->
                     runOnUiThread { showDownloadProgress(done, all, retry) }
@@ -337,6 +337,7 @@ class MainActivity : ComponentActivity() {
                 modelsOk = modelStore.allReady()
                 if (!modelsOk) downloadFailure = ModelStore.Failure(ModelStore.Kind.BUILD, "nicht alle KI-Modelle sind vollständig")
             } catch (e: CancellationException) {
+                closed = true // Ansicht geschlossen: beim nächsten Start geht es an derselben Stelle weiter
                 throw e
             } catch (e: ModelStore.Failure) {
                 downloadFailure = e
@@ -345,59 +346,77 @@ class MainActivity : ComponentActivity() {
             } finally {
                 downloading = false
                 downloadWaiting = null
-                if (running == null) {
-                    if (modelsOk && provider != null && cameraProblem == null) setStatus(Phase.DONE, "KI-Modelle heruntergeladen, bereit")
-                    else showIdleStatus()
+                if (!closed) {
+                    noteDownload((SystemClock.elapsedRealtime() - startedAt) / 1000.0)
+                    if (running == null) {
+                        if (modelsOk && provider != null && cameraProblem == null) setStatus(Phase.DONE, "KI-Modelle heruntergeladen, bereit")
+                        else showIdleStatus()
+                    }
+                    render()
                 }
-                render()
             }
         }
         render()
     }
 
+    /** Hält im Bericht fest, wie das Herunterladen ausging, damit sich auch ein Fehler weitergeben lässt. */
+    private fun noteDownload(seconds: Double?) {
+        val failure = downloadFailure
+        val o = JSONObject().put("zeit", nowIso()).put("version", appVersion)
+        if (failure == null) {
+            o.put("ergebnis", "fertig")
+        } else {
+            o.put("ergebnis", "unterbrochen")
+            o.put("art", when (failure.kind) {
+                ModelStore.Kind.NETWORK -> "netz"
+                ModelStore.Kind.STORAGE -> "speicher"
+                ModelStore.Kind.BUILD -> "bau"
+            })
+            o.put("meldung", failure.message.orEmpty())
+            failure.cause?.let { o.put("ursache", it.toString().take(300)) }
+        }
+        if (seconds != null) o.put("sekunden", r1(seconds))
+        o.put("modelle", modelStore.describe())
+        report.put("herunterladen", o)
+        store.save(report)
+    }
+
+    private fun downloadState() = DownloadUi.State(
+        hasList = modelStore.hasList,
+        downloading = downloading,
+        waiting = downloadWaiting,
+        failure = downloadFailure,
+        doneBytes = modelStore.doneBytes(),
+        totalBytes = modelStore.totalBytes(),
+    )
+
     private fun showDownloadProgress(done: Long, total: Long, retry: ModelStore.Retry?) {
         // Späte Meldungen nach dem Ende des Downloads sind überholt.
         if (modelsOk || !downloading || total <= 0) return
-        val waiting = retry?.takeIf { it.inS == 0 && it.reason in setOf(WAIT_WIFI, WAIT_INTERNET) }?.reason
+        val waiting = DownloadUi.waitingFrom(retry, allowMetered)
         if (waiting != downloadWaiting) {
             downloadWaiting = waiting
             render() // Knopf und Hinweis hängen davon ab
         }
         if (running != null) return
-        val fraction = (done.toDouble() / total).toFloat()
-        when {
-            retry == null -> {
-                val left = remaining.update(SystemClock.elapsedRealtime(), done, total)
-                setStatus(
-                    Phase.BUSY, "Lädt die KI-Modelle herunter · ${mb(done)} von ${mb(total)} MB",
-                    left?.let { remainingText(it) }, fraction
-                )
-            }
-            retry.inS > 0 -> {
-                remaining.pause()
-                setStatus(Phase.BUSY, "${capitalized(retry.reason)} · neuer Versuch", "in ${retry.inS} s", fraction)
-            }
-            waiting != null -> {
-                remaining.pause()
-                setStatus(Phase.IDLE, capitalized(waiting), "noch ${mb(total - done)} MB", fraction)
-            }
-            else -> {
-                remaining.pause()
-                setStatus(Phase.BUSY, capitalized(retry.reason), null, fraction)
-            }
+        val left = if (retry == null) {
+            remaining.update(SystemClock.elapsedRealtime(), done, total)
+        } else {
+            remaining.pause()
+            null
         }
+        show(DownloadUi.progressLine(done, total, retry, waiting, left))
     }
 
-    private fun capitalized(text: String): String = text.replaceFirstChar { it.uppercase() }
-
-    /** Restzeit grob gerundet, damit die Anzeige ruhig bleibt. */
-    private fun remainingText(seconds: Long): String = when {
-        seconds >= 90 -> "noch ${(seconds + 30) / 60} min"
-        seconds >= 10 -> "noch ${(seconds + 4) / 5 * 5} s"
-        else -> "gleich fertig"
+    private fun show(line: DownloadUi.Line) {
+        val phase = when (line.tone) {
+            DownloadUi.Tone.IDLE -> Phase.IDLE
+            DownloadUi.Tone.BUSY -> Phase.BUSY
+            DownloadUi.Tone.ERROR -> Phase.ERROR
+            DownloadUi.Tone.DONE -> Phase.DONE
+        }
+        setStatus(phase, line.text, line.time, line.fraction)
     }
-
-    private fun mb(bytes: Long): String = de(bytes / 1e6, 0)
 
     /**
      * Ob das Herunterladen jetzt eine Verbindung aufbauen darf; sonst, worauf es wartet. Wird vor
@@ -407,34 +426,19 @@ class MainActivity : ComponentActivity() {
         val cm = applicationContext.getSystemService(ConnectivityManager::class.java)
         val caps = cm?.getNetworkCapabilities(cm.activeNetwork)
         when {
-            caps == null || !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) -> WAIT_INTERNET
+            caps == null || !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) -> DownloadUi.WAIT_INTERNET
             caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) ||
                 caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_TEMPORARILY_NOT_METERED) -> null
             allowMetered -> null
-            else -> WAIT_WIFI
+            else -> DownloadUi.WAIT_WIFI
         }
     } catch (_: Exception) {
         null // im Zweifel nicht blockieren
     }
 
-    /** Text des Hauptknopfs, solange die KI-Modelle fehlen. */
-    private fun downloadButtonText(): String = when {
-        downloading && downloadWaiting == WAIT_WIFI -> "Trotzdem jetzt herunterladen"
-        downloading -> "KI-Modelle werden heruntergeladen …"
-        modelStore.doneBytes() > 0 -> "Weiter herunterladen"
-        else -> "KI-Modelle herunterladen"
-    }
-
     /** Statuszeile, wenn gerade kein Test läuft und nichts heruntergeladen wird. */
     private fun showIdleStatus() {
-        when {
-            downloading -> Unit // der Fortschritt zeigt sich selbst
-            !modelsOk && downloadFailure != null -> setStatus(Phase.ERROR, "Herunterladen unterbrochen")
-            !modelsOk -> setStatus(Phase.IDLE, "KI-Modelle fehlen")
-            cameraProblem != null -> setStatus(Phase.ERROR, "Kamera nicht bereit")
-            provider == null -> setStatus(Phase.IDLE, "Kamera startet …")
-            else -> setStatus(Phase.IDLE, "Bereit")
-        }
+        DownloadUi.idleLine(downloadState(), modelsOk, cameraProblem != null, provider != null)?.let { show(it) }
     }
 
     override fun onStart() {
@@ -596,11 +600,11 @@ class MainActivity : ComponentActivity() {
         if (!modelsOk) {
             if (!downloading) {
                 startDownload()
-            } else if (downloadWaiting == WAIT_WIFI) {
+            } else if (downloadWaiting == DownloadUi.WAIT_WIFI) {
                 // Gewollt übers Datenvolumen: Die nächste Prüfung lässt die Verbindung zu.
                 allowMetered = true
                 downloadWaiting = null
-                setStatus(Phase.BUSY, "Verbindet …")
+                show(DownloadUi.progressLine(modelStore.doneBytes(), modelStore.totalBytes(), ModelStore.Retry(0, DownloadUi.CONNECTING), null, null))
                 render()
             }
             return
@@ -1502,9 +1506,9 @@ class MainActivity : ComponentActivity() {
         val noMic = if (has(Manifest.permission.RECORD_AUDIO)) "" else " Ohne Mikrofonzugriff laufen die Aufnahmen ohne Ton."
         val camera = cameraProblem
         return when {
-            camera != null && !modelsOk -> "$camera ${downloadHint()}"
+            camera != null && !modelsOk -> "$camera ${DownloadUi.hint(downloadState())}"
             camera != null -> camera
-            !modelsOk -> downloadHint()
+            !modelsOk -> DownloadUi.hint(downloadState())
             !has(Manifest.permission.CAMERA) -> "Die Test-App braucht Zugriff auf Kamera und Mikrofon."
             !quickDone -> "Starte den KI-Schnelltest. Er lädt beide KI-Modelle auf den KI-Chip, misst Tempo und Genauigkeit " +
                 "und filmt dann 30 Sekunden in 4K, während beide mitrechnen. Beim ersten Mal dauert das Laden länger; " +
@@ -1515,30 +1519,6 @@ class MainActivity : ComponentActivity() {
             repeatReason("kidauer") != null -> repeatReason("kidauer")!!
             else -> "Alles gemessen. Kopiere den Bericht und füge ihn bei mir im Chat ein. " +
                 "In der KI-Vorschau kannst du Tiefe und Verfolgung weiter ausprobieren."
-        }
-    }
-
-    /** Hinweis, solange die KI-Modelle fehlen: was gerade passiert und was zu tun ist. */
-    private fun downloadHint(): String {
-        val total = modelStore.totalBytes()
-        val left = mb(total - modelStore.doneBytes())
-        val failure = downloadFailure
-        return when {
-            !modelStore.hasList -> "In dieser Version fehlt die Liste der KI-Modelle oder ist ungültig. Das ist ein Fehler beim " +
-                "Bauen; bitte sag mir Bescheid."
-            downloading && downloadWaiting == WAIT_WIFI -> "Die App lädt die KI-Modelle herunter, sobald du im WLAN bist; es fehlen " +
-                "noch $left MB. Tippe auf „Trotzdem jetzt herunterladen“, um sie gleich über dein Datenvolumen zu laden."
-            downloading && downloadWaiting == WAIT_INTERNET -> "Gerade ist keine Internetverbindung da. Die App lädt von selbst weiter, " +
-                "sobald das Handy wieder online ist; es fehlen noch $left MB."
-            downloading -> "Die App lädt die KI-Modelle herunter, zusammen ${mb(total)} MB. Lass sie dabei offen; bricht die " +
-                "Verbindung ab, macht sie von selbst an derselben Stelle weiter. Danach bleiben die Modelle auf dem Handy."
-            failure != null && failure.kind == ModelStore.Kind.BUILD -> "Die KI-Modelle passen nicht zu dieser Version (${failure.message}). Das ist ein " +
-                "Fehler beim Bauen; bitte sag mir Bescheid."
-            failure != null && failure.kind == ModelStore.Kind.STORAGE -> "Das Herunterladen ist unterbrochen: ${failure.message}. Gib Speicher frei " +
-                "und tippe dann auf „${downloadButtonText()}“."
-            failure != null -> "Das Herunterladen ist unterbrochen (${failure.message}). Tippe auf „${downloadButtonText()}“, " +
-                "es geht an derselben Stelle weiter."
-            else -> "Die App muss die KI-Modelle herunterladen, noch $left MB. Tippe auf „${downloadButtonText()}“."
         }
     }
 
@@ -1566,9 +1546,10 @@ class MainActivity : ComponentActivity() {
         val ready = provider != null
         val quickDone = quickTestDone()
         if (!modelsOk) {
-            mainButton.text = downloadButtonText()
+            val state = downloadState()
+            mainButton.text = DownloadUi.buttonText(state)
             mainButton.filled(Palette.text, Palette.background)
-            mainButton.isEnabled = modelStore.hasList && (!downloading || downloadWaiting == WAIT_WIFI)
+            mainButton.isEnabled = DownloadUi.buttonEnabled(state)
             previewButton.text = "KI-Vorschau"
             previewButton.outlined()
             previewButton.isEnabled = false

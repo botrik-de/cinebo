@@ -23,7 +23,6 @@ env:
   MODELLE_VERSION: '1'
   EDGETAM_COMMIT: 7711e012a30a2402c4eaab637bdb00a521302c91
   EDGETAM_SHA256: ed2d4850b8792c239689b043c47046ec239b6e808a3d9b6ae676c803fd8780df
-  QNN_VERSION: '2.50.0'
 
 defaults:
   run:
@@ -63,11 +62,13 @@ jobs:
           pip freeze > out/pakete.txt
           (cd out && sha256sum *.tflite *.json > pruefsummen.txt && cat pruefsummen.txt)
 
-      # Die Lizenztexte der Qualcomm-Bibliotheken, die in der App stecken, zum Nachlesen.
+      # Die Lizenztexte der Qualcomm-Bibliotheken, die die App nutzt, zum Nachlesen.
       - name: Lizenzen der Qualcomm-Bibliotheken lesen
         continue-on-error: true
         run: |
           set +e
+          # Dieselbe QNN-Version wie in der App (gradle.properties).
+          QNN_VERSION=$(sed -n 's/^cinebo\.qnnVersion=//p' gradle.properties)
           command -v pdftotext >/dev/null || sudo apt-get install -y -qq poppler-utils >/dev/null
           central=https://repo1.maven.org/maven2/com/qualcomm/qti
           mkdir -p lic

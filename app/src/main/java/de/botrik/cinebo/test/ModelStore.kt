@@ -324,9 +324,11 @@ internal class ModelStore(private val context: Context) {
                 }
             }
         } catch (io: IOException) {
+            // Schreibfehler meldet storage { } schon als Speicherfehler; hier bleibt nur das Lesen der
+            // geprüften Übertragung, also passt sie nicht zu dem, was die Liste verspricht.
             tmp.delete()
             lastProblem = technical(io)
-            throw Failure(Kind.STORAGE, "${e.name} ließ sich nicht entpacken", io)
+            throw Failure(Kind.BUILD, "${e.name} ließ sich nicht entpacken", io)
         } catch (f: Failure) {
             tmp.delete()
             throw f
@@ -409,7 +411,7 @@ internal class ModelStore(private val context: Context) {
                     // Ohne Teilbereich schickt der Server die ganze Datei; dann von vorn, aber nicht endlos.
                     val append = code == HttpURLConnection.HTTP_PARTIAL
                     if (!append && have > 0 && ++restarts > MAX_RESTARTS) {
-                        throw Failure(Kind.NETWORK, "Server kann nicht an derselben Stelle weitermachen")
+                        throw Failure(Kind.NETWORK, "der Server kann nicht fortsetzen, ${s.name} beginnt jedes Mal von vorn")
                     }
                     checkResponse(s, conn, append, have)
                     conn.inputStream.use { input ->
@@ -579,7 +581,7 @@ internal class ModelStore(private val context: Context) {
         const val LIST_FORMAT = 1
         private const val BUFFER = 256 * 1024
         private const val MAX_FAILURES = 25
-        private const val MAX_RESTARTS = 3
+        private const val MAX_RESTARTS = 5
         private const val MAX_NOT_FOUND = 3
         private const val MAX_REDIRECTS = 6
         private const val MAX_PAUSE_MS = 30_000L

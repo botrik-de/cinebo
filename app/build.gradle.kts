@@ -89,4 +89,7 @@ dependencies {
     // (siehe ModelStore und Npu.loadLibraries).
     implementation("org.tensorflow:tensorflow-lite:2.17.0")
     implementation("com.qualcomm.qti:qnn-litert-delegate:$qnnVersion")
+
+    // Prüfungen ohne Handy, bei jedem Bau (app/src/test)
+    testImplementation("junit:junit:4.13.2")
 }

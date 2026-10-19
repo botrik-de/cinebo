@@ -96,6 +96,16 @@ jobs:
             # Festgeschriebene Dateien müssen genau die geprüften sein; sonst bricht der Bau ab.
             (cd "$roh" && sha256sum -c --quiet "$GITHUB_WORKSPACE/.github/modelle.sha256")
 
+            # App und Bau-Skript müssen dasselbe Listenformat sprechen.
+            format_app=$(sed -n 's/.*const val LIST_FORMAT = \([0-9][0-9]*\).*/\1/p' app/src/main/java/de/botrik/cinebo/test/ModelStore.kt)
+            format_bau=$(python3 .github/ki_dateien.py format | awk '{print $2}')
+            if [ -z "$format_app" ] || [ "$format_app" != "$format_bau" ]; then
+              echo "Listenformat passt nicht: App ${format_app:-?}, Bau-Skript $format_bau"
+              exit 1
+            fi
+            # Setzt Maven Central abgebrochene Übertragungen fort? (206 = ja; sonst beginnt die App von vorn)
+            echo "Maven Central, Teilbereich: HTTP $(curl -s -o /dev/null -r 1000-1999 -w '%{http_code}' "$aar_url")" | tee maven-fortsetzen.txt
+
             # Der Satz heißt nach den Prüfsummen aller fertigen Dateien und dem Aufbau der Liste.
             satz=$( { cat ki-dateien.sha256; python3 .github/ki_dateien.py format; } | sha256sum | cut -c1-10)
             tag="ki-modelle-$satz"
@@ -144,9 +154,10 @@ jobs:
             python3 .github/ki_dateien.py uebersicht app/src/main/assets/modelle.json | tee ki-dateien.txt
           } 2>&1 | tee -a ki-log.txt
 
+      # Erst die Prüfungen ohne Handy (app/src/test), dann die APK.
       - name: APK bauen
         shell: bash
-        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace 2>&1 | tee build-log.txt
+        run: ./gradlew :app:testReleaseUnitTest :app:assembleRelease --no-daemon --stacktrace 2>&1 | tee build-log.txt
 
       # Was in der APK steckt und was die App selbst lädt. Danach wacht ki_dateien.py darüber,
       # dass die APK klein bleibt und jede Bibliothek auf dem Handy findet, was sie braucht.
@@ -165,6 +176,7 @@ jobs:
               echo
               echo "== KI-Dateien, die die App beim ersten Start selbst lädt"
               cat ki-dateien.txt
+              cat maven-fortsetzen.txt
               echo
               echo "== Prüfsummen der fertigen KI-Dateien (sha256)"
               cat ki-dateien.sha256
