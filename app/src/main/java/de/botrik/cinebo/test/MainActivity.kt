@@ -780,10 +780,14 @@ class MainActivity : ComponentActivity() {
                 engine.videoCheck { what -> runOnUiThread { setStatus(Phase.BUSY, "$what …") } }
             }
             ki.put("pruefvideo", video)
-            // Live nimmt den Decoder, der auf dem Chip im Prüfvideo am genauesten traf.
+            // Live nimmt den Decoder, der auf dem Chip im Prüfvideo am genauesten traf. Bericht und
+            // Anzeige folgen: „jeBild“ ist die volle Kette, die live läuft.
             val decoder = withContext(engine.dispatcher) { engine.chooseDecoderAfterVideo(video) }
-            if (decoder != null) {
-                ki.optJSONObject("einzeln")?.put("liveDecoder", decoder)?.put("liveDecoderGrund", "Prüfvideo auf dem Chip")
+            val single = ki.optJSONObject("einzeln")
+            if (decoder != null && single != null) {
+                single.put("liveDecoder", decoder).put("liveDecoderGrund", "Prüfvideo auf dem Chip")
+                val live = single.optJSONObject("ketten")?.optJSONObject(AiEngine.liveChainKey(decoder == "meta"))
+                if (live != null) single.put("jeBild", live) else single.remove("jeBild")
             }
             saveAndRender()
         } finally {
@@ -1402,8 +1406,10 @@ class MainActivity : ComponentActivity() {
 
     private fun depthSummary(): Pair<Mark, String> {
         val ki = ki() ?: return openRow("tiefe")
-        val m = ki.optJSONObject("einzeln")?.optJSONObject("modelle")?.optJSONObject(ModelId.DEPTH.key)
-            ?.optJSONObject("imModell") ?: return openRow("tiefe")
+        val measured = ki.optJSONObject("einzeln")?.optJSONObject("modelle")?.optJSONObject(ModelId.DEPTH.key)
+            ?: return openRow("tiefe")
+        measured.optString("fehler").takeIf { it.isNotEmpty() }?.let { return Mark.FAIL to "Messung gescheitert: ${it.take(160)}" }
+        val m = measured.optJSONObject("imModell") ?: return openRow("tiefe")
         val ms = m.optDouble("medianMs")
         val parts = mutableListOf("${de(ms, 0)} ms je Durchgang auf dem KI-Chip, also bis zu ${de(1000.0 / ms, 0)} pro Sekunde")
         var mark = if (ms <= 1000.0 / TARGET_HZ) Mark.OK else Mark.WARN
@@ -1430,7 +1436,11 @@ class MainActivity : ComponentActivity() {
         fun row(key: String): JSONObject? = (0 until rows.length()).map { rows.getJSONObject(it) }.firstOrNull { it.optString("einstellung") == key }
         val chosenKey = perf.optString("gewaehlt")
         val chosen = row(chosenKey)
-        if (chosen == null) return Mark.WARN to (perf.optString("fehler").ifEmpty { "Keine Einstellung lief vollständig" })
+        val stopped = perf.optBoolean("abgebrochen")
+        if (chosen == null) {
+            if (stopped) return Mark.OPEN to "Gestoppt, bevor alle Einstellungen gemessen waren; die bisherige Einstellung bleibt"
+            return Mark.WARN to (perf.optString("fehler").ifEmpty { "Keine Einstellung lief vollständig" })
+        }
         val base = row(ChipSetting.DEFAULT.key)
         val parts = mutableListOf("Am schnellsten: ${perf.optString("gewaehltTitel")}")
         fun model(r: JSONObject?, id: ModelId) = r?.optJSONObject("modelle")?.optJSONObject(id.key)?.optDouble("medianMs", Double.NaN) ?: Double.NaN
@@ -1444,6 +1454,7 @@ class MainActivity : ComponentActivity() {
         val fast = chosen.optDouble("schnellMs", Double.NaN)
         if (!full.isNaN()) parts += "volle Verfolgung mit Tiefe rund ${de(full, 0)} ms"
         if (!fast.isNaN()) parts += "Schnellverfolgung mit Tiefe rund ${de(fast, 0)} ms"
+        if (stopped) parts += "Vergleich mit festgehaltenem Takt gestoppt"
         if (perf.has("gesamtS")) parts += "Test ${de(perf.optDouble("gesamtS") / 60.0, 1)} min"
         return Mark.OK to parts.joinToString(" · ")
     }
@@ -1486,14 +1497,17 @@ class MainActivity : ComponentActivity() {
             val cpu = value(o, "cpuNachbauMittel")
             return "$name ${(chip * 100).roundToInt()} %" + if (!cpu.isNaN()) " (CPU ${(cpu * 100).roundToInt()} %)" else ""
         }
-        val fullIou = value(video?.optJSONObject("voll"), "maskeGleichMittel")
-        if (!fullIou.isNaN()) {
-            parts += "Prüfvideo, Maske gleich wie in Metas Original: " + listOfNotNull(
-                videoPart("voll", video?.optJSONObject("voll")),
-                videoPart("mit Qualcomms Decoder", video?.optJSONObject("vollQualcomm")),
-                videoPart("schnell", video?.optJSONObject("schnell")),
-            ).joinToString(", ")
-            if (fullIou < 0.9) mark = Mark.WARN
+        val videoParts = listOfNotNull(
+            videoPart("voll", video?.optJSONObject("voll")),
+            videoPart("mit Qualcomms Decoder", video?.optJSONObject("vollQualcomm")),
+            videoPart("schnell", video?.optJSONObject("schnell")),
+        )
+        if (videoParts.isNotEmpty()) {
+            parts += "Prüfvideo, Maske gleich wie in Metas Original: " + videoParts.joinToString(", ")
+            // Es zählt die volle Kette, die live läuft (nach dem Prüfvideo gewählt).
+            val metaLive = ki.optJSONObject("einzeln")?.optString("liveDecoder") != "qualcomm"
+            val liveIou = value(video?.optJSONObject(AiEngine.liveChainKey(metaLive)), "maskeGleichMittel")
+            if (liveIou.isNaN() || liveIou < 0.9) mark = Mark.WARN
         } else {
             val acc = ki.optJSONObject("genauigkeit")?.optJSONObject("verfolgung")
             val iou = acc?.optDouble("folgeMaskeGleich", Double.NaN) ?: Double.NaN

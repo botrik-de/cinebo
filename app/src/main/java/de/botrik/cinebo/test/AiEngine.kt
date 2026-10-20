@@ -335,6 +335,8 @@ internal class AiEngine(private val context: Context) {
         }
 
         fun measure(series: Series, id: ModelId) {
+            // Nach dem Stopp nichts mehr laden; die Anzeige bleibt bei „Stoppt …“.
+            if (cancelWork) return
             val s = series.setting
             progress("${s.title} · ${id.title}", done++, total)
             var m: NpuModel? = null
@@ -367,7 +369,6 @@ internal class AiEngine(private val context: Context) {
             // Unvollständig: keine Wahl, die Einstellung bleibt.
             val rows = JSONArray()
             first.forEach { rows.put(it.row()) }
-            progress("abgebrochen", total, total)
             return JSONObject().put("einstellungen", rows).put("waerme", heat).put("abgebrochen", true)
                 .put("gesamtS", r1((SystemClock.elapsedRealtime() - start) / 1000.0))
         }
@@ -419,7 +420,12 @@ internal class AiEngine(private val context: Context) {
         } else {
             out.put("fehler", "Kein Modell lief in irgendeiner Einstellung; es bleibt ${chip.title}.")
         }
-        progress("fertig", total, total)
+        if (cancelWork) {
+            // Gestoppt im zweiten Durchgang: Die Wahl aus dem ersten gilt, der Vergleich mit festgehaltenem Takt fehlt.
+            out.put("abgebrochen", true)
+        } else {
+            progress("fertig", total, total)
+        }
         return out
     }
 
@@ -465,6 +471,10 @@ internal class AiEngine(private val context: Context) {
      */
     fun bench(frame: FrameSlot, progress: (String) -> Unit): JSONObject {
         setStill(frame)
+        // Wird gestoppt, bleibt die bisherige Wahl für live (wie im Leistungstest).
+        val beforeAttn = liveAttn
+        val beforeQcMemory = liveQcMemory
+        val beforeMetaDecoder = liveMetaDecoder
         val out = JSONObject().put("einstellung", chip.key)
         val perModel = JSONObject()
         for (id in ModelId.entries) {
@@ -498,7 +508,7 @@ internal class AiEngine(private val context: Context) {
         )
         for ((key, make) in writers) {
             if (cancelWork) break
-            progress("Memory-Encoder $key in der Kette")
+            progress(if (key == "eigener") "unseren Memory-Encoder in der Kette" else "Qualcomms Memory-Encoder in der Kette")
             section(memory, key) { memory.put(key, writerTiming(make())) }
         }
         out.put("speicherEncoderKette", memory)
@@ -536,6 +546,15 @@ internal class AiEngine(private val context: Context) {
             }
         }
         out.put("ketten", chains)
+        if (cancelWork) {
+            // Unvollständig: keine Wahl für live und nichts davon im Bericht, damit auch ein
+            // Neustart die bisherige Wahl behält.
+            liveAttn = beforeAttn
+            liveQcMemory = beforeQcMemory
+            liveMetaDecoder = beforeMetaDecoder
+            buildTracker()
+            return out.put("abgebrochen", true)
+        }
         // Live vorerst: unser Decoder wie im Original, wenn seine Kette lief; nach dem Prüfvideo
         // entscheidet die Genauigkeit noch einmal (chooseDecoderAfterVideo).
         val metaRan = chains.optJSONObject("voll")?.let { !it.has("fehler") } == true
@@ -545,8 +564,7 @@ internal class AiEngine(private val context: Context) {
         out.put("liveMemoryEncoder", if (liveQcMemory) "qualcomm" else "eigener")
         out.put("liveDecoder", if (liveMetaDecoder) "meta" else "qualcomm")
         // Wie in Stufe 2: „jeBild“ ist die volle Verfolgung, die live läuft.
-        chains.optJSONObject(if (liveMetaDecoder) "voll" else "vollQualcomm")?.let { out.put("jeBild", it) }
-        if (cancelWork) out.put("abgebrochen", true)
+        chains.optJSONObject(liveChainKey(liveMetaDecoder))?.let { out.put("jeBild", it) }
         return out
     }
 
@@ -944,8 +962,9 @@ internal class AiEngine(private val context: Context) {
                     }
                 }
             }
-            if (cancelWork) out.put("abgebrochen", true)
         } finally {
+            // Auch nach einem frühen Ende (etwa ohne Encoder auf der CPU) steht ein Stopp im Bericht.
+            if (cancelWork) out.put("abgebrochen", true)
             for (m in cpu.values) m.close()
         }
         return out
@@ -1250,6 +1269,9 @@ internal class AiEngine(private val context: Context) {
         const val DEPTH_W = 144
         const val DEPTH_H = 256
         val MASK_COLOR = Palette.amber
+
+        /** Die volle Kette, die live läuft: „voll“ mit unserem Decoder wie im Original, sonst „vollQualcomm“. */
+        fun liveChainKey(metaDecoder: Boolean): String = if (metaDecoder) "voll" else "vollQualcomm"
     }
 }
 
