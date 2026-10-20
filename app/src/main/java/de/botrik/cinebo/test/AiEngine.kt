@@ -571,13 +571,16 @@ internal class AiEngine(private val context: Context) {
     /**
      * Nach dem Prüfvideo: Unser Decoder bleibt live, solange er auf dem Chip mindestens so genau
      * trifft wie Qualcomms (1 Prozentpunkt Spielraum); sonst Qualcomms. Lief nur einer der beiden
-     * durch (der andere scheiterte), nimmt live diesen. Null, wenn keiner durchlief.
+     * durch, weil der andere scheiterte, nimmt live diesen. Null, wenn keiner durchlief oder der
+     * Vergleich fehlt, weil das Prüfvideo gestoppt wurde (dann bleibt die bisherige Wahl).
      */
     fun chooseDecoderAfterVideo(video: JSONObject): String? {
         val meta = video.optJSONObject("voll")?.optDouble("maskeGleichMittel", Double.NaN) ?: Double.NaN
         val qualcomm = video.optJSONObject("vollQualcomm")?.optDouble("maskeGleichMittel", Double.NaN) ?: Double.NaN
+        val stopped = video.optBoolean("abgebrochen")
         val useMeta = when {
             meta.isNaN() && qualcomm.isNaN() -> return null
+            (meta.isNaN() || qualcomm.isNaN()) && stopped -> return null
             meta.isNaN() -> false
             qualcomm.isNaN() -> true
             else -> meta + 0.01 >= qualcomm
