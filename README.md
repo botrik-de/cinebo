@@ -7,7 +7,8 @@ Eine Kamera-App für das OPPO Find N6, die beim Filmen live ein natürliches Bok
 Phase 1: Machbarkeitstest.
 
 - Stufe 1 (bestanden): Kamera, 4K-Aufnahme, Klappen und Wärme.
-- Stufe 2 (läuft): Schaffen beide KI-Modelle (Tiefe und Verfolgung) auf dem KI-Chip das nötige Tempo, auch während 4K-Aufnahme und über 10 Minuten?
+- Stufe 2 (gemessen): Die Tiefe schafft das Tempo; die Verfolgung mit Speicher ist noch zu langsam.
+- Stufe 2b (läuft): Tempo herausholen: alle Leistungsstufen des KI-Chips, schnellere Bausteine, und ein Prüfvideo, an dem jede Kette auf dem Chip mit Metas Original verglichen wird.
 
 ## Test-App
 
@@ -23,7 +24,7 @@ laden nur nach, was sich geändert hat.
 Die Modelle liegen nie im Repo und nicht in der APK:
 
 - Depth Anything V2 Small (Tiefe) und EdgeTAM (Verfolgung) in der Fassung von [Qualcomm AI Hub](https://github.com/quic/ai-hub-models).
-- Die Teile von EdgeTAM, die Qualcomm nicht anbietet (Memory-Attention und Memory-Encoder), baut `tools/export/edgetam_export.py` aus dem [Original von Meta](https://github.com/facebookresearch/EdgeTAM) nach, prüft sie gegen das Original und legt sie im Release `modelle-1` ab.
+- Die Teile von EdgeTAM, die Qualcomm nicht anbietet (Memory-Attention, eigener Memory-Encoder, eine Vorbereitung für Qualcomms Memory-Encoder und ein Decoder, der wie in Metas Videoverfolgung rechnet), baut `tools/export/edgetam_export.py` aus dem [Original von Meta](https://github.com/facebookresearch/EdgeTAM) nach, prüft sie gegen das Original und legt sie mit Konstanten und einem Prüfvideo im Release `modelle-2` ab. Dabei rechnet der Export jede Verfolgungs-Kette der App auf der CPU nach: Das ist die Messlatte für das Ergebnis auf dem KI-Chip.
 - Beim Bauen landen alle Modelle, für die Übertragung gepackt, im Release `ki-modelle-<Satz>`; die App bekommt nur die Liste mit Adressen, Größen und Prüfsummen (`.github/ki_dateien.py`).
 - Die QNN-Laufzeit für den KI-Chip holt die App direkt aus Qualcomms Paket `qnn-runtime` auf Maven Central und entpackt daraus nur, was das Find N6 braucht.
 
@@ -31,6 +32,6 @@ Lizenzen: EdgeTAM und Depth Anything V2 Small stehen unter Apache 2.0. Qualcomms
 
 ## Hinweise
 
-- Das Projekt ist öffentlich, damit die Builds kostenlos bleiben. Testvideos und Aufnahmen liegen hier nie.
+- Das Projekt ist öffentlich, damit die Builds kostenlos bleiben. Testvideos und Aufnahmen liegen hier nie. Das Prüfvideo der KI ist künstlich (ein Ball vor Rechtecken) und entsteht beim Export.
 - Der Schlüssel im Ordner `signing` gilt nur für die Test-App und ist absichtlich öffentlich. Die richtige App bekommt einen eigenen, geheimen Schlüssel.
 - Für den Code dieses Projekts gibt es keine Lizenz. Alle Rechte bleiben beim Inhaber dieses Kontos.

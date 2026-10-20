@@ -1,8 +1,10 @@
 name: KI-Modelle exportieren
 
-# Baut die EdgeTAM-Teile, die Qualcomm nicht fertig anbietet (Memory-Attention und
-# Memory-Encoder), prüft sie Zahl für Zahl gegen das Original von Meta und legt sie
-# im Release „modelle-<Version>“ ab. Die Test-App lädt sie beim Bauen von dort.
+# Baut die EdgeTAM-Teile, die Qualcomm nicht fertig anbietet (Memory-Attention, eigener
+# Memory-Encoder, Vorbereitung für Qualcomms Memory-Encoder), prüft sie Zahl für Zahl gegen
+# das Original von Meta und legt sie mit Konstanten und Prüfvideo im Release
+# „modelle-<Version>“ ab. Die Test-App lädt sie beim Bauen von dort. Mit Qualcomms Modellen
+# rechnet der Export außerdem jede Kette der App auf der CPU nach (Messlatte für den KI-Chip).
 # Ändert sich am Export etwas Grundlegendes, steigt MODELLE_VERSION, damit jede
 # Version der Test-App genau weiß, welche Modelle sie enthält.
 
@@ -20,7 +22,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  MODELLE_VERSION: '1'
+  MODELLE_VERSION: '2'
   EDGETAM_COMMIT: 7711e012a30a2402c4eaab637bdb00a521302c91
   EDGETAM_SHA256: ed2d4850b8792c239689b043c47046ec239b6e808a3d9b6ae676c803fd8780df
 
@@ -53,14 +55,40 @@ jobs:
           pip install -q -r tools/export/requirements.txt
           python --version
 
+      # Qualcomms EdgeTAM-Modelle, genau die, die auch in der App laufen (Prüfsummen wie beim Bau).
+      - name: Qualcomms Modelle holen
+        run: |
+          set -u
+          s3=https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/models/edgetam/releases/v0.61.0
+          mkdir -p qc
+          for z in float w8a8; do
+            curl -fsSL --retry 3 -o "qc/$z.zip" "$s3/edgetam-tflite-$z.zip"
+            unzip -q -o "qc/$z.zip" -d "qc/$z-zip"
+            mkdir -p "qc/$z"
+            cp qc/$z-zip/*/*.tflite "qc/$z/"
+          done
+          # Gleiche Dateien wie in der App? Namen dort: edgetam_<teil>[_w8a8].tflite
+          pin() { awk -v n="$1" '$2 == n {print $1}' .github/modelle.sha256; }
+          check() {
+            want=$(pin "$2"); got=$(sha256sum "$1" | cut -d' ' -f1)
+            if [ -z "$want" ] || [ "$want" != "$got" ]; then echo "$1 passt nicht zu $2 (${want:-fehlt} / $got)"; exit 1; fi
+            echo "$1 = $2"
+          }
+          check qc/float/encoder.tflite edgetam_encoder.tflite
+          check qc/float/video_decoder.tflite edgetam_decoder.tflite
+          check qc/float/memory_encoder.tflite edgetam_memory_encoder_qualcomm.tflite
+          check qc/w8a8/encoder.tflite edgetam_encoder_w8a8.tflite
+
       - name: Exportieren und prüfen
         run: |
+          set -o pipefail
           . venv/bin/activate
           mkdir -p out
           python -I tools/export/edgetam_export.py --repo edgetam \
-            --checkpoint edgetam/checkpoints/edgetam.pt --out out 2>&1 | tee out/export-protokoll.txt
+            --checkpoint edgetam/checkpoints/edgetam.pt --qualcomm qc/float --qualcomm-w8a8 qc/w8a8 \
+            --out out 2>&1 | tee out/export-protokoll.txt
           pip freeze > out/pakete.txt
-          (cd out && sha256sum *.tflite *.json > pruefsummen.txt && cat pruefsummen.txt)
+          (cd out && sha256sum *.tflite *.json *.zip > pruefsummen.txt && cat pruefsummen.txt)
 
       # Die Lizenztexte der Qualcomm-Bibliotheken, die die App nutzt, zum Nachlesen.
       - name: Lizenzen der Qualcomm-Bibliotheken lesen
