@@ -26,6 +26,12 @@ android {
         versionName = versionLabel
         // Der KI-Chip und seine Bibliotheken gibt es nur für 64-Bit-ARM.
         ndk { abiFilters += "arm64-v8a" }
+        // Für den Bericht: welche QNN-Version die App erwartet.
+        buildConfigField("String", "QNN_VERSION", "\"$qnnVersion\"")
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     packaging {

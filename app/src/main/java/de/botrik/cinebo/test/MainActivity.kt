@@ -85,18 +85,19 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * Test-App, Stufe 2 des Machbarkeitstests: Laufen beide KI-Modelle (Tiefe mit
- * Depth Anything V2 und Verfolgung mit EdgeTAM) auf dem KI-Chip schnell genug,
- * auch während einer 4K-Aufnahme und über 10 Minuten? Alles landet in einem Bericht,
- * den man kopieren oder teilen kann.
+ * Test-App, Stufe 2b des Machbarkeitstests: Wie schnell laufen Tiefe (Depth Anything V2) und
+ * Verfolgung (EdgeTAM) auf dem KI-Chip in seiner besten Einstellung, mit schnelleren Bausteinen
+ * und als Schnellverfolgung, auch während einer 4K-Aufnahme und über 10 Minuten? Alles landet
+ * in einem Bericht, den man kopieren oder teilen kann.
  */
 class MainActivity : ComponentActivity() {
 
     private companion object {
-        val ORDER = listOf("kichip", "tiefe", "verfolgung", "live", "kidauer")
+        val ORDER = listOf("kichip", "leistung", "tiefe", "verfolgung", "live", "kidauer")
 
         val TITLES = mapOf(
             "kichip" to "KI-Chip",
+            "leistung" to "Leistungsstufen · KI-Chip",
             "tiefe" to "Tiefe · Depth Anything",
             "verfolgung" to "Verfolgung · EdgeTAM",
             "live" to "Live mit 4K · 30 s",
@@ -105,8 +106,9 @@ class MainActivity : ComponentActivity() {
 
         val DESCRIPTIONS = mapOf(
             "kichip" to "Lädt beide KI-Modelle auf den KI-Chip und misst, wie lange das dauert.",
+            "leistung" to "Misst jedes Modell in jeder Leistungsstufe des KI-Chips und nimmt die schnellste.",
             "tiefe" to "Wie schnell und wie genau der KI-Chip die Tiefe eines Bildes schätzt.",
-            "verfolgung" to "Wie schnell EdgeTAM ein Objekt Bild für Bild wiederfindet.",
+            "verfolgung" to "Wie schnell EdgeTAM ein Objekt Bild für Bild wiederfindet, mit Speicher und als Schnellverfolgung.",
             "live" to "30 Sekunden 4K mit 30 fps, beide Modelle rechnen auf dem Kamerabild mit.",
             "kidauer" to "10 Minuten 4K mit beiden Modellen: Tempo, Wärme und Akku."
         )
@@ -687,11 +689,13 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * KI-Schnelltest: KI-Chip prüfen und alle Modelle laden, jedes einzeln messen, mit der
-     * CPU vergleichen und zuletzt 30 Sekunden 4K filmen, während beide mitrechnen.
+     * KI-Schnelltest: KI-Chip prüfen und alle Modelle laden (wie in Stufe 2), die Leistungsstufen
+     * des Chips vergleichen, in der schnellsten jedes Modell und jede Kette messen, mit der CPU und
+     * Metas Original vergleichen und zuletzt 30 Sekunden 4K filmen, während beide mitrechnen.
      */
     private fun runQuickTest() = launchTest {
-        hintOverride = "Lass die App offen und richte die Kamera auf eine Szene mit einem Gegenstand in der Mitte. Der Test dauert etwa drei Minuten."
+        hintOverride = "Lass die App offen und richte die Kamera auf eine Szene mit einem Gegenstand in der Mitte. " +
+            "Der Test dauert beim ersten Mal etwa zehn Minuten, danach etwa fünf."
         val tests = readTests()
         tests.remove("live")
         report.remove("ki")
@@ -711,8 +715,12 @@ class MainActivity : ComponentActivity() {
         report.put("ki", ki)
         saveAndRender()
 
-        // Frisch laden, damit die Ladezeit zählt; beim zweiten Mal aus dem Zwischenspeicher.
-        withContext(engine.dispatcher) { engine.closeAll() }
+        // Frisch laden wie in Stufe 2 (Dauerleistung, Standard-Übersetzung), damit die Ladezeit
+        // zählt und vergleichbar bleibt; beim zweiten Mal aus dem Zwischenspeicher.
+        withContext(engine.dispatcher) {
+            engine.closeAll()
+            engine.configureLive(ChipSetting.DEFAULT, ModelId.ATTN, qcMemory = false, metaDecoder = true)
+        }
         val load = withContext(engine.dispatcher) {
             engine.load(ModelId.entries) { done, total, _ ->
                 runOnUiThread { loadingStatus(done, total) }
@@ -724,20 +732,31 @@ class MainActivity : ComponentActivity() {
         if (!usable) throw IllegalStateException("Die Modelle laufen nicht auf dem KI-Chip. Die Gründe stehen im Bericht.")
         if (stopRequested) return@launchTest
 
-        running = "tiefe"
+        running = "leistung"
         render()
-        reveal("tiefe")
-        setStatus(Phase.BUSY, "Holt ein Kamerabild …")
-        bind(null, withAnalysis = true)
-        delay(300)
-        waitForStreaming(5000)
-        delay(1500) // Belichtung und Weißabgleich einpendeln lassen
-        val frame = grabFrame() ?: throw IllegalStateException(
-            "Die Kamera liefert keine Bilder für die KI (${analysisSize ?: "?"})" +
-                (prepError?.let { ". Vorbereitung: $it" } ?: ".")
-        )
+        reveal("leistung")
+        val frame = cameraFrame()
         try {
             ki.put("bild", frameInfo(frame))
+            val perf = withContext(engine.dispatcher) {
+                engine.perfMatrix(frame) { what, done, total ->
+                    runOnUiThread { setStatus(Phase.BUSY, "Leistungsstufen · ${min(done + 1, total)} von $total · $what", null, done / total.toFloat()) }
+                }
+            }
+            ki.put("leistung", perf)
+            saveAndRender()
+            if (stopRequested) return@launchTest
+            // In der gewählten Einstellung neu laden; was dort noch nicht übersetzt ist, übersetzt QNN jetzt.
+            val reload = withContext(engine.dispatcher) {
+                engine.load(ModelId.entries) { done, total, _ -> runOnUiThread { loadingStatus(done, total) } }
+            }
+            ki.put("ladenGewaehlt", reload)
+            saveAndRender()
+            if (stopRequested) return@launchTest
+
+            running = "tiefe"
+            render()
+            reveal("tiefe")
             val bench = withContext(engine.dispatcher) {
                 engine.bench(frame) { what -> runOnUiThread { setStatus(Phase.BUSY, "Misst $what …") } }
             }
@@ -753,6 +772,12 @@ class MainActivity : ComponentActivity() {
             }
             ki.put("genauigkeit", accuracy)
             saveAndRender()
+            if (stopRequested) return@launchTest
+            val video = withContext(engine.dispatcher) {
+                engine.videoCheck { what -> runOnUiThread { setStatus(Phase.BUSY, "$what …") } }
+            }
+            ki.put("pruefvideo", video)
+            saveAndRender()
         } finally {
             pool.release(frame)
         }
@@ -766,11 +791,34 @@ class MainActivity : ComponentActivity() {
         doneText = "KI-Schnelltest fertig"
     }
 
+    /** Ein vorbereitetes Kamerabild für die KI (ohne Aufnahme); der Aufrufer gibt es mit pool.release zurück. */
+    private suspend fun cameraFrame(): FrameSlot {
+        setStatus(Phase.BUSY, "Holt ein Kamerabild …")
+        bind(null, withAnalysis = true)
+        delay(300)
+        waitForStreaming(5000)
+        delay(1500) // Belichtung und Weißabgleich einpendeln lassen
+        return grabFrame() ?: throw IllegalStateException(
+            "Die Kamera liefert keine Bilder für die KI (${analysisSize ?: "?"})" +
+                (prepError?.let { ". Vorbereitung: $it" } ?: ".")
+        )
+    }
+
     private fun runLongTest() = launchTest {
         hintOverride = "Leg das Handy hin, Kamera nach vorn auf eine Szene mit einem Gegenstand in der Mitte. Die App bleibt offen, die Aufnahme läuft 10 Minuten."
         running = "kidauer"
         render()
         reveal("kidauer")
+        // Liefert die Kamera neben 4K keine Bilder für die KI, rechnet sie auf einem Standbild. Das
+        // entsteht sonst im Schnelltest; nach einem Neustart der App holt der Dauertest es selbst.
+        if (!withContext(engine.dispatcher) { engine.hasStill() }) {
+            val frame = cameraFrame()
+            try {
+                withContext(engine.dispatcher) { engine.setStill(frame) }
+            } finally {
+                pool.release(frame)
+            }
+        }
         putTest("kidauer", recordWithAi("kidauer", LONG_SECONDS))
         doneText = "KI-Dauertest fertig"
     }
@@ -803,11 +851,15 @@ class MainActivity : ComponentActivity() {
 
     /** Lädt die Modelle für den Live-Betrieb, falls nötig. Gibt das Protokoll zurück oder null. */
     private suspend fun ensureLiveModels(): JSONObject? {
-        // Die Einzelmessung hat die schnellere Memory-Attention gewählt; die gilt auch nach einem Neustart.
-        val chosen = ki()?.optJSONObject("einzeln")?.optString("liveMemoryAttention").orEmpty()
-        val preferred = ModelId.entries.firstOrNull { it.key == chosen }
+        // Leistungstest und Einzelmessung haben Einstellung und Bausteine gewählt; das gilt auch nach einem Neustart.
+        val ki = ki()
+        val setting = ChipSetting.fromKey(ki?.optJSONObject("leistung")?.optString("gewaehlt"))
+        val chosenAttn = ki?.optJSONObject("einzeln")?.optString("liveMemoryAttention").orEmpty()
+        val attn = ModelId.entries.firstOrNull { it.key == chosenAttn }
+        val qcMemory = ki?.optJSONObject("einzeln")?.optString("liveMemoryEncoder")?.takeIf { it.isNotEmpty() }?.let { it == "qualcomm" }
+        val metaDecoder = ki?.optJSONObject("einzeln")?.optString("liveDecoder")?.takeIf { it.isNotEmpty() }?.let { it == "meta" }
         val ready = withContext(engine.dispatcher) {
-            if (preferred != null) engine.preferAttention(preferred)
+            engine.configureLive(setting, attn, qcMemory, metaDecoder)
             engine.liveReady()
         }
         if (ready) return null
@@ -978,6 +1030,9 @@ class MainActivity : ComponentActivity() {
         ai.put("kameraBilderFuerKi", if (aiTotal != null) prepared else pool.prepared)
         ai.put("kameraBilderVerworfen", if (aiTotal != null) skipped else pool.skipped)
         ai.put("analyse", analysisSize ?: "?")
+        val (setting, chainName) = withContext(engine.dispatcher) { engine.chip to engine.liveTrackerName() }
+        ai.put("einstellung", setting.key)
+        ai.put("verfolgungKette", chainName)
         ai.put("memoryAttention", engine.liveAttn.key)
         prepError?.let { ai.put("vorbereitungFehler", it) }
         liveError?.let { ai.put("fehler", it) }
@@ -1275,6 +1330,7 @@ class MainActivity : ComponentActivity() {
         if (running == key) return Mark.RUNNING to "läuft …"
         return when (key) {
             "kichip" -> chipSummary()
+            "leistung" -> perfSummary()
             "tiefe" -> depthSummary()
             "verfolgung" -> trackSummary()
             else -> readTests().optJSONObject(key)?.let { liveSummary(key, it) }
@@ -1309,7 +1365,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         val parts = mutableListOf<String>()
-        device?.optString("qnnVersion")?.takeIf { it.isNotEmpty() }?.let { parts += "QNN $it" }
+        device?.optString("qnnSdk")?.takeIf { it.isNotEmpty() }?.let { parts += "QNN $it" }
         val seconds = load.optDouble("gesamtMs", 0.0) / 1000.0
         parts += "$ok Modelle in ${de(seconds, if (seconds < 10) 1 else 0)} s geladen" +
             if (allCached && ok > 0) ", aus dem Zwischenspeicher" else ""
@@ -1348,28 +1404,75 @@ class MainActivity : ComponentActivity() {
         return mark to parts.joinToString(" · ")
     }
 
+    /** Welche Leistungsstufe des KI-Chips gewonnen hat und was sie gegenüber Stufe 2 bringt. */
+    private fun perfSummary(): Pair<Mark, String> {
+        val perf = ki()?.optJSONObject("leistung") ?: return openRow("leistung")
+        val rows = perf.optJSONArray("einstellungen") ?: JSONArray()
+        fun row(key: String): JSONObject? = (0 until rows.length()).map { rows.getJSONObject(it) }.firstOrNull { it.optString("einstellung") == key }
+        val chosenKey = perf.optString("gewaehlt")
+        val chosen = row(chosenKey)
+        if (chosen == null) return Mark.WARN to (perf.optString("fehler").ifEmpty { "Keine Einstellung lief vollständig" })
+        val base = row(ChipSetting.DEFAULT.key)
+        val parts = mutableListOf("Am schnellsten: ${perf.optString("gewaehltTitel")}")
+        fun model(r: JSONObject?, id: ModelId) = r?.optJSONObject("modelle")?.optJSONObject(id.key)?.optDouble("medianMs", Double.NaN) ?: Double.NaN
+        val depthNow = model(chosen, ModelId.DEPTH)
+        val depthBase = model(base, ModelId.DEPTH)
+        val encNow = model(chosen, ModelId.ENC)
+        val encBase = model(base, ModelId.ENC)
+        if (!depthNow.isNaN()) parts += "Tiefe ${de(depthNow, 0)} ms" + if (!depthBase.isNaN() && chosenKey != ChipSetting.DEFAULT.key) " statt ${de(depthBase, 0)}" else ""
+        if (!encNow.isNaN()) parts += "Encoder ${de(encNow, 0)} ms" + if (!encBase.isNaN() && chosenKey != ChipSetting.DEFAULT.key) " statt ${de(encBase, 0)}" else ""
+        val full = chosen.optDouble("vollMs", Double.NaN)
+        val fast = chosen.optDouble("schnellMs", Double.NaN)
+        if (!full.isNaN()) parts += "volle Verfolgung mit Tiefe rund ${de(full, 0)} ms"
+        if (!fast.isNaN()) parts += "Schnellverfolgung mit Tiefe rund ${de(fast, 0)} ms"
+        if (perf.has("gesamtS")) parts += "Test ${de(perf.optDouble("gesamtS") / 60.0, 1)} min"
+        return Mark.OK to parts.joinToString(" · ")
+    }
+
     private fun trackSummary(): Pair<Mark, String> {
         val ki = ki() ?: return openRow("verfolgung")
-        val per = ki.optJSONObject("einzeln")?.optJSONObject("jeBild") ?: return openRow("verfolgung")
-        fun median(name: String) = per.optJSONObject(name)?.optDouble("medianMs", Double.NaN) ?: Double.NaN
-        val track = median("verfolgung")
-        val both = median("beide")
-        val parts = mutableListOf("${de(track, 0)} ms je Durchgang, also bis zu ${de(1000.0 / track, 0)} pro Sekunde")
-        parts += "Encoder ${de(median("encoder"), 0)} · Speicher lesen ${de(median("speicherAttention"), 0)} · " +
-            "Decoder ${de(median("decoder"), 0)} · Speicher schreiben ${de(median("speicherEncoder"), 0)} ms"
-        var mark = Mark.OK
+        val chains = ki.optJSONObject("einzeln")?.optJSONObject("ketten")
+        // Die volle Verfolgung, die live läuft (mit unserem Decoder wie im Original, sonst Qualcomms).
+        val per = ki.optJSONObject("einzeln")?.optJSONObject("jeBild") ?: chains?.optJSONObject("voll") ?: return openRow("verfolgung")
+        fun median(o: JSONObject?, name: String) = o?.optJSONObject(name)?.optDouble("medianMs", Double.NaN) ?: Double.NaN
+        val parts = mutableListOf<String>()
+        var best = 0.0
+        val both = median(per, "beide")
+        parts += "Mit Speicher: ${de(median(per, "verfolgung"), 0)} ms je Bild (Encoder ${de(median(per, "encoder"), 0)} · " +
+            "Memory-Attention ${de(median(per, "speicherAttention"), 0)} · Decoder ${de(median(per, "decoder"), 0)} · " +
+            "Memory-Encoder ${de(median(per, "speicherEncoder"), 0)} ms)"
         if (!both.isNaN()) {
-            val hz = 1000.0 / both
-            parts += "mit der Tiefe zusammen ${de(both, 0)} ms, also bis zu ${de(hz, 0)} Durchgänge pro Sekunde"
-            if (hz < TARGET_HZ) mark = Mark.WARN
+            parts += "mit Tiefe ${de(both, 0)} ms, bis zu ${de(1000.0 / both, 0)} pro Sekunde"
+            best = max(best, 1000.0 / both)
         }
-        val acc = ki.optJSONObject("genauigkeit")?.optJSONObject("verfolgung")
-        if (acc != null) {
-            val iou = acc.optDouble("folgeMaskeGleich", Double.NaN)
-            if (!iou.isNaN()) {
-                parts += "Maske zu ${(iou * 100).roundToInt()} % wie auf der CPU"
-                if (iou < 0.9) mark = Mark.WARN
-            }
+        val fast = chains?.optJSONObject("schnell")
+        val fastBoth = median(fast, "beide")
+        if (!fastBoth.isNaN()) {
+            parts += "Schnellverfolgung mit Tiefe ${de(fastBoth, 0)} ms, bis zu ${de(1000.0 / fastBoth, 0)} pro Sekunde"
+            best = max(best, 1000.0 / fastBoth)
+        }
+        var mark = if (best >= TARGET_HZ) Mark.OK else Mark.WARN
+        val video = ki.optJSONObject("pruefvideo")
+        fun value(o: JSONObject?, k: String) = o?.optDouble(k, Double.NaN) ?: Double.NaN
+        // Je Kette: wie gleich die Maske Metas Original ist, auf dem Chip und (Messlatte) im CPU-Nachbau des Exports.
+        fun videoPart(name: String, o: JSONObject?): String? {
+            val chip = value(o, "maskeGleichMittel")
+            if (chip.isNaN()) return null
+            val cpu = value(o, "cpuNachbauMittel")
+            return "$name ${(chip * 100).roundToInt()} %" + if (!cpu.isNaN()) " (CPU ${(cpu * 100).roundToInt()} %)" else ""
+        }
+        val fullIou = value(video?.optJSONObject("voll"), "maskeGleichMittel")
+        if (!fullIou.isNaN()) {
+            parts += "Prüfvideo, Maske gleich wie in Metas Original: " + listOfNotNull(
+                videoPart("voll", video?.optJSONObject("voll")),
+                videoPart("mit Qualcomms Decoder", video?.optJSONObject("vollQualcomm")),
+                videoPart("schnell", video?.optJSONObject("schnell")),
+            ).joinToString(", ")
+            if (fullIou < 0.9) mark = Mark.WARN
+        } else {
+            val acc = ki.optJSONObject("genauigkeit")?.optJSONObject("verfolgung")
+            val iou = acc?.optDouble("folgeMaskeGleich", Double.NaN) ?: Double.NaN
+            if (!iou.isNaN()) parts += "Maske zu ${(iou * 100).roundToInt()} % wie auf der CPU"
         }
         return mark to parts.joinToString(" · ")
     }
@@ -1510,9 +1613,9 @@ class MainActivity : ComponentActivity() {
             camera != null -> camera
             !modelsOk -> DownloadUi.hint(downloadState())
             !has(Manifest.permission.CAMERA) -> "Die Test-App braucht Zugriff auf Kamera und Mikrofon."
-            !quickDone -> "Starte den KI-Schnelltest. Er lädt beide KI-Modelle auf den KI-Chip, misst Tempo und Genauigkeit " +
-                "und filmt dann 30 Sekunden in 4K, während beide mitrechnen. Beim ersten Mal dauert das Laden länger; " +
-                "rechne mit etwa drei Minuten.$noMic"
+            !quickDone -> "Starte den KI-Schnelltest. Er lädt beide KI-Modelle auf den KI-Chip, sucht dessen schnellste " +
+                "Leistungsstufe, misst Tempo und Genauigkeit und filmt dann 30 Sekunden in 4K, während beide mitrechnen. " +
+                "Beim ersten Mal übersetzt der Chip jedes Modell neu; rechne mit etwa zehn Minuten, danach etwa fünf.$noMic"
             repeatReason("live") != null -> repeatReason("live")!!
             !tests.has("kidauer") -> "Jetzt der KI-Dauertest: Handy hinlegen, Kamera auf eine Szene mit einem Gegenstand " +
                 "in der Mitte. Vorher kannst du in der KI-Vorschau auf Dinge tippen und zusehen, wie die Markierung folgt.$noMic"

@@ -1,32 +1,43 @@
 package de.botrik.cinebo.test
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.SystemClock
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.asCoroutineDispatcher
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.nio.ByteBuffer
 import java.util.EnumMap
 import java.util.concurrent.Executors
+import java.util.zip.ZipFile
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
 
-/** Alle Modelle der Test-App. [live] heißt: läuft bei Live-Test, Dauertest und Vorschau mit. */
-internal enum class ModelId(val asset: String, val title: String, val fp16: Boolean, val live: Boolean) {
-    DEPTH("depth_anything_v2.tflite", "Tiefe · Depth Anything V2 Small", true, true),
-    ENC("edgetam_encoder.tflite", "EdgeTAM · Encoder", true, true),
-    DEC("edgetam_decoder.tflite", "EdgeTAM · Decoder", true, true),
-    ATTN("edgetam_memory_attention.tflite", "EdgeTAM · Memory-Attention", true, true),
-    ATTN4("edgetam_memory_attention_q4.tflite", "EdgeTAM · Memory-Attention in 4 Blöcken", true, false),
-    MEMENC("edgetam_memory_encoder.tflite", "EdgeTAM · Memory-Encoder", true, true),
-    MEMENC_QC("edgetam_memory_encoder_qualcomm.tflite", "EdgeTAM · Memory-Encoder von Qualcomm", true, false),
-    ENC_Q("edgetam_encoder_w8a8.tflite", "EdgeTAM · Encoder quantisiert", false, false),
-    DEC_Q("edgetam_decoder_w8a8.tflite", "EdgeTAM · Decoder quantisiert", false, false),
-    MEMENC_Q("edgetam_memory_encoder_w8a8.tflite", "EdgeTAM · Memory-Encoder quantisiert", false, false);
+/** Alle Modelle der Test-App. */
+internal enum class ModelId(val asset: String, val title: String, val fp16: Boolean) {
+    DEPTH("depth_anything_v2.tflite", "Tiefe · Depth Anything V2 Small", true),
+    ENC("edgetam_encoder.tflite", "EdgeTAM · Encoder", true),
+    DEC("edgetam_decoder.tflite", "EdgeTAM · Decoder", true),
+    DEC_META("edgetam_decoder_meta.tflite", "EdgeTAM · Decoder wie im Original (eigener Export)", true),
+    ATTN("edgetam_memory_attention.tflite", "EdgeTAM · Memory-Attention", true),
+    ATTN2("edgetam_memory_attention_v2.tflite", "EdgeTAM · Memory-Attention, chipfreundlich exportiert", true),
+    MEMENC("edgetam_memory_encoder.tflite", "EdgeTAM · Memory-Encoder (eigener Export)", true),
+    MEMPREP("edgetam_memory_prep.tflite", "EdgeTAM · Vorbereitung für Qualcomms Memory-Encoder", true),
+    MEMENC_QC("edgetam_memory_encoder_qualcomm.tflite", "EdgeTAM · Memory-Encoder von Qualcomm", true),
+    ENC_Q("edgetam_encoder_w8a8.tflite", "EdgeTAM · Encoder quantisiert", false),
+    DEC_Q("edgetam_decoder_w8a8.tflite", "EdgeTAM · Decoder quantisiert", false),
+    MEMENC_Q("edgetam_memory_encoder_w8a8.tflite", "EdgeTAM · Memory-Encoder quantisiert", false);
 
     val key: String get() = name.lowercase()
+
+    companion object {
+        /** Was der Leistungstest in jeder Einstellung misst: alles, was in einer Verfolgung laufen kann. */
+        val MATRIX = listOf(DEPTH, ENC, ENC_Q, DEC, DEC_META, ATTN, ATTN2, MEMPREP, MEMENC_QC)
+    }
 }
 
 /** Was die Vorschau während der KI-Läufe zeigt. Wird auf dem KI-Thread aufgerufen. */
@@ -35,9 +46,10 @@ internal interface LiveSink {
 }
 
 /**
- * Lädt die Modelle auf den KI-Chip, misst sie einzeln, prüft ihre Genauigkeit gegen die
- * CPU und lässt beide zusammen auf den Kamerabildern laufen. Alles läuft auf einem
- * eigenen Thread („ki“); die Methoden hier nur über [dispatcher] aufrufen.
+ * Lädt die Modelle auf den KI-Chip, vergleicht die Einstellungen des Chips, misst die Modelle
+ * einzeln und als Ketten, prüft die Genauigkeit gegen die CPU und gegen Metas Original und lässt
+ * Tiefe und Verfolgung auf den Kamerabildern laufen. Alles läuft auf einem eigenen Thread („ki“);
+ * die Methoden hier nur über [dispatcher] aufrufen.
  */
 internal class AiEngine(private val context: Context) {
 
@@ -54,12 +66,27 @@ internal class AiEngine(private val context: Context) {
     }
 
     private val models = EnumMap<ModelId, NpuModel>(ModelId::class.java)
-    private var noObjPtr: FloatArray? = null
-    private var tracker: EdgeTamTracker? = null
+    private var consts: EdgeTamConstants? = null
+    private var tracker: Tracker? = null
     private var cacheCleaned = false
+
+    /** Einstellung des KI-Chips für alle geladenen Modelle. */
+    var chip: ChipSetting = ChipSetting.DEFAULT
+        private set
 
     /** Welche Memory-Attention live läuft; nach der Einzelmessung die schnellere. */
     var liveAttn = ModelId.ATTN
+        private set
+
+    /** Live mit Qualcomms Memory-Encoder (samt Vorbereitung) statt unserem; nach der Einzelmessung der schnellere. */
+    var liveQcMemory = false
+        private set
+
+    /**
+     * Live mit unserem Decoder, der wie Metas Videoverfolgung rechnet (Qualcomms weicht davon ab).
+     * Läuft er nicht, springt Qualcomms ein.
+     */
+    var liveMetaDecoder = true
         private set
 
     /** Ein Standbild für den Fall, dass die Kamera neben 4K keine Bilder für die KI liefert. */
@@ -78,30 +105,44 @@ internal class AiEngine(private val context: Context) {
 
     fun loaded(id: ModelId): Boolean = models.containsKey(id)
 
-    fun liveReady(): Boolean = liveSet().all { models.containsKey(it) } && tracker != null
+    fun hasStill(): Boolean = still != null
 
-    /** Die Modelle, die live laufen; die Memory-Attention ist die zuletzt gewählte. */
-    fun liveSet(): List<ModelId> = listOf(ModelId.DEPTH, ModelId.ENC, ModelId.DEC, liveAttn, ModelId.MEMENC)
+    /** Merkt sich ein Kamerabild als Standbild (Kopie). */
+    fun setStill(frame: FrameSlot) {
+        still = FrameSlot().also { it.copyFrom(frame) }
+    }
+
+    /** Bereit für live: Tiefe geladen und eine volle Verfolgung aus geladenen Teilen gebaut. */
+    fun liveReady(): Boolean = models.containsKey(ModelId.DEPTH) && tracker != null
+
+    /** Die Modelle für live, beide Decoder: Fällt unserer aus, springt Qualcomms ein. */
+    fun liveSet(): List<ModelId> = listOf(ModelId.DEPTH, ModelId.ENC, ModelId.DEC, ModelId.DEC_META, liveAttn) +
+        if (liveQcMemory) listOf(ModelId.MEMPREP, ModelId.MEMENC_QC) else listOf(ModelId.MEMENC)
 
     /**
-     * Übernimmt die Memory-Attention, die die Einzelmessung als schnellere gewählt hat
-     * (steht im Bericht), damit Dauertest und Vorschau auch nach einem Neustart dieselbe nehmen.
+     * Übernimmt, was Leistungstest und Einzelmessung gewählt haben (steht im Bericht), damit
+     * Dauertest und Vorschau auch nach einem Neustart dasselbe nehmen. Eine andere Einstellung
+     * des Chips heißt: alle Modelle neu laden.
      */
-    fun preferAttention(id: ModelId) {
-        if (id != ModelId.ATTN && id != ModelId.ATTN4) return
-        if (id == liveAttn) return
-        liveAttn = id
+    fun configureLive(setting: ChipSetting?, attn: ModelId?, qcMemory: Boolean?, metaDecoder: Boolean?) {
+        if (setting != null && setting != chip) {
+            unload(ModelId.entries)
+            chip = setting
+        }
+        if (attn == ModelId.ATTN || attn == ModelId.ATTN2) liveAttn = attn
+        if (qcMemory != null) liveQcMemory = qcMemory
+        if (metaDecoder != null) liveMetaDecoder = metaDecoder
         buildTracker()
     }
 
     // ------------------------------------------------------------ Laden
 
     /**
-     * Lädt die angegebenen Modelle auf den KI-Chip, soweit noch nicht geladen. Ein Fehler bei
-     * einem Modell hält die anderen nicht auf; er steht im Ergebnis.
+     * Lädt die angegebenen Modelle in der aktuellen Einstellung auf den KI-Chip, soweit noch
+     * nicht geladen. Ein Fehler bei einem Modell hält die anderen nicht auf; er steht im Ergebnis.
      */
     fun load(ids: List<ModelId>, progress: (done: Int, total: Int, id: ModelId) -> Unit): JSONObject {
-        val out = JSONObject()
+        val out = JSONObject().put("einstellung", chip.key)
         try {
             Npu.loadLibraries(context)
         } catch (e: Throwable) {
@@ -117,7 +158,7 @@ internal class AiEngine(private val context: Context) {
         todo.forEachIndexed { i, id ->
             progress(i, todo.size, id)
             try {
-                val m = NpuModel.load(context, id.asset, NpuConfig(fp16 = id.fp16))
+                val m = NpuModel.load(context, id.asset, NpuConfig(id.fp16, chip))
                 models[id] = m
                 out.put(id.key, m.describe())
             } catch (e: Throwable) {
@@ -126,8 +167,14 @@ internal class AiEngine(private val context: Context) {
             }
         }
         progress(todo.size, todo.size, todo.lastOrNull() ?: ModelId.DEPTH)
-        if (noObjPtr == null) noObjPtr = readNoObjPtr()
+        if (consts == null) consts = try {
+            EdgeTamConstants.load(File(context.filesDir, ModelStore.FOLDER))
+        } catch (e: Exception) {
+            out.put("konstantenFehler", e.toString().take(300))
+            null
+        }
         buildTracker()
+        trackerError?.let { out.put("verfolgungFehler", it) }
         out.put("gesamtMs", SystemClock.elapsedRealtime() - start)
         val cache = JSONArray()
         Npu.cacheDir(context).listFiles()?.sortedBy { it.name }?.forEach { cache.put("${it.name} ${r1(it.length() / 1e6)} MB") }
@@ -137,7 +184,7 @@ internal class AiEngine(private val context: Context) {
 
     fun unload(ids: Collection<ModelId>) {
         for (id in ids) models.remove(id)?.close()
-        if (liveSet().any { !models.containsKey(it) }) tracker = null
+        buildTracker()
     }
 
     fun unloadExtras() = unload(ModelId.entries.filter { it !in liveSet() })
@@ -147,145 +194,312 @@ internal class AiEngine(private val context: Context) {
         still = null
     }
 
-    private fun readNoObjPtr(): FloatArray {
-        val text = java.io.File(java.io.File(context.filesDir, ModelStore.FOLDER), "edgetam_konstanten.json").readText()
-        val list = JSONObject(text).getJSONArray("noObjPtr")
-        return FloatArray(list.length()) { list.getDouble(it).toFloat() }
-    }
+    /** Warum sich zuletzt keine Verfolgung bauen ließ, obwohl die Teile geladen waren (für den Bericht). */
+    private var trackerError: String? = null
 
+    /** Die Verfolgung für live aus den geladenen Teilen; null, wenn etwas fehlt. */
     private fun buildTracker() {
-        val enc = models[ModelId.ENC]
-        val dec = models[ModelId.DEC]
-        val attn = models[liveAttn]
-        val mem = models[ModelId.MEMENC]
-        val ptr = noObjPtr
-        tracker = if (enc != null && dec != null && attn != null && mem != null && ptr != null) {
-            EdgeTamTracker(enc, dec, attn, mem, ptr)
-        } else {
+        tracker = try {
+            trackerError = null
+            (if (liveMetaDecoder) buildFullTracker(liveAttn, liveQcMemory, appPrompt = true, metaDecoder = true) else null)
+                ?: buildFullTracker(liveAttn, liveQcMemory, appPrompt = true, metaDecoder = false)
+        } catch (e: IllegalArgumentException) {
+            trackerError = e.message?.take(300)
             null
         }
+    }
+
+    /** Eingebauter Decoder: unserer wie im Original oder Qualcomms; null, wenn er nicht geladen ist oder nicht passt. */
+    private fun decoderOf(meta: Boolean, from: Map<ModelId, NpuModel> = models): MaskDecoder? = try {
+        if (meta) from[ModelId.DEC_META]?.let { MetaDecoder(it) } else from[ModelId.DEC]?.let { QualcommDecoder(it) }
+    } catch (e: IllegalArgumentException) {
+        null
+    }
+
+    /** Volle Verfolgung mit Speicher aus den geladenen Teilen, oder null, wenn etwas fehlt. */
+    private fun buildFullTracker(attnId: ModelId, qcMemory: Boolean, appPrompt: Boolean, metaDecoder: Boolean): EdgeTamTracker? {
+        val enc = models[ModelId.ENC] ?: return null
+        val decoder = decoderOf(metaDecoder) ?: return null
+        val attn = models[attnId] ?: return null
+        val c = consts ?: return null
+        val writer: MemoryWriter = if (qcMemory) {
+            QualcommMemoryWriter(models[ModelId.MEMPREP] ?: return null, models[ModelId.MEMENC_QC] ?: return null)
+        } else {
+            OwnMemoryWriter(models[ModelId.MEMENC] ?: return null)
+        }
+        val prompt = if (appPrompt) c.prompt ?: return null else null
+        if (prompt == null && decoder.points != 2) return null // die Einbettung des Encoders passt nur zu Qualcomms Decoder
+        return EdgeTamTracker(
+            FloatEncoder(enc), decoder, attn, writer, c.noObjPtr, prompt,
+            enc.newInput(enc.inputIndex("unnorm_coords")), enc.newInput(enc.inputIndex("labels"))
+        )
+    }
+
+    private fun buildFastTracker(quantized: Boolean, metaDecoder: Boolean): FastTracker? {
+        val decoder = decoderOf(metaDecoder) ?: return null
+        val prompt = consts?.prompt ?: return null
+        val encModel = models[if (quantized) ModelId.ENC_Q else ModelId.ENC] ?: return null
+        val encoder: ImageEncoder = if (quantized) QuantEncoder(encModel) else FloatEncoder(encModel)
+        // Die Punkte des Encoders zählen hier nicht; float-Puffer in der Form des fp16-Encoders reichen.
+        return FastTracker(encoder, decoder, prompt, directBuffer(16), directBuffer(8))
+    }
+
+    // ------------------------------------------------------------ Leistungstest
+
+    /**
+     * Misst jedes Modell aus [ModelId.MATRIX] in jeder Einstellung des KI-Chips (3 Läufe Einlaufen,
+     * dann 10) und wählt die Einstellung, mit der die volle Verfolgung samt Tiefe am schnellsten ist
+     * (läuft sie nirgends, zählt die Schnellverfolgung, sonst die Tiefe). Bei weniger als 3 %
+     * Unterschied gewinnt die kühlere Stufe. Gemessen wird Modell für Modell durch alle
+     * Einstellungen: Erwärmt sich das Handy dabei, trifft das alle Einstellungen eines Modells
+     * gleich. Zuletzt laufen die beste und dieselbe mit festgehaltenem Takt im Wechsel; der
+     * festgehaltene Takt gewinnt nur, wenn er mehr als 3 % schneller ist. Danach sind alle Modelle
+     * entladen; sie laden in der gewählten Einstellung neu.
+     */
+    fun perfMatrix(frame: FrameSlot, progress: (String, Int, Int) -> Unit): JSONObject {
+        unload(ModelId.entries)
+        val start = SystemClock.elapsedRealtime()
+        val settings = ChipSetting.CANDIDATES
+        val total = (settings.size + 2) * ModelId.MATRIX.size
+        var done = 0
+        val heat = JSONArray()
+
+        class Series(val setting: ChipSetting, val pass: Int) {
+            val medians = EnumMap<ModelId, Double>(ModelId::class.java)
+            val details = JSONObject()
+            fun estimates() = chainEstimates(medians)
+            fun row(): JSONObject = JSONObject().put("einstellung", setting.key).put("titel", setting.title)
+                .put("durchgang", pass).put("modelle", details)
+                .also { r -> estimates().forEach { (k, v) -> r.put(k, r2(v)) } }
+        }
+
+        fun measure(series: Series, id: ModelId) {
+            val s = series.setting
+            progress("${s.title} · ${id.title}", done++, total)
+            var m: NpuModel? = null
+            try {
+                m = NpuModel.load(context, id.asset, NpuConfig(id.fp16, s))
+                val inputs = benchInputs(id, m, frame)
+                m.vote()
+                val t = time(m, runs = MATRIX_RUNS) { m.run(inputs) }.getJSONObject("imModell")
+                val median = t.getDouble("medianMs")
+                series.medians[id] = median
+                series.details.put(id.key, JSONObject()
+                    .put("medianMs", median)
+                    .put("p90Ms", t.getDouble("p90Ms"))
+                    .put("ladenMs", r1(m.loadMs))
+                    .put("ausZwischenspeicher", m.fromCache))
+            } catch (e: Throwable) {
+                series.details.put(id.key, JSONObject().put("fehler", e.toString().take(300)))
+            } finally {
+                m?.close()
+            }
+        }
+
+        val first = settings.map { Series(it, 1) }
+        for (id in ModelId.MATRIX) {
+            heat.put(DeviceHeat.read(context).put("vor", id.key))
+            for (series in first) measure(series, id)
+        }
+
+        // Maßstab: die volle Verfolgung, wenn sie in mindestens einer Einstellung ganz lief.
+        val scale = listOf("vollMs", "schnellMs").firstOrNull { k -> first.any { it.estimates()[k] != null } }
+        fun cost(series: Series): Double =
+            (if (scale != null) series.estimates()[scale] else series.medians[ModelId.DEPTH]) ?: Double.NaN
+        val ran = first.filter { !cost(it).isNaN() }
+        var best: Series? = ran.minByOrNull { cost(it) }
+        if (best != null) {
+            val bestMs = cost(best)
+            best = ran.filter { cost(it) <= bestMs * 1.03 }
+                .minWith(compareBy<Series> { it.setting.perf.ordinal }.thenBy { cost(it) })
+        }
+        val what = when (scale) {
+            "vollMs" -> "volle Verfolgung mit Tiefe"
+            "schnellMs" -> "Schnellverfolgung mit Tiefe (die volle lief in keiner Einstellung)"
+            else -> "Tiefe (die Verfolgung lief in keiner Einstellung)"
+        }
+        var chosen = best?.setting
+        var reason = "$what am schnellsten"
+        val rows = JSONArray()
+        first.forEach { rows.put(it.row()) }
+        if (best != null) {
+            // Die beste noch einmal, im Wechsel mit festgehaltenem Takt, damit beide unter gleichen Bedingungen laufen.
+            val again = Series(best.setting, 2)
+            val held = Series(best.setting.copy(manualVote = true), 2)
+            for (id in ModelId.MATRIX) {
+                measure(again, id)
+                measure(held, id)
+            }
+            rows.put(again.row())
+            rows.put(held.row())
+            val a = cost(again)
+            val h = cost(held)
+            if (!a.isNaN() && !h.isNaN() && h < a * 0.97) {
+                chosen = held.setting
+                reason = "mit festgehaltenem Takt mehr als 3 % schneller"
+            }
+        }
+        heat.put(DeviceHeat.read(context).put("vor", "ende"))
+        val out = JSONObject().put("einstellungen", rows).put("waerme", heat)
+            .put("gesamtS", r1((SystemClock.elapsedRealtime() - start) / 1000.0))
+        if (chosen != null) {
+            out.put("gewaehlt", chosen.key).put("gewaehltTitel", chosen.title).put("grund", reason)
+            chip = chosen
+        } else {
+            out.put("fehler", "Kein Modell lief in irgendeiner Einstellung; es bleibt ${chip.title}.")
+        }
+        progress("fertig", total, total)
+        return out
+    }
+
+    /**
+     * Geschätzte Zeiten je Bild aus Einzelzeiten: voll (mit Speicher) und schnell (ohne), jeweils
+     * mit Tiefe und mit dem Decoder, der live liefe (unserer wie im Original, sonst Qualcomms).
+     */
+    private fun chainEstimates(m: Map<ModelId, Double>): Map<String, Double> {
+        val out = LinkedHashMap<String, Double>()
+        val depth = m[ModelId.DEPTH] ?: return out
+        val enc = m[ModelId.ENC]
+        val dec = m[ModelId.DEC_META] ?: m[ModelId.DEC]
+        val attn = listOfNotNull(m[ModelId.ATTN], m[ModelId.ATTN2]).minOrNull()
+        val qcMem = if (m[ModelId.MEMPREP] != null && m[ModelId.MEMENC_QC] != null) m.getValue(ModelId.MEMPREP) + m.getValue(ModelId.MEMENC_QC) else null
+        if (enc != null && dec != null && attn != null && qcMem != null) out["vollMs"] = depth + enc + attn + dec + qcMem
+        if (enc != null && dec != null) out["schnellMs"] = depth + enc + dec
+        val encQ = m[ModelId.ENC_Q]
+        if (encQ != null && dec != null) out["schnellQuantisiertMs"] = depth + encQ + dec
+        return out
+    }
+
+    /** Eingänge für eine Zeitmessung: echte Bilder für Tiefe und Encoder, sonst Nullen (die Rechenzeit hängt nicht vom Inhalt ab). */
+    private fun benchInputs(id: ModelId, m: NpuModel, frame: FrameSlot): Array<Any> = when (id) {
+        ModelId.DEPTH -> arrayOf(frame.depth)
+        ModelId.ENC -> {
+            val inputs = arrayOfNulls<Any>(3)
+            inputs[m.inputIndex("image")] = frame.enc
+            inputs[m.inputIndex("unnorm_coords")] = directBuffer(16).apply { putFloat(0.5f).putFloat(0.5f).putFloat(0f).putFloat(0f).rewind() }
+            inputs[m.inputIndex("labels")] = directBuffer(8).apply { putFloat(1f).putFloat(-1f).rewind() }
+            @Suppress("UNCHECKED_CAST")
+            inputs as Array<Any>
+        }
+        else -> Array(m.inputCount) { m.newInput(it) }
     }
 
     // ------------------------------------------------------------ Einzelmessung
 
     /**
-     * Misst jedes geladene Modell einzeln auf dem KI-Chip (3 Läufe Einlaufen, dann 20) und
-     * danach den ganzen Ablauf je Bild. Wählt die schnellere Memory-Attention für live.
+     * Misst jedes geladene Modell einzeln (3 Läufe Einlaufen, dann 20) und danach ganze Ketten
+     * je Bild: wie in Stufe 2, die beste volle Verfolgung und die Schnellverfolgung. Wählt die
+     * schnellere Memory-Attention und den schnelleren Memory-Encoder für live.
      */
     fun bench(frame: FrameSlot, progress: (String) -> Unit): JSONObject {
-        still = FrameSlot().also { it.copyFrom(frame) }
-        val out = JSONObject()
+        setStill(frame)
+        val out = JSONObject().put("einstellung", chip.key)
         val perModel = JSONObject()
-        val enc = models[ModelId.ENC]
-        val dec = models[ModelId.DEC]
-        val center = directBuffer(16).apply { putFloat(0.5f).putFloat(0.5f).putFloat(0f).putFloat(0f).rewind() }
-        val labels = directBuffer(8).apply { putFloat(1f).putFloat(-1f).rewind() }
-
-        models[ModelId.DEPTH]?.let { m ->
-            progress(ModelId.DEPTH.title)
-            perModel.put(ModelId.DEPTH.key, time(m) { m.run(arrayOf(frame.depth)) })
-        }
-        if (enc != null) {
-            progress(ModelId.ENC.title)
-            val inputs = arrayOfNulls<Any>(3)
-            inputs[enc.inputIndex("image")] = frame.enc
-            inputs[enc.inputIndex("unnorm_coords")] = center
-            inputs[enc.inputIndex("labels")] = labels
-            @Suppress("UNCHECKED_CAST")
-            perModel.put(ModelId.ENC.key, time(enc) { enc.run(inputs as Array<Any>) })
-        }
-        if (enc != null && dec != null) {
-            progress(ModelId.DEC.title)
-            val inputs = arrayOfNulls<Any>(4)
-            inputs[dec.inputIndex("image_embeddings")] = enc.output(enc.outputIndex("pix_feat"))
-            inputs[dec.inputIndex("high_res_features1")] = enc.output(enc.outputIndex("high_res_features1"))
-            inputs[dec.inputIndex("high_res_features2")] = enc.output(enc.outputIndex("high_res_features2"))
-            inputs[dec.inputIndex("sparse_embedding")] = enc.output(enc.outputIndex("sparse_embedding"))
-            @Suppress("UNCHECKED_CAST")
-            perModel.put(ModelId.DEC.key, time(dec) { dec.run(inputs as Array<Any>) })
-        }
-        val emb = enc?.output(enc.outputIndex("image_embeddings"))
-        for (id in listOf(ModelId.ATTN, ModelId.ATTN4)) {
-            val m = models[id] ?: continue
-            if (emb == null) continue
-            progress(id.title)
-            val bank = m.newInput(1)
-            val ptrs = m.newInput(2)
-            val bias = m.newInput(3) // alles 0: alle Plätze gültig, rechnet voll
-            perModel.put(id.key, time(m) { m.run(arrayOf(emb, bank, ptrs, bias)) })
-        }
-        models[ModelId.MEMENC]?.let { m ->
-            if (emb == null) return@let
-            progress(ModelId.MEMENC.title)
-            val mask = m.newInput(1)
-            val cond = m.newInput(2)
-            perModel.put(ModelId.MEMENC.key, time(m) { m.run(arrayOf(emb, mask, cond)) })
-        }
-        // Nur zum Vergleich, mit Nullen gefüllt: Rechenzeit hängt nicht vom Inhalt ab.
-        for (id in listOf(ModelId.MEMENC_QC, ModelId.ENC_Q, ModelId.DEC_Q, ModelId.MEMENC_Q)) {
+        for (id in ModelId.entries) {
             val m = models[id] ?: continue
             progress(id.title)
-            val inputs: Array<Any> = Array(m.inputCount) { m.newInput(it) }
-            perModel.put(id.key, time(m) { m.run(inputs) })
+            val inputs = benchInputs(id, m, frame)
+            m.vote()
+            try {
+                perModel.put(id.key, time(m) { m.run(inputs) })
+            } finally {
+                m.release()
+            }
         }
         out.put("modelle", perModel)
 
-        // Schnellere Memory-Attention für live wählen.
-        val a1 = perModel.optJSONObject(ModelId.ATTN.key)?.optJSONObject("imModell")?.optDouble("medianMs", Double.NaN) ?: Double.NaN
-        val a4 = perModel.optJSONObject(ModelId.ATTN4.key)?.optJSONObject("imModell")?.optDouble("medianMs", Double.NaN) ?: Double.NaN
-        val chosen = if (!a4.isNaN() && (a1.isNaN() || a4 < a1 * 0.97)) ModelId.ATTN4 else ModelId.ATTN
-        if (chosen != liveAttn && models.containsKey(chosen)) {
-            liveAttn = chosen
-            buildTracker()
-        }
-        out.put("liveMemoryAttention", liveAttn.key)
+        // Schnellere Teile für live wählen.
+        fun med(id: ModelId) = perModel.optJSONObject(id.key)?.optJSONObject("imModell")?.optDouble("medianMs", Double.NaN) ?: Double.NaN
+        val a1 = med(ModelId.ATTN)
+        val a2 = med(ModelId.ATTN2)
+        liveAttn = if (!a2.isNaN() && (a1.isNaN() || a2 < a1)) ModelId.ATTN2 else ModelId.ATTN
+        val own = med(ModelId.MEMENC)
+        val qc = med(ModelId.MEMPREP) + med(ModelId.MEMENC_QC)
+        liveQcMemory = !qc.isNaN() && (own.isNaN() || qc < own)
 
-        // Ganzer Ablauf je Bild: Tiefe, dann Verfolgung mit Speicher.
-        val t = tracker
+        // Ketten je Bild, jeweils mit der Tiefe davor. „voll“ ist die volle Verfolgung mit unserem
+        // Decoder wie im Original, „vollQualcomm“ dieselbe mit Qualcomms Decoder.
+        val chains = JSONObject()
         val depth = models[ModelId.DEPTH]
-        if (t != null && depth != null) {
-            progress("Tiefe und Verfolgung zusammen")
+        val candidates = listOf(
+            "stufe2" to { buildFullTracker(ModelId.ATTN, qcMemory = false, appPrompt = false, metaDecoder = false) },
+            "voll" to { buildFullTracker(liveAttn, liveQcMemory, appPrompt = true, metaDecoder = true) },
+            "vollQualcomm" to { buildFullTracker(liveAttn, liveQcMemory, appPrompt = true, metaDecoder = false) },
+            "schnell" to { buildFastTracker(quantized = false, metaDecoder = true) },
+            "schnellQuantisiert" to { buildFastTracker(quantized = true, metaDecoder = true) },
+        )
+        if (depth != null) {
+            for ((key, make) in candidates) {
+                val t = try {
+                    make()
+                } catch (e: Exception) {
+                    chains.put(key, JSONObject().put("fehler", e.toString().take(300)))
+                    null
+                } ?: continue
+                progress("Kette ${t.name}")
+                chains.put(key, try {
+                    chain(t, depth, frame)
+                } catch (e: Exception) {
+                    JSONObject().put("name", t.name).put("fehler", e.toString().take(300))
+                })
+            }
+        }
+        out.put("ketten", chains)
+        // Live: unser Decoder wie im Original, wenn seine Kette lief; sonst Qualcomms.
+        val metaRan = chains.optJSONObject("voll")?.let { !it.has("fehler") } == true
+        liveMetaDecoder = metaRan
+        buildTracker()
+        out.put("liveMemoryAttention", liveAttn.key)
+        out.put("liveMemoryEncoder", if (liveQcMemory) "qualcomm" else "eigener")
+        out.put("liveDecoder", if (liveMetaDecoder) "meta" else "qualcomm")
+        // Wie in Stufe 2: „jeBild“ ist die volle Verfolgung, die live läuft.
+        chains.optJSONObject(if (liveMetaDecoder) "voll" else "vollQualcomm")?.let { out.put("jeBild", it) }
+        return out
+    }
+
+    private fun chain(t: Tracker, depth: NpuModel, frame: FrameSlot): JSONObject {
+        val used = liveModelsOf(t)
+        used.forEach { it.vote() }
+        depth.vote()
+        try {
             t.start(frame.enc, 0.5f, 0.5f)
             repeat(WARMUP) {
                 depth.run(arrayOf(frame.depth))
                 t.step(frame.enc)
             }
-            val total = DoubleArray(RUNS)
-            val depthMs = DoubleArray(RUNS)
-            val trackMs = DoubleArray(RUNS)
-            val parts = Array(4) { DoubleArray(RUNS) }
+            val series = Array(8) { DoubleArray(RUNS) }
             for (i in 0 until RUNS) {
                 val s = System.nanoTime()
-                depthMs[i] = depth.run(arrayOf(frame.depth))
+                series[1][i] = depth.run(arrayOf(frame.depth))
                 t.step(frame.enc)
-                total[i] = (System.nanoTime() - s) / 1e6
-                trackMs[i] = t.totalMs
-                parts[0][i] = t.encMs
-                parts[1][i] = t.attnMs
-                parts[2][i] = t.decMs
-                parts[3][i] = t.memMs
+                series[0][i] = (System.nanoTime() - s) / 1e6
+                series[2][i] = t.totalMs
+                series[3][i] = t.encMs
+                series[4][i] = t.attnMs
+                series[5][i] = t.decMs
+                series[6][i] = t.memMs
+                series[7][i] = t.convertMs
             }
-            out.put(
-                "jeBild", JSONObject()
-                    .put("beide", Timing(total).toJson())
-                    .put("tiefe", Timing(depthMs).toJson())
-                    .put("verfolgung", Timing(trackMs).toJson())
-                    .put("encoder", Timing(parts[0]).toJson())
-                    .put("speicherAttention", Timing(parts[1]).toJson())
-                    .put("decoder", Timing(parts[2]).toJson())
-                    .put("speicherEncoder", Timing(parts[3]).toJson())
-                    .put("objektGefunden", t.present)
-            )
+            val names = listOf("beide", "tiefe", "verfolgung", "encoder", "speicherAttention", "decoder", "speicherEncoder", "umrechnen")
+            val o = JSONObject().put("name", t.name)
+            names.forEachIndexed { k, n -> if (series[k].any { it > 0.0 }) o.put(n, Timing(series[k]).toJson()) }
+            o.put("objektGefunden", t.present)
             t.reset()
+            return o
+        } finally {
+            depth.release()
+            used.forEach { it.release() }
         }
-        return out
     }
 
-    private fun time(m: NpuModel, run: () -> Double): JSONObject {
+    /** Die Modelle, die eine Kette nutzt, damit ein festgehaltener Takt für alle gilt. */
+    private fun liveModelsOf(@Suppress("UNUSED_PARAMETER") t: Tracker): List<NpuModel> = models.values.toList()
+
+    private fun time(m: NpuModel, runs: Int = RUNS, run: () -> Double): JSONObject {
         repeat(WARMUP) { run() }
-        val total = DoubleArray(RUNS)
-        val native = DoubleArray(RUNS)
-        for (i in 0 until RUNS) {
+        val total = DoubleArray(runs)
+        val native = DoubleArray(runs)
+        for (i in 0 until runs) {
             total[i] = run()
             native[i] = m.lastNativeMs
         }
@@ -304,7 +518,7 @@ internal class AiEngine(private val context: Context) {
         val out = JSONObject()
         val cpu = EnumMap<ModelId, NpuModel>(ModelId::class.java)
         try {
-            for (id in listOf(ModelId.DEPTH, ModelId.ENC, ModelId.DEC, ModelId.ATTN, ModelId.MEMENC)) {
+            for (id in listOf(ModelId.DEPTH, ModelId.ENC, ModelId.DEC, ModelId.DEC_META, ModelId.ATTN, ModelId.ATTN2, ModelId.MEMENC, ModelId.MEMPREP, ModelId.MEMENC_QC)) {
                 if (!models.containsKey(id)) continue
                 progress("Lädt ${id.title} für die CPU")
                 cpu[id] = NpuModel.load(context, id.asset, null, threads = 4)
@@ -320,67 +534,155 @@ internal class AiEngine(private val context: Context) {
                 r.put("cpuMs", r1(cpuMs))
                 out.put("tiefe", r)
             }
-            // EdgeTAM, Modell für Modell mit den Eingängen der CPU
             val ec = cpu[ModelId.ENC]
             val en = models[ModelId.ENC]
             val dcd = cpu[ModelId.DEC]
             val dnd = models[ModelId.DEC]
+            if (ec == null || en == null || dcd == null || dnd == null) return out
+            progress("Vergleicht den Encoder")
+            val center = directBuffer(16).apply { putFloat(0.5f).putFloat(0.5f).putFloat(0f).putFloat(0f).rewind() }
+            val labels = directBuffer(8).apply { putFloat(1f).putFloat(-1f).rewind() }
+            val encIn = arrayOfNulls<Any>(3)
+            encIn[ec.inputIndex("image")] = frame.enc
+            encIn[ec.inputIndex("unnorm_coords")] = center
+            encIn[ec.inputIndex("labels")] = labels
+            @Suppress("UNCHECKED_CAST")
+            val encCpuMs = ec.run(encIn as Array<Any>)
+            en.run(encIn)
+            val names = listOf("image_embeddings", "high_res_features1", "high_res_features2", "pix_feat")
+            val eo = JSONObject()
+            for (name in names) eo.put(name, compare(en.output(en.outputIndex(name)), ec.output(ec.outputIndex(name))))
+            eo.put("cpuMs", r1(encCpuMs))
+            // Quantisierter Encoder gegen die CPU (Ausgänge zurück in float umgerechnet).
+            models[ModelId.ENC_Q]?.let { q ->
+                val qe = QuantEncoder(q)
+                qe.run(frame.enc, center, labels)
+                val qo = JSONObject()
+                qo.put("image_embeddings", compare(qe.embeddings, ec.output(ec.outputIndex("image_embeddings"))))
+                qo.put("high_res_features1", compare(qe.hr1, ec.output(ec.outputIndex("high_res_features1"))))
+                qo.put("high_res_features2", compare(qe.hr2, ec.output(ec.outputIndex("high_res_features2"))))
+                qo.put("pix_feat", compare(qe.pixFeat, ec.output(ec.outputIndex("pix_feat"))))
+                qo.put("umrechnenMs", r1(qe.convertMs))
+                eo.put("quantisiert", qo)
+            }
+            out.put("encoder", eo)
+
+            // Eingabe-Einbettung der App gegen die des Encoders (CPU) und gegen Metas Proben.
+            consts?.prompt?.let { p ->
+                val mine = FloatArray(3 * PromptEncoder.D)
+                p.embed(floatArrayOf(0.5f, 0f), floatArrayOf(0.5f, 0f), intArrayOf(1, -1), mine)
+                val po = compare(directBuffer(mine.size * 4).apply { asFloatBuffer().put(mine); rewind() }, ec.output(ec.outputIndex("sparse_embedding")))
+                consts?.promptSamples?.let { po.put("metaProben", p.check(it)) }
+                out.put("einbettung", po)
+            }
+
+            progress("Vergleicht den Decoder")
+            val decIn = arrayOfNulls<Any>(4)
+            decIn[dcd.inputIndex("image_embeddings")] = ec.output(ec.outputIndex("pix_feat"))
+            decIn[dcd.inputIndex("high_res_features1")] = ec.output(ec.outputIndex("high_res_features1"))
+            decIn[dcd.inputIndex("high_res_features2")] = ec.output(ec.outputIndex("high_res_features2"))
+            decIn[dcd.inputIndex("sparse_embedding")] = ec.output(ec.outputIndex("sparse_embedding"))
+            @Suppress("UNCHECKED_CAST")
+            val decCpuMs = dcd.run(decIn as Array<Any>)
+            dnd.run(decIn)
+            val maskC = floats(dcd.output(dcd.outputIndex("masks")))
+            val maskN = floats(dnd.output(dnd.outputIndex("masks")))
+            out.put(
+                "decoder", JSONObject()
+                    .put("maskeGleich", r2(iou(maskN, maskC)))
+                    .put("maskeCpuAnteil", r4(maskC.count { it > 0f } / maskC.size.toDouble()))
+                    .put("maskeChipAnteil", r4(maskN.count { it > 0f } / maskN.size.toDouble()))
+                    .put("maskenLogits", compare(dnd.output(dnd.outputIndex("masks")), dcd.output(dcd.outputIndex("masks"))))
+                    .put("scoreCpu", num2(dcd.output(dcd.outputIndex("scores")).getFloat(0).toDouble()))
+                    .put("scoreChip", num2(dnd.output(dnd.outputIndex("scores")).getFloat(0).toDouble()))
+                    .put("zeiger", compare(dnd.output(dnd.outputIndex("obj_ptr")), dcd.output(dcd.outputIndex("obj_ptr"))))
+                    .put("objektWertCpu", num2(dcd.output(dcd.outputIndex("object_score_logits")).getFloat(0).toDouble()))
+                    .put("objektWertChip", num2(dnd.output(dnd.outputIndex("object_score_logits")).getFloat(0).toDouble()))
+                    .put("cpuMs", r1(decCpuMs))
+            )
+            val ptr = floats(dcd.output(dcd.outputIndex("obj_ptr")))
+
+            // Unser Decoder wie im Original, mit der Einbettung der App (ein Punkt in der Mitte).
+            val metaCpu = decoderOf(meta = true, from = cpu) as? MetaDecoder
+            val metaChip = decoderOf(meta = true) as? MetaDecoder
+            val prompt = consts?.prompt
+            if (metaCpu != null && metaChip != null && prompt != null) {
+                progress("Vergleicht den Decoder wie im Original")
+                val sparse = metaCpu.newSparse()
+                prompt.write(floatArrayOf(0.5f), floatArrayOf(0.5f), intArrayOf(1), FloatArray(2 * PromptEncoder.D), sparse)
+                val pix = ec.output(ec.outputIndex("pix_feat"))
+                val hr1 = ec.output(ec.outputIndex("high_res_features1"))
+                val hr2 = ec.output(ec.outputIndex("high_res_features2"))
+                val outC = directBuffer(MaskPainter.SIZE * MaskPainter.SIZE * 4)
+                val outN = directBuffer(MaskPainter.SIZE * MaskPainter.SIZE * 4)
+                val ptrC = FloatArray(PromptEncoder.D)
+                val ptrN = FloatArray(PromptEncoder.D)
+                val scoreC = metaCpu.run(pix, hr1, hr2, sparse, outC, ptrC)
+                val scoreN = metaChip.run(pix, hr1, hr2, sparse, outN, ptrN)
+                val mC = floats(outC)
+                val mN = floats(outN)
+                out.put(
+                    "decoderWieMeta", JSONObject()
+                        .put("maskeGleich", r2(iou(mN, mC)))
+                        .put("maskeCpuAnteil", r4(mC.count { it > 0f } / mC.size.toDouble()))
+                        .put("maskeChipAnteil", r4(mN.count { it > 0f } / mN.size.toDouble()))
+                        .put("wahlCpu", metaCpu.lastChoice)
+                        .put("wahlChip", metaChip.lastChoice)
+                        .put("maskenLogits", compare(outN, outC))
+                        .put("zeiger", compare(buffer(ptrN), buffer(ptrC)))
+                        .put("objektWertCpu", num2(scoreC.toDouble()))
+                        .put("objektWertChip", num2(scoreN.toDouble()))
+                        .put("cpuMs", r1(metaCpu.lastMs))
+                )
+            }
+
+            // Memory-Encoder: unserer auf Chip und CPU, Qualcomms samt Vorbereitung gegen unseren.
+            val emb = ec.output(ec.outputIndex("image_embeddings"))
+            val maskBuf = directBuffer(maskC.size * 4).apply { asFloatBuffer().put(maskC); rewind() }
+            val memRef = FloatArray(EdgeTamTracker.TOK_MEM * EdgeTamTracker.MEM_DIM)
             val mc = cpu[ModelId.MEMENC]
             val mn = models[ModelId.MEMENC]
-            val ac = cpu[ModelId.ATTN]
-            val an = models[ModelId.ATTN]
-            if (ec != null && en != null && dcd != null && dnd != null && mc != null && mn != null && ac != null && an != null) {
-                progress("Vergleicht EdgeTAM")
-                val center = directBuffer(16).apply { putFloat(0.5f).putFloat(0.5f).putFloat(0f).putFloat(0f).rewind() }
-                val labels = directBuffer(8).apply { putFloat(1f).putFloat(-1f).rewind() }
-                val encIn = arrayOfNulls<Any>(3)
-                encIn[ec.inputIndex("image")] = frame.enc
-                encIn[ec.inputIndex("unnorm_coords")] = center
-                encIn[ec.inputIndex("labels")] = labels
-                @Suppress("UNCHECKED_CAST")
-                val encCpuMs = ec.run(encIn as Array<Any>)
-                en.run(encIn)
-                val eo = JSONObject()
-                for (name in listOf("image_embeddings", "high_res_features1", "high_res_features2", "pix_feat")) {
-                    eo.put(name, compare(en.output(en.outputIndex(name)), ec.output(ec.outputIndex(name))))
+            if (mc != null) {
+                progress("Vergleicht den Memory-Encoder")
+                val so = JSONObject()
+                val ownCpu = OwnMemoryWriter(mc)
+                ownCpu.write(emb, maskBuf, startFrame = false, out = memRef)
+                val refBuf = buffer(memRef)
+                if (mn != null) {
+                    val chipOut = FloatArray(memRef.size)
+                    OwnMemoryWriter(mn).write(emb, maskBuf, startFrame = false, out = chipOut)
+                    so.put("eigener", compare(buffer(chipOut), refBuf))
                 }
-                eo.put("cpuMs", r1(encCpuMs))
-                out.put("encoder", eo)
+                val pc = cpu[ModelId.MEMPREP]
+                val qc = cpu[ModelId.MEMENC_QC]
+                if (pc != null && qc != null) {
+                    val qcOut = FloatArray(memRef.size)
+                    QualcommMemoryWriter(pc, qc).write(emb, maskBuf, startFrame = false, out = qcOut)
+                    so.put("qualcommCpuGegenEigenen", compare(buffer(qcOut), refBuf))
+                    val start1 = FloatArray(memRef.size)
+                    val start2 = FloatArray(memRef.size)
+                    OwnMemoryWriter(mc).write(emb, maskBuf, startFrame = true, out = start1)
+                    QualcommMemoryWriter(pc, qc).write(emb, maskBuf, startFrame = true, out = start2)
+                    so.put("qualcommCpuGegenEigenenStartbild", compare(buffer(start2), buffer(start1)))
+                }
+                val pn = models[ModelId.MEMPREP]
+                val qn = models[ModelId.MEMENC_QC]
+                if (pn != null && qn != null) {
+                    val chipOut = FloatArray(memRef.size)
+                    QualcommMemoryWriter(pn, qn).write(emb, maskBuf, startFrame = false, out = chipOut)
+                    so.put("qualcomm", compare(buffer(chipOut), refBuf))
+                }
+                out.put("speicherEncoder", so)
+            }
 
-                val decIn = arrayOfNulls<Any>(4)
-                decIn[dcd.inputIndex("image_embeddings")] = ec.output(ec.outputIndex("pix_feat"))
-                decIn[dcd.inputIndex("high_res_features1")] = ec.output(ec.outputIndex("high_res_features1"))
-                decIn[dcd.inputIndex("high_res_features2")] = ec.output(ec.outputIndex("high_res_features2"))
-                decIn[dcd.inputIndex("sparse_embedding")] = ec.output(ec.outputIndex("sparse_embedding"))
-                @Suppress("UNCHECKED_CAST")
-                val decCpuMs = dcd.run(decIn as Array<Any>)
-                dnd.run(decIn)
-                val maskC = floats(dcd.output(dcd.outputIndex("masks")))
-                val maskN = floats(dnd.output(dnd.outputIndex("masks")))
-                out.put(
-                    "decoder", JSONObject()
-                        .put("maskeGleich", r2(iou(maskN, maskC)))
-                        .put("maskeCpuAnteil", r2(maskC.count { it > 0f } / maskC.size.toDouble()))
-                        .put("zeiger", compare(dnd.output(dnd.outputIndex("obj_ptr")), dcd.output(dcd.outputIndex("obj_ptr"))))
-                        .put("objektWertCpu", r2(dcd.output(dcd.outputIndex("object_score_logits")).getFloat(0).toDouble()))
-                        .put("objektWertChip", r2(dnd.output(dnd.outputIndex("object_score_logits")).getFloat(0).toDouble()))
-                        .put("cpuMs", r1(decCpuMs))
-                )
-
-                val emb = ec.output(ec.outputIndex("image_embeddings"))
-                val maskBuf = directBuffer(maskC.size * 4).apply { asFloatBuffer().put(maskC); rewind() }
-                val cond = directBuffer(4).apply { putFloat(1f).rewind() }
-                val memCpuMs = mc.run(arrayOf(emb, maskBuf, cond))
-                mn.run(arrayOf(emb, maskBuf, cond))
-                val memC = floats(mc.output(0))
-                out.put("speicherEncoder", compare(mn.output(0), mc.output(0)).put("cpuMs", r1(memCpuMs)))
-
-                // Memory-Attention mit einem echten Speicher: Startbild in Platz 0 und 6.
+            // Memory-Attention mit einem echten Speicher: Startbild in Platz 0 und 6.
+            val ac = cpu[ModelId.ATTN]
+            if (ac != null && mc != null) {
+                progress("Vergleicht die Memory-Attention")
                 val bank = directBuffer(EdgeTamTracker.N_MEM * EdgeTamTracker.TOK_MEM * EdgeTamTracker.MEM_DIM * 4)
                 val slot = EdgeTamTracker.TOK_MEM * EdgeTamTracker.MEM_DIM
-                bank.asFloatBuffer().apply { put(memC); position(6 * slot); put(memC) }
+                bank.asFloatBuffer().apply { put(memRef); position(6 * slot); put(memRef) }
                 val ptrs = directBuffer(EdgeTamTracker.N_PTR * EdgeTamTracker.D * 4)
-                val ptr = floats(dcd.output(dcd.outputIndex("obj_ptr")))
                 ptrs.asFloatBuffer().apply { put(ptr); put(ptr) }
                 val bias = directBuffer(EdgeTamTracker.N_K * 4)
                 bias.asFloatBuffer().apply {
@@ -395,16 +697,45 @@ internal class AiEngine(private val context: Context) {
                         put(if (valid) 0f else EdgeTamTracker.MASK)
                     }
                 }
+                val ao = JSONObject()
                 val attnCpuMs = ac.run(arrayOf(emb, bank, ptrs, bias))
-                an.run(arrayOf(emb, bank, ptrs, bias))
-                out.put("speicherAttention", compare(an.output(0), ac.output(0)).put("cpuMs", r1(attnCpuMs)))
+                val ref = floats(ac.output(0))
+                ao.put("cpuMs", r1(attnCpuMs))
+                models[ModelId.ATTN]?.let { an ->
+                    an.run(arrayOf(emb, bank, ptrs, bias))
+                    ao.put("chip", compare(an.output(0), buffer(ref)))
+                }
+                cpu[ModelId.ATTN2]?.let { a2 ->
+                    a2.run(arrayOf(emb, bank, ptrs, bias))
+                    ao.put("neuCpuGegenAlt", compare(a2.output(0), buffer(ref)))
+                }
+                models[ModelId.ATTN2]?.let { a2 ->
+                    a2.run(arrayOf(emb, bank, ptrs, bias))
+                    ao.put("neuChip", compare(a2.output(0), buffer(ref)))
+                }
+                out.put("speicherAttention", ao)
+            }
 
-                // Ganze Verfolgung doppelt: Startbild in der Mitte, dann zwei Folgebilder.
+            // Ganze Verfolgung doppelt: dieselbe Kette wie live, einmal auf der CPU, einmal auf dem Chip.
+            // Startbild in der Mitte, dann zwei Folgebilder.
+            val c = consts
+            val attnCpu = cpu[liveAttn]
+            val writerCpu: MemoryWriter? = if (liveQcMemory) {
+                val p = cpu[ModelId.MEMPREP]
+                val q = cpu[ModelId.MEMENC_QC]
+                if (p != null && q != null) QualcommMemoryWriter(p, q) else null
+            } else {
+                mc?.let { OwnMemoryWriter(it) }
+            }
+            val useMeta = liveMetaDecoder && metaCpu != null && metaChip != null
+            val decoderCpu: MaskDecoder? = if (useMeta) decoderOf(meta = true, from = cpu) else decoderOf(meta = false, from = cpu)
+            if (c?.prompt != null && attnCpu != null && writerCpu != null && decoderCpu != null) {
                 progress("Vergleicht die ganze Verfolgung")
-                val ptrNo = noObjPtr
-                if (ptrNo != null) {
-                    val tc = EdgeTamTracker(ec, dcd, ac, mc, ptrNo)
-                    val tn = tracker ?: EdgeTamTracker(en, dnd, an, mn, ptrNo)
+                val coords = { directBuffer(16) }
+                val lab = { directBuffer(8) }
+                val tc = EdgeTamTracker(FloatEncoder(ec), decoderCpu, attnCpu, writerCpu, c.noObjPtr, c.prompt, coords(), lab())
+                val tn = buildFullTracker(liveAttn, liveQcMemory, appPrompt = true, metaDecoder = useMeta)
+                if (tn != null) {
                     tc.start(frame.enc, 0.5f, 0.5f)
                     val startC = tc.mask().copyOf()
                     tn.start(frame.enc, 0.5f, 0.5f)
@@ -413,13 +744,17 @@ internal class AiEngine(private val context: Context) {
                         tc.step(frame.enc)
                         tn.step(frame.enc)
                     }
+                    val followC = tc.mask()
+                    val followN = tn.mask()
                     out.put(
                         "verfolgung", JSONObject()
+                            .put("kette", tn.name)
                             .put("startMaskeGleich", r2(iou(startN, startC)))
-                            .put("folgeMaskeGleich", r2(iou(tn.mask(), tc.mask())))
+                            .put("folgeMaskeGleich", r2(iou(followN, followC)))
                             .put("objektCpu", tc.present)
                             .put("objektChip", tn.present)
-                            .put("maskeAnteil", r2(tc.mask().count { it > 0f } / startC.size.toDouble()))
+                            .put("maskeCpuAnteil", r4(followC.count { it > 0f } / followC.size.toDouble()))
+                            .put("maskeChipAnteil", r4(followN.count { it > 0f } / followN.size.toDouble()))
                             .put("cpuMsJeBild", r1(tc.totalMs))
                     )
                     tn.reset()
@@ -431,8 +766,120 @@ internal class AiEngine(private val context: Context) {
         return out
     }
 
+    /**
+     * Prüfvideo aus unserem Export: Metas Original hat darin einen Ball verfolgt. Jede Kette
+     * verfolgt ihn hier noch einmal auf dem Chip; verglichen wird Bild für Bild mit Metas Maske.
+     */
+    fun videoCheck(progress: (String) -> Unit): JSONObject {
+        val out = JSONObject()
+        val meta = consts?.testVideo ?: return out.put("fehler", "Kein Prüfvideo in diesem KI-Satz")
+        val file = File(File(context.filesDir, ModelStore.FOLDER), meta.getString("datei"))
+        if (!file.isFile) return out.put("fehler", "Prüfvideo fehlt: ${file.name}")
+        val frames = meta.getInt("bilder")
+        val startU = meta.getJSONArray("start").getDouble(0).toFloat()
+        val startV = meta.getJSONArray("start").getDouble(1).toFloat()
+        // Was dieselbe Kette im Export auf der CPU erreichte (gleiche Modelle, volle Genauigkeit):
+        // die Messlatte für den Chip. Bei den vollen Ketten je Memory-Encoder; es zählt der, der live läuft.
+        val cpuChains = meta.optJSONObject("cpuKetten")
+        fun expectation(key: String): JSONObject? {
+            val c = cpuChains?.optJSONObject(key) ?: return null
+            return if (key == "voll" || key == "vollQualcomm") c.optJSONObject(if (liveQcMemory) "qualcomm" else "eigener") else c
+        }
+        val slot = FrameSlot()
+        val chains = listOf(
+            "stufe2" to { buildFullTracker(ModelId.ATTN, qcMemory = false, appPrompt = false, metaDecoder = false) },
+            "voll" to { buildFullTracker(liveAttn, liveQcMemory, appPrompt = true, metaDecoder = true) },
+            "vollQualcomm" to { buildFullTracker(liveAttn, liveQcMemory, appPrompt = true, metaDecoder = false) },
+            "schnell" to { buildFastTracker(quantized = false, metaDecoder = true) },
+            "schnellQuantisiert" to { buildFastTracker(quantized = true, metaDecoder = true) },
+        )
+        ZipFile(file).use { zip ->
+            val truth = Array(frames) { i -> readMask(zip, "maske_%02d.png".format(i)) }
+            for ((key, make) in chains) {
+                val t = try {
+                    make()
+                } catch (e: Exception) {
+                    out.put(key, JSONObject().put("fehler", e.toString().take(300)))
+                    null
+                } ?: continue
+                progress("Prüfvideo · ${t.name}")
+                val ious = JSONArray()
+                val found = JSONArray()
+                var sum = 0.0
+                var worst = 1.0
+                for (i in 0 until frames) {
+                    readFrame(zip, "bild_%02d.png".format(i), slot)
+                    if (i == 0) t.start(slot.enc, startU, startV) else t.step(slot.enc)
+                    val v = iou(t.mask(), truth[i])
+                    ious.put(r2(v))
+                    found.put(t.present)
+                    sum += v
+                    worst = min(worst, v)
+                }
+                t.reset()
+                val result = JSONObject().put("name", t.name).put("maskeGleichMittel", r2(sum / frames))
+                    .put("maskeGleichSchlechtestes", r2(worst)).put("jeBild", ious).put("objektGefunden", found)
+                expectation(key)?.let { c ->
+                    val mean = c.optDouble("maskeGleichMittel", Double.NaN)
+                    if (!mean.isNaN()) result.put("cpuNachbauMittel", r2(mean))
+                    c.optJSONArray("jeBild")?.let { result.put("cpuNachbauJeBild", it) }
+                }
+                out.put(key, result)
+            }
+        }
+        out.put("bilder", frames)
+        return out
+    }
+
+    private fun readFrame(zip: ZipFile, name: String, slot: FrameSlot) {
+        val bmp = decode(zip, name)
+        try {
+            require(bmp.width == FrameSlot.ENC && bmp.height == FrameSlot.ENC) { "$name: ${bmp.width}×${bmp.height}" }
+            val px = IntArray(bmp.width * bmp.height)
+            bmp.getPixels(px, 0, bmp.width, 0, 0, bmp.width, bmp.height)
+            val fb = slot.enc.duplicate().order(slot.enc.order()).apply { rewind() }.asFloatBuffer()
+            val row = FloatArray(bmp.width * 3)
+            for (y in 0 until bmp.height) {
+                for (x in 0 until bmp.width) {
+                    val p = px[y * bmp.width + x]
+                    row[x * 3] = ((p ushr 16) and 0xFF) / 255f
+                    row[x * 3 + 1] = ((p ushr 8) and 0xFF) / 255f
+                    row[x * 3 + 2] = (p and 0xFF) / 255f
+                }
+                fb.put(row)
+            }
+            slot.enc.rewind()
+        } finally {
+            bmp.recycle()
+        }
+    }
+
+    private fun readMask(zip: ZipFile, name: String): FloatArray {
+        val bmp = decode(zip, name)
+        try {
+            require(bmp.width == MaskPainter.SIZE && bmp.height == MaskPainter.SIZE) { "$name: ${bmp.width}×${bmp.height}" }
+            val px = IntArray(bmp.width * bmp.height)
+            bmp.getPixels(px, 0, bmp.width, 0, 0, bmp.width, bmp.height)
+            return FloatArray(px.size) { if ((px[it] and 0xFF) >= 128) 1f else -1f }
+        } finally {
+            bmp.recycle()
+        }
+    }
+
+    private fun decode(zip: ZipFile, name: String): Bitmap {
+        val entry = zip.getEntry(name) ?: throw IllegalStateException("Prüfvideo: $name fehlt")
+        val opts = BitmapFactory.Options().apply {
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+            inScaled = false
+        }
+        return zip.getInputStream(entry).use { BitmapFactory.decodeStream(it, null, opts) }
+            ?: throw IllegalStateException("Prüfvideo: $name nicht lesbar")
+    }
+
+    private fun buffer(values: FloatArray): ByteBuffer = directBuffer(values.size * 4).apply { asFloatBuffer().put(values); rewind() }
+
     private fun floats(b: ByteBuffer): FloatArray {
-        val fb = b.asFloatBuffer()
+        val fb = b.duplicate().order(b.order()).apply { rewind() }.asFloatBuffer()
         return FloatArray(fb.remaining()).also { fb.get(it) }
     }
 
@@ -452,6 +899,7 @@ internal class AiEngine(private val context: Context) {
         var sbb = 0.0
         var sab = 0.0
         var nonFinite = 0
+        var count = 0
         for (i in 0 until n) {
             val x = a[i].toDouble()
             val y = b[i].toDouble()
@@ -459,6 +907,7 @@ internal class AiEngine(private val context: Context) {
                 nonFinite++
                 continue
             }
+            count++
             val d = x - y
             diff2 += d * d
             ref2 += y * y
@@ -471,17 +920,19 @@ internal class AiEngine(private val context: Context) {
             sbb += y * y
             sab += x * y
         }
+        val o = JSONObject()
+        if (count == 0) return o.put("ungueltigeWerte", nonFinite)
         val corr = run {
-            val cov = sab / n - (sa / n) * (sb / n)
-            val va = saa / n - (sa / n) * (sa / n)
-            val vb = sbb / n - (sb / n) * (sb / n)
+            val cov = sab / count - (sa / count) * (sb / count)
+            val va = saa / count - (sa / count) * (sa / count)
+            val vb = sbb / count - (sb / count) * (sb / count)
             if (va > 0 && vb > 0) cov / sqrt(va * vb) else Double.NaN
         }
-        val o = JSONObject()
         o.put("abweichungProzent", r2(100 * sqrt(diff2 / max(ref2, 1e-30))))
-        o.put("groessteAbweichung", r2(maxDiff))
+        o.put("groessteAbweichung", r4(maxDiff))
         o.put("wertebereich", "${r2(lo)} bis ${r2(hi)}")
         if (!corr.isNaN()) o.put("korrelation", Math.round(corr * 10000) / 10000.0)
+        if (a.size != b.size) o.put("groessenUnterschied", "${a.size} gegen ${b.size}")
         if (nonFinite > 0) o.put("ungueltigeWerte", nonFinite)
         return o
     }
@@ -515,6 +966,9 @@ internal class AiEngine(private val context: Context) {
         stopLive = true
     }
 
+    /** Name der Verfolgung, die live läuft, für den Bericht. */
+    fun liveTrackerName(): String = tracker?.name ?: "keine"
+
     /**
      * Läuft, bis [requestStop] kommt: nimmt das jeweils neueste Kamerabild, rechnet die Tiefe
      * und verfolgt das Objekt. Kommen länger keine Kamerabilder und gibt es ein Standbild,
@@ -523,9 +977,11 @@ internal class AiEngine(private val context: Context) {
     fun runLive(pool: FramePool, sink: LiveSink?, allowStill: Boolean) {
         val depth = models[ModelId.DEPTH] ?: error("Tiefenmodell nicht geladen")
         val t = tracker ?: error("EdgeTAM nicht geladen")
+        val used = liveSet().mapNotNull { models[it] }
         liveRunning = true
         t.reset()
         depthPainter.reset()
+        used.forEach { it.vote() }
         var lastFrame = SystemClock.elapsedRealtime()
         try {
             while (!stopLive) {
@@ -579,6 +1035,7 @@ internal class AiEngine(private val context: Context) {
                 if (!fromPool) Thread.sleep(25) // Standbild: im Takt der Kamera bleiben
             }
         } finally {
+            used.forEach { it.release() }
             liveRunning = false
         }
     }
@@ -593,11 +1050,17 @@ internal class AiEngine(private val context: Context) {
     companion object {
         const val WARMUP = 3
         const val RUNS = 20
+        const val MATRIX_RUNS = 10
         const val DEPTH_W = 144
         const val DEPTH_H = 256
         val MASK_COLOR = Palette.amber
     }
 }
+
+internal fun r4(v: Double): Double = Math.round(v * 10000.0) / 10000.0
+
+/** Zahl für den Bericht, auf zwei Stellen; „ungültig“, wenn der Chip NaN oder Unendlich lieferte (das kann JSON nicht). */
+internal fun num2(v: Double): Any = if (v.isFinite()) r2(v) else "ungültig"
 
 /** Zeiten und Zähler der Live-Läufe, in Abschnitten (etwa alle 30 s) und insgesamt. */
 internal class LiveStats {

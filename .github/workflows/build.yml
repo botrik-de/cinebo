@@ -22,7 +22,7 @@ env:
   # Stufe 2 des Machbarkeitstests: Versionen 0.2.x
   CINEBO_VERSION: 0.2.${{ github.run_number }}
   # Welche selbst exportierten EdgeTAM-Teile in die App kommen (Release modelle-<Version>)
-  MODELLE_VERSION: '1'
+  MODELLE_VERSION: '2'
   # Größer darf die APK nicht werden; alles Große lädt die App selbst.
   APK_MAX_MB: '40'
 
@@ -75,7 +75,8 @@ jobs:
             cp dl/w8a8/*/video_decoder.tflite "$roh/edgetam_decoder_w8a8.tflite"
             cp dl/w8a8/*/memory_encoder.tflite "$roh/edgetam_memory_encoder_w8a8.tflite"
             rel="https://github.com/${{ github.repository }}/releases/download/modelle-$MODELLE_VERSION"
-            for f in edgetam_memory_attention.tflite edgetam_memory_attention_q4.tflite edgetam_memory_encoder.tflite edgetam_konstanten.json; do
+            for f in edgetam_memory_attention.tflite edgetam_memory_attention_v2.tflite edgetam_memory_encoder.tflite \
+                     edgetam_memory_prep.tflite edgetam_decoder_meta.tflite edgetam_konstanten.json edgetam_pruefvideo.zip; do
               curl -fsSL --retry 3 -o "$roh/$f" "$rel/$f"
             done
             # Qualcomms QNN-Laufzeit für den KI-Chip, genau so, wie die App sie von Maven Central holt.
@@ -223,5 +224,5 @@ jobs:
           gh release create "test-${{ github.run_number }}" cinebo-test.apk bau-info.txt \
             --target "${{ github.sha }}" \
             --title "CineBo Test $CINEBO_VERSION" \
-            --notes "Testversion $CINEBO_VERSION für das OPPO Find N6: KI-Messung (Stufe 2). Die KI-Modelle lädt die App beim ersten Start selbst (KI-Satz $KI_SATZ)." \
+            --notes "Testversion $CINEBO_VERSION für das OPPO Find N6: KI-Messung (Stufe 2b). Die KI-Modelle lädt die App beim ersten Start selbst (KI-Satz $KI_SATZ)." \
             --latest

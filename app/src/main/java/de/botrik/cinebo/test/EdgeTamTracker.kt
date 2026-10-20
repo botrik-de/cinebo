@@ -3,46 +3,59 @@ package de.botrik.cinebo.test
 import org.json.JSONObject
 import java.nio.ByteBuffer
 
+/** Gemeinsame Sicht auf beide Verfolgungen, für Messung, Vorschau und Dauertest. */
+internal interface Tracker {
+    val name: String
+    val started: Boolean
+    val present: Boolean
+    val objectScore: Float
+
+    /** Zeiten des letzten Bildes in ms (im Modell gerechnet) und insgesamt. */
+    val encMs: Double
+    val attnMs: Double
+    val decMs: Double
+    val memMs: Double
+    val convertMs: Double
+    val totalMs: Double
+
+    fun start(image: ByteBuffer, u: Float, v: Float)
+    fun step(image: ByteBuffer)
+
+    /** Maske des letzten Bildes (256 × 256 Logits, größer 0 heißt Objekt). */
+    fun mask(): FloatArray
+    fun reset()
+}
+
 /**
- * Verfolgt ein angetipptes Objekt mit EdgeTAM, Bild für Bild.
+ * Verfolgt ein angetipptes Objekt mit EdgeTAM, Bild für Bild, mit Speicher.
  *
- * Encoder und Decoder stammen von Qualcomm, Memory-Attention und Memory-Encoder sind
- * unser eigener Export (tools/export/edgetam_export.py). Der Speicher hält wie im
- * Original das Startbild und die sechs letzten Bilder, dazu bis zu 16 Objekt-Zeiger.
- * Nur vom KI-Thread benutzen.
+ * Der Encoder stammt von Qualcomm, die Memory-Attention ist unser Export
+ * (tools/export/edgetam_export.py). Den Decoder gibt es als Qualcomms oder als unseren, der wie
+ * Metas Videoverfolgung rechnet ([MaskDecoder]); den Memory-Encoder als unseren Export oder als
+ * Qualcomms mit unserer Vorbereitung ([MemoryWriter]). Der Speicher hält wie im Original das
+ * Startbild und die sechs letzten Bilder, dazu bis zu 16 Objekt-Zeiger. Ist [prompt] gesetzt,
+ * rechnet die App die Eingabe-Einbettung selbst, sonst kommt sie aus dem Encoder (wie in Stufe 2,
+ * nur mit Qualcomms Decoder). Nur vom KI-Thread benutzen.
  */
 internal class EdgeTamTracker(
-    private val enc: NpuModel,
-    private val dec: NpuModel,
+    private val encoder: ImageEncoder,
+    private val decoder: MaskDecoder,
     private val attn: NpuModel,
-    private val memEnc: NpuModel,
+    private val memory: MemoryWriter,
     private val noObjPtr: FloatArray,
-) {
-    private val inImage = enc.inputIndex("image")
-    private val inCoords = enc.inputIndex("unnorm_coords")
-    private val inLabels = enc.inputIndex("labels")
-    private val outEmb = enc.outputIndex("image_embeddings")
-    private val outHr1 = enc.outputIndex("high_res_features1")
-    private val outHr2 = enc.outputIndex("high_res_features2")
-    private val outSparse = enc.outputIndex("sparse_embedding")
-    private val outPix = enc.outputIndex("pix_feat")
-    private val decEmb = dec.inputIndex("image_embeddings")
-    private val decHr1 = dec.inputIndex("high_res_features1")
-    private val decHr2 = dec.inputIndex("high_res_features2")
-    private val decSparse = dec.inputIndex("sparse_embedding")
-    private val decMasks = dec.outputIndex("masks")
-    private val decPtr = dec.outputIndex("obj_ptr")
-    private val decLogits = dec.outputIndex("object_score_logits")
-
-    private val coords = enc.newInput(inCoords)
-    private val labels = enc.newInput(inLabels)
-    private val maskBuf = dec.newOutput(decMasks)
-    private val ptrBuf = dec.newOutput(decPtr)
-    private val logitBuf = dec.newOutput(decLogits)
+    private val prompt: PromptEncoder?,
+    private val coords: ByteBuffer,
+    private val labels: ByteBuffer,
+) : Tracker {
+    private val maskBuf = directBuffer(MaskPainter.SIZE * MaskPainter.SIZE * 4)
+    private val sparseBuf = decoder.newSparse()
+    private val sparseScratch = FloatArray((decoder.points + 1) * D)
+    private val promptU = FloatArray(decoder.points)
+    private val promptV = FloatArray(decoder.points)
+    private val promptLabels = IntArray(decoder.points)
     private val bank = attn.newInput(1)
     private val ptrs = attn.newInput(2)
     private val bias = attn.newInput(3)
-    private val cond = memEnc.newInput(2)
 
     private val maskFloats = FloatArray(MaskPainter.SIZE * MaskPainter.SIZE)
     private val hidden = FloatArray(maskFloats.size) { -1024f }
@@ -54,38 +67,43 @@ internal class EdgeTamTracker(
     private val recentMem = ArrayDeque<FloatArray>()
     private val recentPtr = ArrayDeque<FloatArray>()
 
+    override val name: String = "voll · Encoder ${encoder.name} · Decoder ${decoder.name} · " +
+        "${attn.asset.removePrefix("edgetam_").removeSuffix(".tflite")} · Memory-Encoder ${memory.name}" +
+        if (prompt != null) " · Einbettung App" else " · Einbettung Encoder"
+
     init {
-        require(enc.inputBytes(inImage) == FrameSlot.ENC * FrameSlot.ENC * 3 * 4) { "Encoder erwartet ein anderes Bild" }
         require(bank.capacity() == N_MEM * TOK_MEM * MEM_DIM * 4) { "Memory-Attention hat eine andere Speichergröße" }
         require(ptrs.capacity() == N_PTR * D * 4 && bias.capacity() == N_K * 4)
-        require(memEnc.outputFloats(0) == TOK_MEM * MEM_DIM) { "Memory-Encoder liefert eine andere Größe" }
         require(noObjPtr.size == D)
+        require(prompt != null || (encoder.sparse != null && decoder.points == 2)) {
+            "Ohne Einbettung aus der App braucht es die des Encoders, und die passt nur zu Qualcomms Decoder"
+        }
     }
 
-    /** Zeiten des letzten Bildes in ms (im Modell gerechnet) und insgesamt. */
-    var encMs = 0.0; private set
-    var attnMs = 0.0; private set
-    var decMs = 0.0; private set
-    var memMs = 0.0; private set
-    var totalMs = 0.0; private set
-
-    /** Hat EdgeTAM das Objekt im letzten Bild gefunden? */
-    var present = false; private set
-    var objectScore = 0f; private set
+    override var encMs = 0.0; private set
+    override var attnMs = 0.0; private set
+    override var decMs = 0.0; private set
+    override var memMs = 0.0; private set
+    override var convertMs = 0.0; private set
+    override var totalMs = 0.0; private set
+    override var present = false; private set
+    override var objectScore = 0f; private set
     var steps = 0L; private set
 
-    val started: Boolean get() = condMem != null
+    override val started: Boolean get() = condMem != null
 
     /** Startbild: Objekt an Stelle (u, v), beides 0 bis 1 im aufrechten Kamerabild. */
-    fun start(image: ByteBuffer, u: Float, v: Float) {
+    override fun start(image: ByteBuffer, u: Float, v: Float) {
         val t = System.nanoTime()
         point(u, v, positive = true)
-        enc.run(inputs(enc, inImage to image, inCoords to coords, inLabels to labels))
-        encMs = enc.lastNativeMs
+        encoder.run(image, coords, labels)
+        encMs = encoder.lastMs
+        convertMs = encoder.convertMs
+        writePrompt(u, v, 1)
         // Beim Startbild geht pix_feat (mit no_mem_embed) direkt in den Decoder.
-        decode(enc.output(outPix))
+        decode(encoder.pixFeat)
         attnMs = 0.0
-        val mem = encodeMemory(enc.output(outEmb), startFrame = true)
+        val mem = encodeMemory(encoder.embeddings, startFrame = true)
         condMem = mem
         System.arraycopy(currentPtr, 0, condPtr, 0, D)
         recentMem.clear()
@@ -95,18 +113,20 @@ internal class EdgeTamTracker(
     }
 
     /** Folgebild: findet das Objekt mit Hilfe des Speichers wieder. */
-    fun step(image: ByteBuffer) {
+    override fun step(image: ByteBuffer) {
         check(started) { "Erst ein Objekt antippen" }
         val t = System.nanoTime()
         point(0f, 0f, positive = false)
-        enc.run(inputs(enc, inImage to image, inCoords to coords, inLabels to labels))
-        encMs = enc.lastNativeMs
-        val emb = enc.output(outEmb)
+        encoder.run(image, coords, labels)
+        encMs = encoder.lastMs
+        convertMs = encoder.convertMs
+        writePrompt(0f, 0f, -1)
+        val emb = encoder.embeddings
         fillMemory()
         attn.run(arrayOf(emb, bank, ptrs, bias))
         attnMs = attn.lastNativeMs
         decode(attn.output(0))
-        val mem = encodeMemory(emb, startFrame = false)
+        val mem = encodeMemory(encoder.embeddings, startFrame = false)
         recentMem.addLast(mem)
         while (recentMem.size > N_MEM - 1) recentMem.removeFirst()
         recentPtr.addLast(currentPtr.copyOf())
@@ -115,17 +135,13 @@ internal class EdgeTamTracker(
         totalMs = (System.nanoTime() - t) / 1e6
     }
 
-    /** Maske des letzten Bildes (256 × 256 Logits, größer 0 heißt Objekt). */
-    fun mask(): FloatArray {
+    override fun mask(): FloatArray {
         maskBuf.rewind()
         maskBuf.asFloatBuffer().get(maskFloats)
         return maskFloats
     }
 
-    /** Speicher (für die Genauigkeitsprüfung): Startbild-Eintrag und Zeiger. */
-    fun memorySnapshot(): Pair<FloatArray, FloatArray>? = condMem?.let { it.copyOf() to condPtr.copyOf() }
-
-    fun reset() {
+    override fun reset() {
         condMem = null
         recentMem.clear()
         recentPtr.clear()
@@ -153,24 +169,29 @@ internal class EdgeTamTracker(
         labels.rewind()
     }
 
-    /** Decoder; danach wie in Qualcomms App: Ist kein Objekt da, Maske leer und Zeiger neutral. */
+    /**
+     * Eingabe-Einbettung der App, falls [prompt] gesetzt: der Punkt (Label 1 beim Tippen, -1 =
+     * kein Punkt im Folgebild), so viele Leerpunkte, wie der Decoder Punkte erwartet, und der
+     * angehängte Leerpunkt; wie in Metas Videoverfolgung.
+     */
+    private fun writePrompt(u: Float, v: Float, label: Int) {
+        val p = prompt ?: return
+        promptU.fill(0f)
+        promptV.fill(0f)
+        promptLabels.fill(-1)
+        promptU[0] = u
+        promptV[0] = v
+        promptLabels[0] = label
+        p.write(promptU, promptV, promptLabels, sparseScratch, sparseBuf)
+    }
+
+    /** Decoder; danach wie im Original: Ist kein Objekt da, Maske leer und Zeiger neutral. */
     private fun decode(embeddings: ByteBuffer) {
-        dec.run(
-            inputs(
-                dec,
-                decEmb to embeddings,
-                decHr1 to enc.output(outHr1),
-                decHr2 to enc.output(outHr2),
-                decSparse to enc.output(outSparse)
-            ),
-            mapOf(decMasks to maskBuf, decPtr to ptrBuf, decLogits to logitBuf)
-        )
-        decMs = dec.lastNativeMs
-        objectScore = logitBuf.getFloat(0)
+        val sparse = if (prompt != null) sparseBuf else requireNotNull(encoder.sparse)
+        objectScore = decoder.run(embeddings, encoder.hr1, encoder.hr2, sparse, maskBuf, currentPtr)
+        decMs = decoder.lastMs
         present = objectScore > 0f
-        if (present) {
-            ptrBuf.asFloatBuffer().get(currentPtr)
-        } else {
+        if (!present) {
             System.arraycopy(noObjPtr, 0, currentPtr, 0, D)
             maskBuf.rewind()
             maskBuf.asFloatBuffer().put(hidden)
@@ -179,13 +200,10 @@ internal class EdgeTamTracker(
     }
 
     private fun encodeMemory(embeddings: ByteBuffer, startFrame: Boolean): FloatArray {
-        cond.rewind()
-        cond.putFloat(if (startFrame) 1f else 0f)
-        cond.rewind()
-        memEnc.run(arrayOf(embeddings, maskBuf, cond))
-        memMs = memEnc.lastNativeMs
         val out = FloatArray(TOK_MEM * MEM_DIM)
-        memEnc.output(0).asFloatBuffer().get(out)
+        memory.write(embeddings, maskBuf, startFrame, out)
+        memMs = memory.lastMs
+        maskBuf.rewind()
         return out
     }
 
@@ -229,12 +247,6 @@ internal class EdgeTamTracker(
         bias.rewind()
     }
 
-    private fun inputs(model: NpuModel, vararg pairs: Pair<Int, Any>): Array<Any> {
-        val array = arrayOfNulls<Any>(model.inputCount)
-        for ((i, v) in pairs) array[i] = v
-        return Array(array.size) { requireNotNull(array[it]) { "${model.asset}: Eingang $it fehlt" } }
-    }
-
     companion object {
         const val N_MEM = 7
         const val TOK_MEM = 512
@@ -245,4 +257,165 @@ internal class EdgeTamTracker(
         const val N_K = N_MEM * TOK_MEM + N_PTR * TOK_PTR
         const val MASK = -10000f
     }
+}
+
+/**
+ * Schnellverfolgung: In jedem Bild nur Encoder und Decoder, ohne Speicher. Das Objekt findet
+ * sie über einen Punkt in der Mitte seiner Maske im Bild davor (der Maskenpunkt, der dem
+ * Schwerpunkt am nächsten liegt), so wie ein neuer Tipp. Ein Rahmen um die Maske taugt dafür
+ * nicht: Er wächst von Bild zu Bild, bis er den Hintergrund mitnimmt. Mit dem Decoder wie im
+ * Original kam sie auf der CPU in einem echten Video auf 97 % Übereinstimmung mit Metas
+ * Verfolgung, mit Qualcomms Decoder nur auf 91 %. Schnell, aber ohne Gedächtnis: Bei Verdeckung
+ * oder zwei ähnlichen Motiven kann sie springen.
+ */
+internal class FastTracker(
+    private val encoder: ImageEncoder,
+    private val decoder: MaskDecoder,
+    private val prompt: PromptEncoder,
+    private val coords: ByteBuffer,
+    private val labels: ByteBuffer,
+) : Tracker {
+    private val maskBuf = directBuffer(MaskPainter.SIZE * MaskPainter.SIZE * 4)
+    private val sparseBuf = decoder.newSparse()
+    private val sparseScratch = FloatArray((decoder.points + 1) * PromptEncoder.D)
+    private val promptU = FloatArray(decoder.points)
+    private val promptV = FloatArray(decoder.points)
+    private val promptLabels = IntArray(decoder.points)
+    private val ptrScratch = FloatArray(PromptEncoder.D)
+    private val maskFloats = FloatArray(MaskPainter.SIZE * MaskPainter.SIZE)
+    private val hidden = FloatArray(maskFloats.size) { -1024f }
+
+    /** Punkt (u, v) im quadratischen Bild, 0 bis 1: Mitte der Maske im Bild davor. */
+    private val point = FloatArray(2)
+
+    override val name: String = "schnell · Encoder ${encoder.name} · Decoder ${decoder.name} · Punkt aus dem Bild davor"
+    override var started = false; private set
+    override var present = false; private set
+    override var objectScore = 0f; private set
+    override var encMs = 0.0; private set
+    override val attnMs = 0.0
+    override var decMs = 0.0; private set
+    override val memMs = 0.0
+    override var convertMs = 0.0; private set
+    override var totalMs = 0.0; private set
+
+    override fun start(image: ByteBuffer, u: Float, v: Float) {
+        val t = System.nanoTime()
+        encode(image)
+        writePrompt(u, v)
+        decode()
+        started = true
+        // Fehlt die Maske, sucht der nächste Schritt wieder am Tipp-Punkt.
+        if (!updatePoint()) {
+            point[0] = u.coerceIn(0f, 1f)
+            point[1] = v.coerceIn(0f, 1f)
+        }
+        totalMs = (System.nanoTime() - t) / 1e6
+    }
+
+    override fun step(image: ByteBuffer) {
+        check(started) { "Erst ein Objekt antippen" }
+        val t = System.nanoTime()
+        encode(image)
+        writePrompt(point[0], point[1])
+        decode()
+        updatePoint() // ohne Objekt bleibt der alte Punkt
+        totalMs = (System.nanoTime() - t) / 1e6
+    }
+
+    override fun mask(): FloatArray {
+        maskBuf.rewind()
+        maskBuf.asFloatBuffer().get(maskFloats)
+        return maskFloats
+    }
+
+    override fun reset() {
+        started = false
+        present = false
+    }
+
+    private fun encode(image: ByteBuffer) {
+        coords.rewind()
+        repeat(4) { coords.putFloat(0f) }
+        coords.rewind()
+        labels.rewind()
+        labels.putFloat(-1f).putFloat(-1f)
+        labels.rewind()
+        encoder.run(image, coords, labels)
+        encMs = encoder.lastMs
+        convertMs = encoder.convertMs
+    }
+
+    /** Ein positiver Punkt, dann Leerpunkte bis zur Zahl, die der Decoder erwartet (der letzte Leerpunkt kommt dazu). */
+    private fun writePrompt(u: Float, v: Float) {
+        promptU.fill(0f)
+        promptV.fill(0f)
+        promptLabels.fill(-1)
+        promptU[0] = u
+        promptV[0] = v
+        promptLabels[0] = 1
+        prompt.write(promptU, promptV, promptLabels, sparseScratch, sparseBuf)
+    }
+
+    private fun decode() {
+        objectScore = decoder.run(encoder.pixFeat, encoder.hr1, encoder.hr2, sparseBuf, maskBuf, ptrScratch)
+        decMs = decoder.lastMs
+        present = objectScore > 0f
+        if (!present) {
+            maskBuf.rewind()
+            maskBuf.asFloatBuffer().put(hidden)
+            maskBuf.rewind()
+        }
+    }
+
+    /** Neuer Punkt: der Maskenpunkt nächst dem Schwerpunkt der Maske; false, wenn die Maske leer ist. */
+    private fun updatePoint(): Boolean {
+        if (!present) return false
+        val found = maskCenter(mask(), MaskPainter.SIZE) ?: return false
+        point[0] = found[0]
+        point[1] = found[1]
+        return true
+    }
+}
+
+/**
+ * Mitte einer Maske (n × n Logits, größer 0 heißt Objekt) als (u, v) von 0 bis 1: der
+ * Maskenpunkt, der dem Schwerpunkt am nächsten liegt, damit er auch bei einer gebogenen Form
+ * auf dem Objekt liegt. Bei gleichem Abstand zählt der erste Punkt zeilenweise. Null, wenn die
+ * Maske leer ist. (Gleiche Rechnung wie mask_center im Export.)
+ */
+internal fun maskCenter(m: FloatArray, n: Int): FloatArray? {
+    var count = 0L
+    var sx = 0L
+    var sy = 0L
+    for (y in 0 until n) {
+        val row = y * n
+        for (x in 0 until n) {
+            if (m[row + x] > 0f) {
+                count++
+                sx += x
+                sy += y
+            }
+        }
+    }
+    if (count == 0L) return null
+    val cx = sx.toDouble() / count
+    val cy = sy.toDouble() / count
+    var best = Double.MAX_VALUE
+    var bx = 0
+    var by = 0
+    for (y in 0 until n) {
+        val row = y * n
+        for (x in 0 until n) {
+            if (m[row + x] > 0f) {
+                val d = (x - cx) * (x - cx) + (y - cy) * (y - cy)
+                if (d < best) {
+                    best = d
+                    bx = x
+                    by = y
+                }
+            }
+        }
+    }
+    return floatArrayOf((bx + 0.5f) / n, (by + 0.5f) / n)
 }
