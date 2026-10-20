@@ -1461,9 +1461,12 @@ class MainActivity : ComponentActivity() {
 
     private fun trackSummary(): Pair<Mark, String> {
         val ki = ki() ?: return openRow("verfolgung")
-        val chains = ki.optJSONObject("einzeln")?.optJSONObject("ketten")
-        // Die volle Verfolgung, die live läuft (mit unserem Decoder wie im Original, sonst Qualcomms).
-        val per = ki.optJSONObject("einzeln")?.optJSONObject("jeBild") ?: chains?.optJSONObject("voll") ?: return openRow("verfolgung")
+        val single = ki.optJSONObject("einzeln") ?: return openRow("verfolgung")
+        // Gestoppt: Die Ketten liefen mit einer vorläufigen Wahl, die nicht gilt; live bleibt die bisherige.
+        if (single.optBoolean("abgebrochen")) return Mark.OPEN to "Gestoppt, bevor alle Ketten gemessen waren; live bleibt die bisherige Wahl"
+        val chains = single.optJSONObject("ketten") ?: return openRow("verfolgung")
+        // Nur die volle Verfolgung, die live läuft (mit unserem Decoder wie im Original, sonst Qualcomms).
+        val per = single.optJSONObject("jeBild")
         fun median(o: JSONObject?, name: String) = o?.optJSONObject(name)?.optDouble("medianMs", Double.NaN) ?: Double.NaN
         val parts = mutableListOf<String>()
         var best = 0.0
@@ -1475,13 +1478,16 @@ class MainActivity : ComponentActivity() {
                 .mapNotNull { (title, key) -> median(per, key).takeIf { !it.isNaN() }?.let { "$title ${de(it, 0)}" } }
             parts += "Mit Speicher: ${de(trackMs, 0)} ms je Bild" + if (pieces.isNotEmpty()) " (${pieces.joinToString(" · ")} ms)" else ""
         } else {
-            per.optString("fehler").takeIf { it.isNotEmpty() }?.let { parts += "Verfolgung mit Speicher: Fehler ${it.take(120)}" }
+            // Keine volle Kette lief durch: Was schiefging, steht bei ihr.
+            listOfNotNull(per, chains.optJSONObject("voll"), chains.optJSONObject("vollQualcomm"))
+                .firstNotNullOfOrNull { it.optString("fehler").takeIf { e -> e.isNotEmpty() } }
+                ?.let { parts += "Verfolgung mit Speicher: Fehler ${it.take(120)}" }
         }
         if (!both.isNaN()) {
             parts += "mit Tiefe ${de(both, 0)} ms, bis zu ${de(1000.0 / both, 0)} pro Sekunde"
             best = max(best, 1000.0 / both)
         }
-        val fast = chains?.optJSONObject("schnell")
+        val fast = chains.optJSONObject("schnell")
         val fastBoth = median(fast, "beide")
         if (!fastBoth.isNaN()) {
             parts += "Schnellverfolgung mit Tiefe ${de(fastBoth, 0)} ms, bis zu ${de(1000.0 / fastBoth, 0)} pro Sekunde"
@@ -1502,17 +1508,23 @@ class MainActivity : ComponentActivity() {
             videoPart("mit Qualcomms Decoder", video?.optJSONObject("vollQualcomm")),
             videoPart("schnell", video?.optJSONObject("schnell")),
         )
+        val videoStopped = video?.optBoolean("abgebrochen") == true
         if (videoParts.isNotEmpty()) {
-            parts += "Prüfvideo, Maske gleich wie in Metas Original: " + videoParts.joinToString(", ")
-            // Es zählt die volle Kette, die live läuft (nach dem Prüfvideo gewählt).
-            val metaLive = ki.optJSONObject("einzeln")?.optString("liveDecoder") != "qualcomm"
+            parts += "Prüfvideo, Maske gleich wie in Metas Original: " + videoParts.joinToString(", ") +
+                if (videoStopped) " (gestoppt)" else ""
+            // Es zählt die volle Kette, die live läuft (nach dem Prüfvideo gewählt). Fehlt ihr Wert,
+            // weil das Prüfvideo gestoppt wurde, ist das kein Befund.
+            val metaLive = single.optString("liveDecoder") != "qualcomm"
             val liveIou = value(video?.optJSONObject(AiEngine.liveChainKey(metaLive)), "maskeGleichMittel")
-            if (liveIou.isNaN() || liveIou < 0.9) mark = Mark.WARN
+            if (liveIou < 0.9 || (liveIou.isNaN() && !videoStopped)) mark = Mark.WARN
+        } else if (videoStopped) {
+            parts += "Prüfvideo gestoppt"
         } else {
             val acc = ki.optJSONObject("genauigkeit")?.optJSONObject("verfolgung")
             val iou = acc?.optDouble("folgeMaskeGleich", Double.NaN) ?: Double.NaN
             if (!iou.isNaN()) parts += "Maske zu ${(iou * 100).roundToInt()} % wie auf der CPU"
         }
+        if (parts.isEmpty()) return openRow("verfolgung")
         return mark to parts.joinToString(" · ")
     }
 
