@@ -8,11 +8,12 @@ Phase 1: Machbarkeitstest.
 
 - Stufe 1 (bestanden): Kamera, 4K-Aufnahme, Klappen und Wärme.
 - Stufe 2 (gemessen): Die Tiefe schafft das Tempo; die Verfolgung mit Speicher ist noch zu langsam.
-- Stufe 2b (läuft): Tempo herausholen: alle Leistungsstufen des KI-Chips, schnellere Bausteine, und ein Prüfvideo, an dem jede Kette auf dem Chip mit Metas Original verglichen wird.
+- Stufe 2b (läuft): Tempo und Genauigkeit herausholen: alle Leistungsstufen des KI-Chips, schnellere Bausteine, ein Decoder, der wie Metas Original rechnet, und ein Prüfvideo, an dem jede Kette auf dem Chip mit Metas Original verglichen wird.
 
 ## Test-App
 
-GitHub baut jede Änderung automatisch. Die neueste Version liegt immer unter
+GitHub baut jede Änderung in `main` automatisch; Arbeitszweige werden vorher nur übersetzt und
+ohne Handy geprüft. Die neueste Version liegt immer unter
 [cinebo-test.apk](https://github.com/botrik-de/cinebo/releases/latest/download/cinebo-test.apk).
 Die APK ist klein: Die KI-Modelle und die QNN-Laufzeit lädt die App beim ersten Start selbst,
 von selbst nur im WLAN. Bricht die Verbindung ab, macht sie an derselben Stelle weiter, und jede
@@ -24,7 +25,7 @@ laden nur nach, was sich geändert hat.
 Die Modelle liegen nie im Repo und nicht in der APK:
 
 - Depth Anything V2 Small (Tiefe) und EdgeTAM (Verfolgung) in der Fassung von [Qualcomm AI Hub](https://github.com/quic/ai-hub-models).
-- Die Teile von EdgeTAM, die Qualcomm nicht anbietet (Memory-Attention, eigener Memory-Encoder, eine Vorbereitung für Qualcomms Memory-Encoder und ein Decoder, der wie in Metas Videoverfolgung rechnet), baut `tools/export/edgetam_export.py` aus dem [Original von Meta](https://github.com/facebookresearch/EdgeTAM) nach, prüft sie gegen das Original und legt sie mit Konstanten und einem Prüfvideo im Release `modelle-2` ab. Dabei rechnet der Export jede Verfolgungs-Kette der App auf der CPU nach: Das ist die Messlatte für das Ergebnis auf dem KI-Chip.
+- Die Teile von EdgeTAM, die Qualcomm nicht oder anders anbietet (Memory-Attention, eigener Memory-Encoder, eine Vorbereitung für Qualcomms Memory-Encoder und ein Decoder, der wie in Metas Videoverfolgung rechnet), baut `tools/export/edgetam_export.py` aus dem [Original von Meta](https://github.com/facebookresearch/EdgeTAM) nach, prüft sie gegen das Original und legt sie mit Konstanten und einem Prüfvideo im Release `modelle-2` ab. Dabei rechnet der Export jede Verfolgungs-Kette der App auf der CPU nach: Das ist die Messlatte für das Ergebnis auf dem KI-Chip.
 - Beim Bauen landen alle Modelle, für die Übertragung gepackt, im Release `ki-modelle-<Satz>`; die App bekommt nur die Liste mit Adressen, Größen und Prüfsummen (`.github/ki_dateien.py`).
 - Die QNN-Laufzeit für den KI-Chip holt die App direkt aus Qualcomms Paket `qnn-runtime` auf Maven Central und entpackt daraus nur, was das Find N6 braucht.
 

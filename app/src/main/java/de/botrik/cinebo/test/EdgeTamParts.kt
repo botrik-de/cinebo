@@ -47,7 +47,7 @@ internal class PromptEncoder(
     private val imageSize: Int,
 ) {
     init {
-        require(gauss.size == 2 && gauss.all { it.size == HALF }) { "Gauss-Matrix muss 2 × $HALF sein" }
+        require(gauss.size == 2 && gauss.all { it.size == HALF }) { "Gauß-Matrix muss 2 × $HALF sein" }
         require(labelEmbeddings.size == 4 && labelEmbeddings.all { it.size == D }) { "4 Punkt-Einbettungen zu je $D" }
         require(noPoint.size == D)
     }

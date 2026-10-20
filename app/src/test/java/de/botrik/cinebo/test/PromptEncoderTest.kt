@@ -48,7 +48,7 @@ class PromptEncoderTest {
 
     @Test
     fun rahmenWieImOriginal() {
-        // Schnellverfolgung: Rahmen als zwei Ecken (Labels 2 und 3).
+        // Ein Rahmen als zwei Ecken (Labels 2 und 3), so wie SAM2 Rahmen eingibt.
         val out = embed(floatArrayOf(0.1f, 0.8f), floatArrayOf(0.2f, 0.95f), intArrayOf(2, 3))
         assertToken(out, 0, floatArrayOf(0.9364541f, -0.3440046f, -0.9154034f, 0.2482878f, 0.450481f, 0.9538838f, 0.7077858f, 1.0013117f))
         assertToken(out, 1, floatArrayOf(0.2243286f, 1.0199883f, 0.6784938f, 0.1649051f, 1.018577f, -0.1636675f, 0.8301972f, 1.0216751f))

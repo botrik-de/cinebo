@@ -626,6 +626,17 @@ def compare(a, b) -> dict:
             "bereich": [float(b.min()), float(b.max())]}
 
 
+def finite_or_text(x):
+    """Prüfwerte, die JSON nicht kennt (NaN, unendlich), als Text: Die App liest die Datei mit org.json."""
+    if isinstance(x, float) and not math.isfinite(x):
+        return "ungültig"
+    if isinstance(x, dict):
+        return {k: finite_or_text(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [finite_or_text(v) for v in x]
+    return x
+
+
 def iou(mask, ref) -> float:
     """Wie die App vergleicht: Logit größer 0 heißt Objekt."""
     a, b = np.asarray(mask) > 0, np.asarray(ref) > 0
@@ -911,7 +922,7 @@ class AppChain:
 
 
 def mask_center(mask):
-    """Wie FastTracker.centerOf in der App: Maskenpunkt nächst dem Schwerpunkt, als (u, v), oder None."""
+    """Wie maskCenter in der App (EdgeTamTracker.kt): Maskenpunkt nächst dem Schwerpunkt, als (u, v), oder None."""
     ys, xs = np.nonzero(mask > 0)
     if len(xs) == 0:
         return None
@@ -1265,9 +1276,10 @@ def main():
     write_test_video(video_path, frames, ref_masks)
     log(f"   {os.path.getsize(video_path) / 1e6:.1f} MB")
 
-    konst["pruefung"] = report
+    konst["pruefung"] = finite_or_text(report)
     with open(os.path.join(a.out, "edgetam_konstanten.json"), "w") as f:
-        json.dump(konst, f, indent=1, ensure_ascii=False)
+        # Android liest die Datei mit org.json, das NaN und Unendlich nicht kennt: lieber hier scheitern.
+        json.dump(konst, f, indent=1, ensure_ascii=False, allow_nan=False)
     log("== Fertig")
 
 

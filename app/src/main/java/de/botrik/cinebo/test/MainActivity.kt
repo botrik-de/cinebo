@@ -622,6 +622,8 @@ class MainActivity : ComponentActivity() {
     private fun requestStop() {
         if (running == null) return
         stopRequested = true
+        // Messungen hören nach dem laufenden Schritt auf, die Vorschau sofort.
+        engine.requestCancel()
         if (running == "vorschau") engine.requestStop()
         setStatus(Phase.BUSY, "Stoppt …")
     }
@@ -633,6 +635,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         stopRequested = false
+        engine.beginWork()
         failed = false
         doneText = null
         testStartedAt = SystemClock.elapsedRealtime()
@@ -777,6 +780,11 @@ class MainActivity : ComponentActivity() {
                 engine.videoCheck { what -> runOnUiThread { setStatus(Phase.BUSY, "$what …") } }
             }
             ki.put("pruefvideo", video)
+            // Live nimmt den Decoder, der auf dem Chip im Prüfvideo am genauesten traf.
+            val decoder = withContext(engine.dispatcher) { engine.chooseDecoderAfterVideo(video) }
+            if (decoder != null) {
+                ki.optJSONObject("einzeln")?.put("liveDecoder", decoder)?.put("liveDecoderGrund", "Prüfvideo auf dem Chip")
+            }
             saveAndRender()
         } finally {
             pool.release(frame)
@@ -811,15 +819,26 @@ class MainActivity : ComponentActivity() {
         reveal("kidauer")
         // Liefert die Kamera neben 4K keine Bilder für die KI, rechnet sie auf einem Standbild. Das
         // entsteht sonst im Schnelltest; nach einem Neustart der App holt der Dauertest es selbst.
+        // Klappt das nicht, läuft der Dauertest trotzdem (die KI rechnet dann nur auf Kamerabildern).
+        var stillMissing: String? = null
         if (!withContext(engine.dispatcher) { engine.hasStill() }) {
-            val frame = cameraFrame()
             try {
-                withContext(engine.dispatcher) { engine.setStill(frame) }
-            } finally {
-                pool.release(frame)
+                val frame = cameraFrame()
+                try {
+                    withContext(engine.dispatcher) { engine.setStill(frame) }
+                } finally {
+                    pool.release(frame)
+                }
+            } catch (e: CancellationException) {
+                // Abbruch (auch eine Unterart von IllegalStateException) beendet den Test wie bisher.
+                throw e
+            } catch (e: IllegalStateException) {
+                stillMissing = e.message ?: e.toString()
             }
         }
-        putTest("kidauer", recordWithAi("kidauer", LONG_SECONDS))
+        val result = recordWithAi("kidauer", LONG_SECONDS)
+        stillMissing?.let { result.put("ohneStandbild", it) }
+        putTest("kidauer", result)
         doneText = "KI-Dauertest fertig"
     }
 
@@ -1267,7 +1286,7 @@ class MainActivity : ComponentActivity() {
 
     private fun reportText(): String {
         val o = JSONObject()
-        o.put("app", JSONObject().put("name", "CineBo Test").put("stufe", 2).put("version", appVersion).put("erstellt", nowIso()))
+        o.put("app", JSONObject().put("name", "CineBo Test").put("stufe", "2b").put("version", appVersion).put("erstellt", nowIso()))
         val keys = report.keys()
         while (keys.hasNext()) {
             val k = keys.next()
@@ -1438,9 +1457,15 @@ class MainActivity : ComponentActivity() {
         val parts = mutableListOf<String>()
         var best = 0.0
         val both = median(per, "beide")
-        parts += "Mit Speicher: ${de(median(per, "verfolgung"), 0)} ms je Bild (Encoder ${de(median(per, "encoder"), 0)} · " +
-            "Memory-Attention ${de(median(per, "speicherAttention"), 0)} · Decoder ${de(median(per, "decoder"), 0)} · " +
-            "Memory-Encoder ${de(median(per, "speicherEncoder"), 0)} ms)"
+        val trackMs = median(per, "verfolgung")
+        if (!trackMs.isNaN()) {
+            // Teile, die nicht gemessen wurden (etwa nach einem Fehler), fehlen in der Klammer.
+            val pieces = listOf("Encoder" to "encoder", "Memory-Attention" to "speicherAttention", "Decoder" to "decoder", "Memory-Encoder" to "speicherEncoder")
+                .mapNotNull { (title, key) -> median(per, key).takeIf { !it.isNaN() }?.let { "$title ${de(it, 0)}" } }
+            parts += "Mit Speicher: ${de(trackMs, 0)} ms je Bild" + if (pieces.isNotEmpty()) " (${pieces.joinToString(" · ")} ms)" else ""
+        } else {
+            per.optString("fehler").takeIf { it.isNotEmpty() }?.let { parts += "Verfolgung mit Speicher: Fehler ${it.take(120)}" }
+        }
         if (!both.isNaN()) {
             parts += "mit Tiefe ${de(both, 0)} ms, bis zu ${de(1000.0 / both, 0)} pro Sekunde"
             best = max(best, 1000.0 / both)
