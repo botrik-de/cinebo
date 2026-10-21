@@ -338,7 +338,7 @@ internal class BokehProcessor(
             drawTriangle()
             present(o, ts)
         }
-        stats.frameOut(ts, null, blurred = false)
+        stats.frameOut(ts, null, blurred = false, subject = false)
     }
 
     /** Kamerabild in den Ring (st-Raum, [w] × [h]) und seine unscharfe Fassung dazu. */
@@ -423,7 +423,8 @@ internal class BokehProcessor(
             drawTriangle()
             present(o, slot.ts)
         }
-        stats.frameOut(slot.ts, pick, blurred = true)
+        val subject = pick != null && (maskPresent[pick.a] || maskPresent[pick.b])
+        stats.frameOut(slot.ts, pick, blurred = true, subject = subject)
         freeSlots.addLast(slot)
     }
 
@@ -465,11 +466,21 @@ internal class BokehProcessor(
             slot.rotation = upright
             slot.prepMs = (System.nanoTime() - start) / 1e6
             // Einmal je Lauf ein kleines Bild dessen, was die KI bekommt, zurückgerechnet aus den
-            // gelesenen Zahlen: So zeigt der Bericht Ausrichtung und Farben des ganzen Weges.
+            // gelesenen Zahlen: So zeigt der Bericht Ausrichtung und Farben des ganzen Weges. Hier
+            // nur die Bildpunkte (schnell); das JPEG entsteht auf einem eigenen Thread, damit die
+            // Aufnahme kein Bild verliert.
             if (thumbnailAfter > 0 && !thumbnailDone && stats.aiFrames() + 1 >= thumbnailAfter) {
                 thumbnailDone = true
                 try {
-                    stats.thumbnail(slot.thumbnailJpegBase64())
+                    val size = FrameSlot.THUMBNAIL
+                    val pixels = slot.thumbnailPixels(size)
+                    Thread({
+                        try {
+                            stats.thumbnail(FrameSlot.jpegBase64(pixels, size))
+                        } catch (e: Throwable) {
+                            stats.error("Vorschaubild", e)
+                        }
+                    }, "vorschaubild").start()
                 } catch (e: Throwable) {
                     stats.error("Vorschaubild", e)
                 }
@@ -950,6 +961,7 @@ internal class PipelineStats {
     private var framesIn = 0
     private var framesOut = 0
     private var blurredOut = 0
+    private var withSubject = 0
     private var gaps = 0
     private var lostEstimate = 0
     private var dropped = 0
@@ -966,6 +978,7 @@ internal class PipelineStats {
     private val aiMs = Series()
     private val maskDistanceMs = Series()
     private val windowDistanceMs = Series()
+    private val windowFrameMs = Series()
     private var windowIn = 0
     private var windowOut = 0
     private var windowGaps = 0
@@ -996,6 +1009,7 @@ internal class PipelineStats {
         framesIn = 0
         framesOut = 0
         blurredOut = 0
+        withSubject = 0
         gaps = 0
         lostEstimate = 0
         dropped = 0
@@ -1006,7 +1020,7 @@ internal class PipelineStats {
         withoutMask = 0
         mixed = 0
         outOfOrder = 0
-        for (series in listOf(intervals, frameMs, aiMs, maskDistanceMs, windowDistanceMs)) series.clear()
+        for (series in listOf(intervals, frameMs, aiMs, maskDistanceMs, windowDistanceMs, windowFrameMs)) series.clear()
         windowIn = 0
         windowOut = 0
         windowGaps = 0
@@ -1062,16 +1076,22 @@ internal class PipelineStats {
 
     fun frameDone(totalMs: Double, aiFrameMs: Double) = synchronized(lock) {
         frameMs.add(totalMs)
+        windowFrameMs.add(totalMs)
         aiMs.add(aiFrameMs)
     }
 
-    fun frameOut(ts: Long, pick: PipelineMath.MaskPick?, blurred: Boolean) = synchronized(lock) {
+    /**
+     * Ein Bild ging hinaus. [blurred]: über den Weg mit Unschärfe (Ring und Masken);
+     * [subject]: eine der beiden Masken zeigte ein Motiv, der Hintergrund wurde also unscharf.
+     */
+    fun frameOut(ts: Long, pick: PipelineMath.MaskPick?, blurred: Boolean, subject: Boolean) = synchronized(lock) {
         framesOut++
         windowOut++
         if (lastOut != 0L && ts <= lastOut) outOfOrder++
         lastOut = ts
         if (!blurred) return@synchronized
         blurredOut++
+        if (subject) withSubject++
         if (pick == null) {
             withoutMask++
             return@synchronized
@@ -1103,10 +1123,12 @@ internal class PipelineStats {
     /** Abschnitt für den Verlauf (etwa alle 30 s). */
     fun closeWindow(): JSONObject = synchronized(lock) {
         val o = JSONObject().put("bilderEin", windowIn).put("bilderAus", windowOut).put("luecken", windowGaps)
+        windowFrameMs.json()?.let { o.put("jeBildMs", it) }
         windowDistanceMs.json()?.let { o.put("maskenAbstandMs", it) }
         windowIn = 0
         windowOut = 0
         windowGaps = 0
+        windowFrameMs.clear()
         windowDistanceMs.clear()
         o
     }
@@ -1119,8 +1141,11 @@ internal class PipelineStats {
         if (outOfOrder > 0) o.put("zeitRueckwaerts", outOfOrder)
         if (aiFrames > 0 || masksIn > 0) o.put("kiBilder", aiFrames).put("masken", masksIn)
         if (blurredOut > 0) {
-            o.put("mitUnschaerfe", blurredOut).put("ohneMaske", withoutMask)
-                .put("gemischtProzent", Math.round(mixed * 100.0 / blurredOut))
+            // mitUnschaerfeWeg: Bilder über Ring und Masken; mitMotiv: davon mit unscharfem
+            // Hintergrund (eine Maske zeigte ein Motiv); ohneMaske: keine KI-Maske in 0,4 s Nähe.
+            val withMask = blurredOut - withoutMask
+            o.put("mitUnschaerfeWeg", blurredOut).put("mitMotiv", withSubject).put("ohneMaske", withoutMask)
+            if (withMask > 0) o.put("gemischtProzent", Math.round(mixed * 100.0 / withMask))
         }
         val ms = JSONObject()
         intervals.json()?.let { ms.put("bildabstand", it) }

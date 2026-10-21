@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Stufe 2 des Machbarkeitstests: Versionen 0.2.x
+  # Stufe 3 des Machbarkeitstests: Versionen 0.3.x
   CINEBO_VERSION: 0.3.${{ github.run_number }}
   # Welche selbst exportierten EdgeTAM-Teile in die App kommen (Release modelle-<Version>)
   MODELLE_VERSION: '2'

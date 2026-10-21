@@ -9,7 +9,7 @@ Phase 1: Machbarkeitstest.
 - Stufe 1 (bestanden): Kamera, 4K-Aufnahme, Klappen und Wärme.
 - Stufe 2 (gemessen): Die Tiefe schafft das Tempo; die Verfolgung mit Speicher ist noch zu langsam.
 - Stufe 2b (gemessen): Die volle Verfolgung mit Speicher schafft etwa 7,6 Durchgänge pro Sekunde und trifft auf dem Chip wie Metas Original; Abkürzungen ohne Speicher verlieren das Motiv.
-- Stufe 3 (läuft): Grafik-Pipeline. Sie sitzt als CameraX-Effekt vor Vorschau und Videoaufnahme, gibt der KI echte Kamerabilder während der 4K-Aufnahme, legt jede Maske auf genau das Bild, zu dem sie gehört (die Ausgabe wartet dafür eine Drittelsekunde), und macht den Hintergrund einfach unscharf. Eine Wärmeregelung nimmt die KI bei Hitze zurück.
+- Stufe 3 (läuft): Grafik-Pipeline. Sie sitzt als CameraX-Effekt vor Vorschau und Videoaufnahme, gibt der KI echte Kamerabilder während der 4K-Aufnahme, legt jede Maske auf genau das Bild, zu dem sie gehört (die Ausgabe wartet dafür eine Drittelsekunde), und macht den Hintergrund vorerst gleichmäßig unscharf, noch ohne Tiefe. Clips mit und ohne Unschärfe landen zum Vergleich mit der OPPO-Kamera in der Galerie (Album CineBo). Eine Wärmeregelung nimmt die KI bei Hitze zurück.
 
 ## Test-App
 

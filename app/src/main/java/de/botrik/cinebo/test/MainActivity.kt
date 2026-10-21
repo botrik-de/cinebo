@@ -69,6 +69,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -110,9 +111,9 @@ class MainActivity : ComponentActivity() {
             "kichip" to "Lädt beide KI-Modelle auf den KI-Chip und misst, wie lange das dauert.",
             "leistung" to "Misst jedes Modell in jeder Leistungsstufe des KI-Chips und nimmt die schnellste.",
             "tiefe" to "Wie schnell und wie genau der KI-Chip die Tiefe eines Bildes schätzt.",
-            "verfolgung" to "Wie schnell EdgeTAM ein Objekt Bild für Bild wiederfindet, mit Speicher und als Schnellverfolgung.",
+            "verfolgung" to "Wie schnell EdgeTAM ein Motiv Bild für Bild wiederfindet, mit Speicher und als Schnellverfolgung.",
             "live" to "30 Sekunden 4K mit 30 fps: Die KI verfolgt das Motiv, der Hintergrund wird unscharf. Der Clip kommt in die Galerie.",
-            "vergleich" to "10 Sekunden 4K ohne Grafik-Pipeline, wie CameraX allein filmt: zum Vergleich mit dem Unschärfe-Clip und der OPPO-Kamera. Der Clip kommt in die Galerie.",
+            "vergleich" to "10 Sekunden 4K ohne KI und Grafik-Pipeline, zum Vergleich mit dem Unschärfe-Clip und mit der OPPO-Kamera. Der Clip kommt in die Galerie.",
             "kidauer" to "10 Minuten 4K mit Unschärfe und Wärmeregelung: Tempo, Wärme und Akku."
         )
 
@@ -133,6 +134,9 @@ class MainActivity : ComponentActivity() {
          * Bewegung sichtbar; die Wärmeregelung darf so weit bremsen, das steht dann gelb da.
          */
         const val MIN_LIVE_HZ = 5.0
+
+        /** Findet die KI das Motiv seltener, wurde der Hintergrund zu selten unscharf. */
+        const val MIN_FOUND_PERCENT = 80
 
         val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
         val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
@@ -190,6 +194,8 @@ class MainActivity : ComponentActivity() {
     private var stopRequested = false
     private var failed = false
     private var doneText: String? = null
+    /** Wie die Statuszeile das Ende zeigt: grün, oder rot, wenn eine Aufnahme nicht geklappt hat. */
+    private var donePhase = Phase.DONE
     private var hintOverride: String? = null
     private var events: JSONArray? = null
     private var recordingSince = 0L
@@ -267,8 +273,8 @@ class MainActivity : ComponentActivity() {
         CrashLog.install(this)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // Eigener Bericht für Stufe 2; der Bericht von Stufe 1 bleibt unberührt liegen.
-        store = ReportStore(this, "bericht-stufe2.json")
+        // Eigener Bericht für Stufe 3; die Berichte früherer Stufen bleiben unberührt liegen.
+        store = ReportStore(this, "bericht-stufe3.json")
         report = store.load()
         val crash = CrashLog.take(this)
         if (crash != null) {
@@ -609,6 +615,7 @@ class MainActivity : ComponentActivity() {
         engine.beginWork()
         failed = false
         doneText = null
+        donePhase = Phase.DONE
         testStartedAt = SystemClock.elapsedRealtime()
         archiveErrors()
         backDuringTest.isEnabled = true
@@ -629,7 +636,8 @@ class MainActivity : ComponentActivity() {
                 setStatus(Phase.ERROR, "Fehler: ${e.message ?: e.javaClass.simpleName}")
             } finally {
                 val was = running
-                if (liveJob != null) stopLive()
+                // Auch wenn die Ansicht geschlossen wurde: KI-Schleife sauber beenden und den Bericht sichern.
+                if (liveJob != null) withContext(NonCancellable) { stopLive() }
                 running = null
                 counting = false
                 hintOverride = null
@@ -643,7 +651,7 @@ class MainActivity : ComponentActivity() {
                         when {
                             was == "vorschau" -> setStatus(Phase.IDLE, "Bereit")
                             stopRequested -> setStatus(Phase.IDLE, "Gestoppt")
-                            done != null -> setStatus(Phase.DONE, done)
+                            done != null -> setStatus(donePhase, done)
                         }
                     }
                     render()
@@ -669,8 +677,9 @@ class MainActivity : ComponentActivity() {
      * mitrechnen, und zuletzt 10 Sekunden ohne Unschärfe zum Vergleich.
      */
     private fun runQuickTest() = launchTest {
-        hintOverride = "Lass die App offen und richte die Kamera auf eine Person oder einen Gegenstand in der Mitte, " +
-            "mit etwas Abstand zum Hintergrund. Der Test dauert beim ersten Mal etwa zehn Minuten, danach etwa fünf."
+        hintOverride = "Stell das Handy fest hin und richte die Kamera auf eine Person oder einen Gegenstand in der Mitte, " +
+            "mit etwas Abstand zum Hintergrund; so zeigen beide Clips dieselbe Szene. Lass die App offen. " +
+            "Der Test dauert beim ersten Mal etwa zehn Minuten, danach etwa fünf."
         val tests = readTests()
         tests.remove("live")
         tests.remove("vergleich")
@@ -779,7 +788,14 @@ class MainActivity : ComponentActivity() {
         render()
         reveal("vergleich")
         putTest("vergleich", recordComparison())
-        doneText = "KI-Schnelltest fertig"
+        markDone("KI-Schnelltest fertig", "live", "vergleich")
+    }
+
+    /** Text für das Ende eines Tests; rot mit Hinweis, wenn eine seiner Aufnahmen nicht geklappt hat. */
+    private fun markDone(text: String, vararg keys: String) {
+        val failedRows = keys.any { key -> readTests().optJSONObject(key)?.let { recordingSummary(key, it).first } == Mark.FAIL }
+        doneText = if (failedRows) "$text · mit Fehlern" else text
+        donePhase = if (failedRows) Phase.ERROR else Phase.DONE
     }
 
     /**
@@ -789,14 +805,17 @@ class MainActivity : ComponentActivity() {
      */
     private suspend fun cameraFrame(): Pair<FrameSlot, JSONObject> {
         setStatus(Phase.BUSY, "Holt ein Kamerabild …")
-        val effect = BokehProcessor(applicationContext, strength = 0f, aiPool = pool, aiDemand = grabDemand, thumbnailAfter = 1)
+        val effect = BokehProcessor(applicationContext, strength = 0f, aiPool = pool, aiDemand = grabDemand, thumbnailAfter = 0)
         bind(null, effect)
         delay(300)
         waitForStreaming(5000)
         delay(1500) // Belichtung und Weißabgleich einpendeln lassen
-        val frame = grabFrame() ?: throw IllegalStateException(
-            "Die Grafik-Pipeline liefert keine Kamerabilder für die KI" + pipelineNote(effect)
-        )
+        val frame = grabFrame()
+        if (frame == null) {
+            // Alles, was die Pipeline weiß, in den Bericht; die Meldung bekommt nur den ersten Hinweis.
+            ki()?.put("bild", JSONObject().put("fehler", "keine Kamerabilder für die KI").put("pipeline", effect.stats.toJson()))
+            throw IllegalStateException("Die Grafik-Pipeline liefert keine Kamerabilder für die KI" + pipelineNote(effect))
+        }
         val info = frameInfo(frame, effect)
         showPreviewOnly()
         return frame to info
@@ -815,13 +834,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun runLongTest() = launchTest {
-        hintOverride = "Leg das Handy hin, die Kamera auf eine Person oder einen Gegenstand mit etwas Abstand zum Hintergrund. " +
-            "Die App bleibt offen, die Aufnahme läuft 10 Minuten."
+        hintOverride = "Stell das Handy so hin, dass die Kamera auf eine Person oder einen Gegenstand in der Mitte zeigt, " +
+            "mit etwas Abstand zum Hintergrund. Lass die App offen; die Aufnahme läuft 10 Minuten."
         running = "kidauer"
         render()
         reveal("kidauer")
         putTest("kidauer", recordWithAi("kidauer", LONG_SECONDS))
-        doneText = "KI-Dauertest fertig"
+        markDone("KI-Dauertest fertig", "kidauer")
     }
 
     /**
@@ -837,11 +856,12 @@ class MainActivity : ComponentActivity() {
         launchTest {
             running = "vorschau"
             hintOverride = "Tippe im Kamerabild auf eine Person oder einen Gegenstand: Das Motiv bleibt scharf, der Hintergrund wird unscharf. " +
-                "Das Bild läuft eine Drittelsekunde hinterher, damit Motiv und Unschärfe genau zusammenpassen."
+                "Ohne Tippen nimmt die KI, was in der Mitte ist. Das Bild läuft eine Drittelsekunde hinterher, damit Motiv und Unschärfe genau zusammenpassen."
             render()
             setStatus(Phase.BUSY, "Bereitet die KI vor …")
             val load = ensureLiveModels()
             if (load != null) report.optJSONObject("ki")?.put("ladenVorschau", load)
+            if (stopRequested) return@launchTest
             val effect = BokehProcessor(applicationContext, strength = 1f, aiPool = pool, aiDemand = engine, thumbnailAfter = 0)
             bind(null, effect)
             startLive(effect)
@@ -849,7 +869,12 @@ class MainActivity : ComponentActivity() {
             try {
                 while (!stopRequested && liveJob?.isActive == true) delay(200)
             } finally {
-                stopLive()
+                withContext(NonCancellable) { stopLive() }
+                // Die letzte Vorschau steht im Bericht, damit sich auch dort etwas beurteilen lässt.
+                val o = JSONObject().put("zeit", nowIso()).put("version", appVersion)
+                    .put("ki", engine.stats.totalJson()).put("pipeline", effect.stats.toJson())
+                liveError?.let { o.put("fehler", it) }
+                ki()?.put("vorschau", o)
             }
             liveError?.let { throw IllegalStateException(it) }
         }
@@ -903,6 +928,12 @@ class MainActivity : ComponentActivity() {
         o.put("quelle", "Grafik-Pipeline")
         o.put("vorbereitungMs", r1(frame.prepMs))
         o.put("pipeline", effect.stats.toJson())
+        // Was die KI bekommt, als kleines Bild: Ausrichtung und Farben auf einen Blick.
+        try {
+            o.put("kiBildJpegBase64", frame.thumbnailJpegBase64())
+        } catch (e: Exception) {
+            o.put("kiBildFehler", e.toString().take(200))
+        }
         return o
     }
 
@@ -920,7 +951,7 @@ class MainActivity : ComponentActivity() {
         tapOverlay.onTap = { u, v -> engine.track(u, v) }
         liveJob = lifecycleScope.launch(engine.dispatcher) {
             try {
-                engine.runLive(pool, allowStill = false)
+                engine.runLive(pool)
             } catch (e: Throwable) {
                 liveError = "KI-Schleife: $e".take(400)
             }
@@ -969,6 +1000,7 @@ class MainActivity : ComponentActivity() {
     private suspend fun recordWithAi(key: String, seconds: Int, keepClip: Boolean = false): JSONObject {
         setStatus(Phase.BUSY, "Bereitet die KI vor …")
         val load = ensureLiveModels()
+        if (stopRequested) return JSONObject().put("version", appVersion).put("zeit", nowIso()).put("ende", "gestoppt")
         val effect = BokehProcessor(
             applicationContext, strength = 1f, aiPool = pool, aiDemand = engine,
             thumbnailAfter = if (keepClip) BokehProcessor.THUMBNAIL_AFTER else 0
@@ -1001,7 +1033,13 @@ class MainActivity : ComponentActivity() {
                     prepared = pool.prepared
                     skipped = pool.skipped
                 },
-                afterStop = { engine.requestStop() },
+                afterStop = {
+                    // Die Datei ist fertig: KI anhalten und ihre Anzeige gleich ausblenden.
+                    engine.requestStop()
+                    badgeJob?.cancel()
+                    badgeJob = null
+                    aiBadge.visibility = View.GONE
+                },
                 shouldStop = { liveJob?.isActive == false }
             ) { t, stats ->
                 if (t >= next) {
@@ -1009,7 +1047,7 @@ class MainActivity : ComponentActivity() {
                     val entry = JSONObject().put("s", next.toInt())
                     val fromFrames = if (prevFrames < 0) 1L else prevFrames
                     val fromTs = if (prevFrames < 0) first else prevTs
-                    if (last > fromTs) entry.put("fps", r1((count - fromFrames) / ((last - fromTs) / 1e9)))
+                    if (last > fromTs) entry.put("kameraFps", r1((count - fromFrames) / ((last - fromTs) / 1e9)))
                     if (stats != null && t > prevT) {
                         entry.put("mbits", r1((stats.numBytesRecorded - prevBytes) * 8 / (t - prevT) / 1e6))
                         prevBytes = stats.numBytesRecorded
@@ -1026,21 +1064,22 @@ class MainActivity : ComponentActivity() {
                     next += LOG_EVERY_S
                     if (seconds > LIVE_SECONDS) {
                         val parts = mutableListOf("Läuft")
-                        if (window.has("hz")) parts.add("KI ${de(window.optDouble("hz"), 0)}/s")
-                        if (entry.has("fps")) parts.add("${de(entry.optDouble("fps"), 1)} fps")
+                        if (window.has("hz")) parts.add("KI ${de(window.optDouble("hz"), 1)}/s")
+                        if (entry.has("kameraFps")) parts.add("${de(entry.optDouble("kameraFps"), 1)} fps")
                         if (heat.has("akkuGrad")) parts.add("Akku ${de(heat.optDouble("akkuGrad"), 1)} °C")
-                        parts.add("Wärmestufe ${heat.optString("stufe")}")
+                        parts.add("Wärmestufe: ${heat.optString("stufe")}")
                         hintOverride = parts.joinToString(" · ")
                         hintText.text = hintOverride
                     }
                 }
             }
         } finally {
-            stopLive()
+            withContext(NonCancellable) { stopLive() }
         }
         val ai = aiTotal ?: engine.stats.totalJson()
-        ai.put("kameraBilderFuerKi", if (aiTotal != null) prepared else pool.prepared)
-        ai.put("kameraBilderVerworfen", if (aiTotal != null) skipped else pool.skipped)
+        // Wie oft die Pipeline ein KI-Bild vorbereitete, und wie oft sie es ließ, weil das vorige noch nicht genommen war.
+        ai.put("kiBilderVorbereitet", if (aiTotal != null) prepared else pool.prepared)
+        ai.put("kiBildLagNochBereit", if (aiTotal != null) skipped else pool.skipped)
         val (setting, chainName) = withContext(engine.dispatcher) { engine.chip to engine.liveTrackerName() }
         ai.put("einstellung", setting.key)
         ai.put("verfolgungKette", chainName)
@@ -1076,7 +1115,6 @@ class MainActivity : ComponentActivity() {
         stabilize: Boolean,
         effect: BokehProcessor? = null,
         clipName: String? = null,
-        recordingHint: String? = null,
         onStart: () -> Unit = {},
         onStop: () -> Unit = {},
         afterStop: () -> Unit = {},
@@ -1098,7 +1136,7 @@ class MainActivity : ComponentActivity() {
                 .put("pipeline", effect != null)
                 .put("unschaerfe", effect?.blurs == true)
         )
-        val label = "4K · $fps" + (if (stabilize) " · Stabilisator" else "") + (if (effect?.blurs == true) " · Unschärfe" else "")
+        val label = (if (effect?.blurs == true) "4K mit Unschärfe" else "4K") + if (stabilize) " · Stabilisator" else ""
         setStatus(Phase.BUSY, "Kamera startet · $label")
 
         // Ohne eigenes Seitenverhältnis ist 4K genau die Größe aus dem Profil des Encoders (3840 × 2160).
@@ -1109,6 +1147,10 @@ class MainActivity : ComponentActivity() {
         if (stabilize) builder.setVideoStabilizationEnabled(true)
         val videoCapture = builder.build()
 
+        if (stopRequested) {
+            out.put("ende", "gestoppt")
+            return attachEvents(out)
+        }
         val camera = try {
             bind(videoCapture, effect)
         } catch (e: Exception) {
@@ -1172,10 +1214,6 @@ class MainActivity : ComponentActivity() {
             if (started.isCompleted) {
                 val totalMs = seconds * 1000L
                 recBadge.visibility = View.VISIBLE
-                if (recordingHint != null) {
-                    hintOverride = recordingHint
-                    hintText.text = recordingHint
-                }
                 while (!finished.isCompleted) {
                     if (stopRequested) {
                         stoppedByUser = true
@@ -1282,10 +1320,11 @@ class MainActivity : ComponentActivity() {
             stream.use { target -> file.inputStream().use { it.copyTo(target, 1 shl 20) } }
             values.clear()
             values.put(MediaStore.Video.Media.IS_PENDING, 0)
-            resolver.update(uri, values, null, null)
+            if (resolver.update(uri, values, null, null) == 0) throw IOException("Clip ließ sich in der Galerie nicht freigeben")
             out.put("mb", (file.length() / 1e6).roundToInt())
         } catch (e: Exception) {
-            resolver.delete(uri, null, null)
+            // Den halb geschriebenen Eintrag wieder entfernen; scheitert auch das, bleibt die Messung trotzdem.
+            runCatching { resolver.delete(uri, null, null) }
             out.put("fehler", "Clip ließ sich nicht in die Galerie legen: ${e.message ?: e.javaClass.simpleName}")
         }
     }
@@ -1586,17 +1625,20 @@ class MainActivity : ComponentActivity() {
         if (aiError.isNotEmpty()) return Mark.FAIL to aiError
         val file = r.optJSONObject("datei")
         if (file == null || !file.has("fps")) {
+            // Vor dem Start der Aufnahme gestoppt: kein Fehler, der Test ist nur noch offen.
+            if (r.optString("ende") == "gestoppt") return Mark.OPEN to "Gestoppt, bevor die Aufnahme lief"
             val reason = endNote(r) ?: file?.optString("fehler")?.ifEmpty { null } ?: "keine auswertbare Aufnahme"
             return Mark.FAIL to reason.replaceFirstChar { it.uppercase() }
         }
         val parts = mutableListOf<String>()
         var mark = Mark.OK
-        if (key == "kidauer" && file.has("dauerS")) parts += "${clock(file.optDouble("dauerS").toLong())} min"
+        if (key == "kidauer" && file.has("dauerS")) parts += "${clock(Math.round(file.optDouble("dauerS")))} min"
         val fps = file.optDouble("fps")
         val lost = lostAfterStart(file)
         parts += "${sizeText(file)} mit ${de(fps, 1)} fps"
         parts += lostText(lost)
-        if (fps < FPS * 0.95 || lost > 0) mark = Mark.WARN
+        // Abnahme: mindestens 30 Bilder pro Sekunde; 1 % Spielraum für die Zeitstempel der Datei.
+        if (fps < FPS * 0.99 || lost > 0) mark = Mark.WARN
         if (key != "vergleich") {
             if (ai != null && ai.has("hz")) {
                 val hz = ai.optDouble("hz")
@@ -1617,7 +1659,7 @@ class MainActivity : ComponentActivity() {
                         hi = hz
                     }
                 }
-                parts += if (de(lo, 0) == de(hi, 0)) "KI ${de(hz, 0)} Durchgänge pro Sekunde" else "KI ${de(lo, 0)} bis ${de(hi, 0)} Durchgänge pro Sekunde"
+                parts += if (de(lo, 1) == de(hi, 1)) "KI ${de(hz, 1)} Durchgänge pro Sekunde" else "KI ${de(lo, 1)} bis ${de(hi, 1)} Durchgänge pro Sekunde"
                 if (lo < MIN_LIVE_HZ) mark = Mark.WARN
             } else {
                 parts += "KI lief nicht mit"
@@ -1627,11 +1669,15 @@ class MainActivity : ComponentActivity() {
                 parts += text
                 if (warn) mark = Mark.WARN
             }
-            ai?.optInt("objektGefundenProzent", -1)?.takeIf { it >= 0 }?.let { parts += "Motiv in $it % der Durchgänge gefunden" }
+            val found = ai?.optInt("objektGefundenProzent", -1) ?: -1
+            if (found >= 0) {
+                parts += "Motiv in $found % der Durchgänge gefunden"
+                if (found < MIN_FOUND_PERCENT) mark = Mark.WARN
+            }
             ai?.optJSONObject("waermeregelung")?.let { heat ->
                 val waited = heat.optDouble("gewartetS", 0.0)
                 if (heat.optInt("gebremsteDurchgaenge") > 0) {
-                    parts += "Wärmeregelung bremste die KI um insgesamt ${clock(waited.roundToInt().toLong())} min"
+                    parts += "Wärmeregelung ließ die KI insgesamt ${clock(waited.roundToInt().toLong())} min warten"
                 }
             }
         }
@@ -1644,16 +1690,18 @@ class MainActivity : ComponentActivity() {
                     parts += "Akku ${de(start.optDouble("akkuGrad"), 1)} → ${de(stop.optDouble("akkuGrad"), 1)} °C"
                 }
                 if (start.has("akkuProzent") && stop.has("akkuProzent")) {
-                    parts += "${start.optInt("akkuProzent")} → ${stop.optInt("akkuProzent")} %"
+                    parts += "Akkustand ${start.optInt("akkuProzent")} → ${stop.optInt("akkuProzent")} %"
                 }
             }
+            // Heißeste Stufe aus dem Verlauf (alle 30 s) und aus der Wärmeregelung (alle 2 s).
             var hottest = "keine"
-            val log = r.optJSONArray("verlauf") ?: JSONArray()
-            for (i in 0 until log.length()) {
-                val stage = log.optJSONObject(i)?.optJSONObject("waerme")?.optString("stufe").orEmpty()
+            fun consider(stage: String) {
                 if (DeviceHeat.stageOrder.indexOf(stage) > DeviceHeat.stageOrder.indexOf(hottest)) hottest = stage
             }
-            parts += "Wärmestufe höchstens $hottest"
+            val log = r.optJSONArray("verlauf") ?: JSONArray()
+            for (i in 0 until log.length()) consider(log.optJSONObject(i)?.optJSONObject("waerme")?.optString("stufe").orEmpty())
+            ai?.optJSONObject("waermeregelung")?.optJSONObject("sekundenJeStufe")?.keys()?.forEach { consider(it) }
+            parts += "höchste Wärmestufe: $hottest"
             if (DeviceHeat.stageOrder.indexOf(hottest) >= 3) mark = Mark.WARN
         }
         endNote(r)?.let {
@@ -1673,22 +1721,25 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Wie gut die Unschärfe zur KI passte: auf wie vielen Bildern sie lag und wie viele die Masken
-     * davor und danach mischten. Gibt (Warnung, Text) zurück oder null ohne Zahlen.
+     * Wie gut die Unschärfe zur KI passte: auf wie vielen Bildern der Hintergrund unscharf wurde
+     * und wie viele die KI-Masken davor und danach mischten. Gibt (Warnung, Text) zurück oder
+     * null ohne Zahlen.
      */
     private fun blurNote(p: JSONObject?): Pair<Boolean, String>? {
         if (p == null) return null
-        val blurred = p.optInt("mitUnschaerfe")
-        if (blurred <= 0) {
+        val frames = p.optInt("mitUnschaerfeWeg")
+        if (frames <= 0) {
             val note = p.optJSONArray("hinweise")?.optString(0).orEmpty()
             return true to if (note.isNotEmpty()) "Keine Unschärfe: ${note.take(120)}" else "Keine Unschärfe"
         }
-        val withMask = 100 - Math.round(p.optInt("ohneMaske") * 100.0 / blurred).toInt()
+        val blurred = Math.round(p.optInt("mitMotiv") * 100.0 / frames).toInt()
+        val withoutMask = Math.round(p.optInt("ohneMaske") * 100.0 / frames).toInt()
         val mixed = p.optInt("gemischtProzent")
-        var text = "Unschärfe auf $withMask % der Bilder, $mixed % zwischen zwei Masken gemischt"
+        var text = "Hintergrund auf $blurred % der Bilder unscharf, $mixed % zwischen zwei KI-Masken gemischt"
+        if (withoutMask > 5) text += ", $withoutMask % ohne KI-Maske"
         val gaps = p.optInt("luecken")
-        if (gaps > 0) text += ", ${p.optInt("fehlendeBilderGeschaetzt")} Kamerabilder fehlten der Pipeline"
-        return (withMask < 95 || mixed < 80 || gaps > 0) to text
+        if (gaps > 0) text += ", ${p.optInt("fehlendeBilderGeschaetzt")} Kamerabilder fehlten der Grafik-Pipeline"
+        return (withoutMask > 5 || mixed < 80 || gaps > 0) to text
     }
 
     private fun endNote(r: JSONObject): String? = when (val end = r.optString("ende")) {
@@ -1741,9 +1792,10 @@ class MainActivity : ComponentActivity() {
                 "jedes Modell neu; rechne mit etwa zehn Minuten, danach etwa fünf.$noMic"
             repeatReason("live") != null -> repeatReason("live")!!
             repeatReason("vergleich") != null -> repeatReason("vergleich")!!
-            !tests.has("kidauer") -> "Jetzt der KI-Dauertest: Handy hinlegen, Kamera auf eine Person oder einen Gegenstand " +
-                "mit etwas Abstand zum Hintergrund. Vorher kannst du in der KI-Vorschau auf ein Motiv tippen und zusehen, " +
-                "wie der Hintergrund unscharf wird.$noMic"
+            !tests.has("vergleich") -> "Der Vergleichsclip fehlt noch. Starte den KI-Schnelltest bitte noch einmal und lass die App dabei offen."
+            !tests.has("kidauer") -> "Film zum Vergleich noch dieselbe Szene 10 Sekunden mit der OPPO-Kamera (Video, 4K, 30 fps). " +
+                "Danach der KI-Dauertest: Stell das Handy so hin, dass die Kamera auf eine Person oder einen Gegenstand " +
+                "in der Mitte zeigt, mit etwas Abstand zum Hintergrund.$noMic"
             repeatReason("kidauer") != null -> repeatReason("kidauer")!!
             else -> "Alles gemessen. Kopiere den Bericht und füge ihn bei mir im Chat ein. Die Clips liegen in der " +
                 "Galerie im Album $GALLERY_FOLDER. In der KI-Vorschau kannst du die Unschärfe weiter ausprobieren."
@@ -1753,7 +1805,9 @@ class MainActivity : ComponentActivity() {
     /** Warum ein Test noch einmal laufen sollte, oder null. */
     private fun repeatReason(key: String): String? {
         val r = readTests().optJSONObject(key) ?: return null
-        if (r.has("fehler")) return null
+        if (recordingSummary(key, r).first == Mark.FAIL) {
+            return "Eine Aufnahme hat nicht geklappt (siehe Ergebnis). Kopiere den Bericht und füge ihn bei mir im Chat ein."
+        }
         return when (r.optString("ende")) {
             "gestoppt" -> if (key == "kidauer") {
                 "Der KI-Dauertest wurde vorzeitig gestoppt. Starte ihn bitte noch einmal, er braucht die vollen 10 Minuten."

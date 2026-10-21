@@ -29,30 +29,12 @@ internal class FrameSlot {
     /** Drehung vom st-Raum der Pipeline zum aufrechten Bild (beim Hochkant-Halten 0). */
     var rotation = 0
 
-    fun copyFrom(other: FrameSlot) {
-        other.enc.rewind()
-        enc.rewind()
-        enc.put(other.enc)
-        enc.rewind()
-        other.enc.rewind()
-        other.depth.rewind()
-        depth.rewind()
-        depth.put(other.depth)
-        depth.rewind()
-        other.depth.rewind()
-        depthContent.set(other.depthContent)
-        timestampNs = other.timestampNs
-        prepMs = other.prepMs
-        width = other.width
-        height = other.height
-        rotation = other.rotation
-    }
-
     /**
-     * Kleines JPEG (Base64) dessen, was EdgeTAM bekommt, zurückgerechnet aus [enc]: zeigt im
-     * Bericht, ob das KI-Bild aufrecht steht und die Farben stimmen. Zeile 0 ist oben.
+     * Kleines Bild dessen, was EdgeTAM bekommt, zurückgerechnet aus [enc] (Zeile 0 oben): zeigt im
+     * Bericht, ob das KI-Bild aufrecht steht und die Farben stimmen. Schnell genug für den
+     * Pipeline-Thread; das JPEG macht [jpegBase64] daraus, gern auf einem anderen Thread.
      */
-    fun thumbnailJpegBase64(size: Int = THUMBNAIL): String {
+    fun thumbnailPixels(size: Int = THUMBNAIL): IntArray {
         val fb = enc.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
         val pixels = IntArray(size * size)
         val step = ENC.toFloat() / size
@@ -75,12 +57,11 @@ internal class FrameSlot {
                 pixels[y * size + x] = Color.rgb(byteOf(r / 4f), byteOf(g / 4f), byteOf(b / 4f))
             }
         }
-        val bitmap = Bitmap.createBitmap(pixels, size, size, Bitmap.Config.ARGB_8888)
-        val jpeg = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 75, jpeg)
-        bitmap.recycle()
-        return Base64.encodeToString(jpeg.toByteArray(), Base64.NO_WRAP)
+        return pixels
     }
+
+    /** [thumbnailPixels] als kleines JPEG (Base64) für den Bericht. */
+    fun thumbnailJpegBase64(size: Int = THUMBNAIL): String = jpegBase64(thumbnailPixels(size), size)
 
     companion object {
         const val ENC = 1024
@@ -89,6 +70,15 @@ internal class FrameSlot {
         const val THUMBNAIL = 128
 
         private fun byteOf(v: Float): Int = if (v.isNaN()) 0 else (v * 255f + 0.5f).toInt().coerceIn(0, 255)
+
+        /** Bildpunkte (ARGB, [size] × [size]) als JPEG in Base64; darf auf jedem Thread laufen. */
+        fun jpegBase64(pixels: IntArray, size: Int): String {
+            val bitmap = Bitmap.createBitmap(pixels, size, size, Bitmap.Config.ARGB_8888)
+            val jpeg = ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 75, jpeg)
+            bitmap.recycle()
+            return Base64.encodeToString(jpeg.toByteArray(), Base64.NO_WRAP)
+        }
     }
 }
 

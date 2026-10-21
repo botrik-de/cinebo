@@ -84,9 +84,6 @@ internal class AiEngine(private val context: Context) : AiDemand {
     var liveMetaDecoder = true
         private set
 
-    /** Ein Standbild für den Fall, dass die Kamera neben 4K keine Bilder für die KI liefert. */
-    private var still: FrameSlot? = null
-
     @Volatile var liveRunning = false
         private set
     @Volatile private var stopLive = false
@@ -147,13 +144,6 @@ internal class AiEngine(private val context: Context) : AiDemand {
     val stats = LiveStats()
 
     fun loaded(id: ModelId): Boolean = models.containsKey(id)
-
-    fun hasStill(): Boolean = still != null
-
-    /** Merkt sich ein Kamerabild als Standbild (Kopie). */
-    fun setStill(frame: FrameSlot) {
-        still = FrameSlot().also { it.copyFrom(frame) }
-    }
 
     /** Bereit für live: Tiefe geladen und eine volle Verfolgung aus geladenen Teilen gebaut. */
     fun liveReady(): Boolean = models.containsKey(ModelId.DEPTH) && tracker != null
@@ -241,7 +231,6 @@ internal class AiEngine(private val context: Context) : AiDemand {
 
     fun closeAll() {
         unload(ModelId.entries)
-        still = null
     }
 
     /** Warum sich zuletzt keine Verfolgung bauen ließ, obwohl die Teile geladen waren (für den Bericht). */
@@ -477,7 +466,6 @@ internal class AiEngine(private val context: Context) : AiDemand {
      * schnellere Memory-Attention und den schnelleren Memory-Encoder für live.
      */
     fun bench(frame: FrameSlot, progress: (String) -> Unit): JSONObject {
-        setStill(frame)
         // Wird gestoppt, bleibt die bisherige Wahl für live (wie im Leistungstest).
         val beforeAttn = liveAttn
         val beforeQcMemory = liveQcMemory
@@ -1200,10 +1188,9 @@ internal class AiEngine(private val context: Context) : AiDemand {
 
     /**
      * Läuft, bis [requestStop] kommt: nimmt das jeweils neueste Kamerabild aus der Grafik-Pipeline,
-     * verfolgt das Objekt, gibt die Maske an [maskSink] und rechnet die Tiefe. Kommen länger keine
-     * Kamerabilder und gibt es ein Standbild, rechnet sie darauf weiter (das steht dann im Bericht).
+     * verfolgt das Motiv, gibt die Maske an [maskSink] und rechnet die Tiefe.
      */
-    fun runLive(pool: FramePool, allowStill: Boolean) {
+    fun runLive(pool: FramePool) {
         val depth = models[ModelId.DEPTH] ?: error("Tiefenmodell nicht geladen")
         val t = tracker ?: error("EdgeTAM nicht geladen")
         val used = liveSet().mapNotNull { models[it] }
@@ -1211,7 +1198,6 @@ internal class AiEngine(private val context: Context) : AiDemand {
         t.reset()
         heat.reset()
         nextTake = 0L
-        var lastFrame = SystemClock.elapsedRealtime()
         var lastStart = 0L
         var expectedMs = Double.NaN
         try {
@@ -1232,29 +1218,13 @@ internal class AiEngine(private val context: Context) : AiDemand {
                         if (stopLive) break
                     }
                 }
-                // Kommen seit 600 ms keine Kamerabilder (die Kamera gibt neben 4K keins heraus),
-                // rechnet die KI ohne Pause auf dem Standbild weiter und schaut nur nach, ob doch
-                // wieder ein Kamerabild da ist. Bis Stufe 2b wartete sie jedes Mal 100 ms darauf;
-                // das halbierte die gemessene Rate.
-                val onStill = allowStill && still != null && SystemClock.elapsedRealtime() - lastFrame >= 600
+                // Die Pipeline sieht an aiWaiting, dass die KI auf ein Bild wartet, und liefert eins.
                 aiWaiting = true
-                val taken = try {
-                    pool.take(if (onStill) 0 else 100)
+                val slot = try {
+                    pool.take(100)
                 } finally {
                     aiWaiting = false
-                }
-                val slot: FrameSlot
-                val fromPool: Boolean
-                if (taken != null) {
-                    slot = taken
-                    fromPool = true
-                    lastFrame = SystemClock.elapsedRealtime()
-                } else {
-                    val s = still
-                    if (!allowStill || s == null || SystemClock.elapsedRealtime() - lastFrame < 600) continue
-                    slot = s
-                    fromPool = false
-                }
+                } ?: continue
                 try {
                     val start = System.nanoTime()
                     lastStart = SystemClock.elapsedRealtime()
@@ -1263,7 +1233,7 @@ internal class AiEngine(private val context: Context) : AiDemand {
                     nextTake = if (expectedMs.isNaN()) 0L else start + (max(expectedMs, gap.toDouble()) * 1e6).toLong()
                     // Wie alt das Kamerabild ist, wenn die KI es aufnimmt. Je nach Gerät zählt die
                     // Kamera ab Systemstart mit oder ohne Tiefschlaf.
-                    val age = if (fromPool) frameAgeMs(slot.timestampNs) else Double.NaN
+                    val age = frameAgeMs(slot.timestampNs)
                     val tap = pendingTap
                     if (tap != null) pendingTap = null
                     // Startbild: neu angetippt oder der erste Durchgang (Mitte des Bildes).
@@ -1277,7 +1247,7 @@ internal class AiEngine(private val context: Context) : AiDemand {
                     // sie auf dasselbe Bild, wenn sie es verzögert ausgibt (siehe BokehProcessor).
                     // Sie geht vor der Tiefe hinaus, damit die Pipeline weniger warten muss.
                     val masks = maskSink
-                    if (masks != null && fromPool) {
+                    if (masks != null) {
                         PipelineMath.maskProbabilities(t.mask(), maskBytes)
                         masks.onMask(slot.timestampNs, maskBytes, t.present)
                     }
@@ -1291,10 +1261,10 @@ internal class AiEngine(private val context: Context) : AiDemand {
                         attnMs = if (startFrame) Double.NaN else t.attnMs, decMs = t.decMs,
                         memMs = t.memMs, trackMs = t.totalMs, prepMs = slot.prepMs,
                         ageMs = age, resultAgeMs = age + aiMs,
-                        present = t.present, restart = tap != null, still = !fromPool
+                        present = t.present, restart = tap != null
                     )
                 } finally {
-                    if (fromPool) pool.release(slot)
+                    pool.release(slot)
                 }
             }
         } finally {
@@ -1356,7 +1326,6 @@ internal class LiveStats {
     private var windowPresent = 0
     private var totalPresent = 0
     private var restarts = 0
-    private var stillCycles = 0
 
     @Synchronized
     fun reset() {
@@ -1369,14 +1338,13 @@ internal class LiveStats {
         windowPresent = 0
         totalPresent = 0
         restarts = 0
-        stillCycles = 0
     }
 
     @Synchronized
     fun add(
         aiMs: Double, depthMs: Double, encMs: Double, attnMs: Double, decMs: Double, memMs: Double,
         trackMs: Double, prepMs: Double, ageMs: Double, resultAgeMs: Double,
-        present: Boolean, restart: Boolean, still: Boolean
+        present: Boolean, restart: Boolean
     ) {
         val values = listOf(aiMs, depthMs, encMs, attnMs, decMs, memMs, trackMs, prepMs, ageMs, resultAgeMs)
         for ((i, name) in names.withIndex()) {
@@ -1390,7 +1358,6 @@ internal class LiveStats {
             totalPresent++
         }
         if (restart) restarts++
-        if (still) stillCycles++
     }
 
     /** Alle Bilder seit dem letzten Zurücksetzen. */
@@ -1418,7 +1385,6 @@ internal class LiveStats {
     @Synchronized
     fun totalJson(): JSONObject = summary(total, totalCycles, totalPresent, totalStart)
         .put("neuAngetippt", restarts)
-        .put("aufStandbild", stillCycles)
 
     private fun summary(series: Map<String, Series>, cycles: Int, present: Int, since: Long): JSONObject {
         val seconds = (SystemClock.elapsedRealtime() - since) / 1000.0
