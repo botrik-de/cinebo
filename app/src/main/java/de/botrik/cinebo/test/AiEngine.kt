@@ -1204,7 +1204,7 @@ internal class AiEngine(private val context: Context) : AiDemand {
         heat.reset()
         nextTake = 0L
         wantDepth = true
-        var pass = 0L
+        var sinceDepth = 1_000
         var lastStart = 0L
         var expectedMs = Double.NaN
         try {
@@ -1235,6 +1235,14 @@ internal class AiEngine(private val context: Context) : AiDemand {
                 try {
                     val start = System.nanoTime()
                     lastStart = SystemClock.elapsedRealtime()
+                    // Wärmeregelung: Bei Hitze fällt zuerst die Tiefe weg (live noch nicht gebraucht),
+                    // damit die Verfolgung schnell genug für die Masken bleibt. Gleich zu Beginn
+                    // entscheiden, auch fürs nächste Bild: Die Pipeline bereitet es schon während
+                    // dieses Durchgangs vor und spart sich das Tiefenbild, wenn es nicht gebraucht wird.
+                    val every = heat.depthEvery()
+                    val runDepth = slot.hasDepth && every > 0 && sinceDepth + 1 >= every
+                    sinceDepth = if (runDepth) 0 else min(sinceDepth + 1, 1_000)
+                    wantDepth = every > 0 && sinceDepth + 1 >= every
                     // Wann die KI voraussichtlich das nächste Bild nimmt: Danach richtet die
                     // Grafik-Pipeline das nächste Bild ein, damit es frisch ist.
                     nextTake = if (expectedMs.isNaN()) 0L else start + (max(expectedMs, gap.toDouble()) * 1e6).toLong()
@@ -1259,10 +1267,6 @@ internal class AiEngine(private val context: Context) : AiDemand {
                         PipelineMath.maskProbabilities(t.mask(), maskBytes)
                         masks.onMask(slot.timestampNs, maskBytes, t.present, generation)
                     }
-                    // Wärmeregelung: Bei Hitze fällt zuerst die Tiefe weg (live noch nicht gebraucht),
-                    // damit die Verfolgung schnell genug für die Masken bleibt.
-                    val every = heat.depthEvery()
-                    val runDepth = slot.hasDepth && every > 0 && pass % every == 0L
                     val depthNative = if (runDepth) {
                         depth.run(arrayOf(slot.depth))
                         depth.lastNativeMs
@@ -1270,8 +1274,6 @@ internal class AiEngine(private val context: Context) : AiDemand {
                         heat.noteDepthSkipped()
                         Double.NaN
                     }
-                    pass++
-                    wantDepth = every > 0 && pass % every == 0L
                     val aiMs = (System.nanoTime() - start) / 1e6
                     expectedMs = if (expectedMs.isNaN()) aiMs else expectedMs * 0.8 + aiMs * 0.2
                     // Das Ergebnis ist fertig, wenn das Bild so alt ist wie beim Aufnehmen plus die Rechenzeit.

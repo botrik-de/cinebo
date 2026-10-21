@@ -145,6 +145,10 @@ internal class BokehProcessor(
     private var smallW = 1
     private var smallH = 1
     private var delay = 0
+    /** Zuletzt gezeigte Stärke der Unschärfe: Sie steigt höchstens um [BLUR_RAMP] je Bild, nie sprunghaft. */
+    private var shownBlur = 0f
+    /** Zeitstempel des ersten Bildes seit dem letzten Neubeginn; ältere Masken gehören nicht mehr dazu. */
+    private var flowStartNs = Long.MAX_VALUE
     private val queue = ArrayDeque<Slot>()
     private val freeSlots = ArrayDeque<Slot>()
     // Zwischenstufen: Viertel (Verkleinern), Hintergrund und Gauß-Zwischenschritt (Achtel).
@@ -316,6 +320,7 @@ internal class BokehProcessor(
         val ts = input.st.timestamp
         input.st.getTransformMatrix(stMatrix)
         stats.frameIn(ts)
+        if (flowStartNs == Long.MAX_VALUE) flowStartNs = ts
         try {
             uploadMasks()
             // Alles hier liegt im st-Raum: Die Matrix der SurfaceTexture dreht den quer
@@ -337,6 +342,7 @@ internal class BokehProcessor(
             }
             // Erst das Bild für Vorschau und Aufnahme, dann das KI-Bild: Das Lesen des KI-Bildes
             // wartet auf die Grafikeinheit und soll die Ausgabe nicht aufhalten.
+            val tOut = System.nanoTime()
             if (outputs.isNotEmpty()) {
                 if (strength > 0f && ensureRing(Size(sw, sh))) {
                     pushRing(input, ts, sw, sh)
@@ -345,8 +351,15 @@ internal class BokehProcessor(
                     drawDirect(input, ts)
                 }
             }
+            val outMs = (System.nanoTime() - tOut) / 1e6
+            // Ein GL-Fehler der Ausgabe gehört zur Ausgabe, nicht zum folgenden KI-Bild.
+            val glError = GLES30.glGetError()
+            if (glError != GLES30.GL_NO_ERROR) {
+                drainGlErrors()
+                stats.outputFailed("GL-Fehler 0x${Integer.toHexString(glError)}")
+            }
             val aiMs = if (aiPool != null) maybeAiFrame(input, ts, sw, sh, upright) else Double.NaN
-            stats.frameDone((System.nanoTime() - t0) / 1e6, aiMs)
+            stats.frameDone((System.nanoTime() - t0) / 1e6, outMs, aiMs)
         } catch (e: Throwable) {
             stats.error("Bild", e)
         }
@@ -354,6 +367,7 @@ internal class BokehProcessor(
 
     /** Ohne Unschärfe: Kamerabild direkt in jede Ausgabe, mit seinem Zeitstempel. */
     private fun drawDirect(input: Input, ts: Long) {
+        var failure: String? = null
         for (o in outputs.toList()) {
             try {
                 o.target.updateTransformMatrix(o.matrix, stMatrix)
@@ -365,11 +379,12 @@ internal class BokehProcessor(
                 copyOes.int("uCam", 0)
                 copyOes.mat("uTex", o.matrix)
                 drawTriangle()
-                present(o, ts)
+                present(o, ts)?.let { failure = it }
             } catch (e: Throwable) {
-                stats.error("Ausgabe", e)
+                failure = "${e.javaClass.simpleName}: ${e.message}"
             }
         }
+        failure?.let { stats.outputFailed(it) }
         stats.frameOut(ts, null, blurred = false, subject = false, stale = false, gapNs = -1L)
     }
 
@@ -436,10 +451,16 @@ internal class BokehProcessor(
             }
             val presentA = pick != null && maskPresent[pick.a]
             val presentB = pick != null && maskPresent[pick.b]
-            val blur = if (pick != null && (presentA || presentB)) strength * fade else 0f
+            // Nach oben höchstens um BLUR_RAMP je Bild (≈ 0,27 s bis voll), etwa wenn die KI nach
+            // einem Stocken wieder Masken liefert; nach unten folgt sie gleich (Masken und Alter
+            // blenden dort schon weich über).
+            val target = if (pick != null && (presentA || presentB)) strength * fade else 0f
+            val blur = if (target > shownBlur) minOf(target, shownBlur + BLUR_RAMP) else target
+            shownBlur = blur
             val bufToMask = PipelineMath.bufferToUpright(upright)
             if (pick != null && blur > 0f) renderBackground(slot, pick, presentA, presentB, bufToMask)
             val stInverse = PipelineMath.invert(stMatrix) ?: PipelineMath.identity()
+            var failure: String? = null
             for (o in outputs.toList()) {
                 try {
                     o.target.updateTransformMatrix(o.matrix, stMatrix)
@@ -467,11 +488,12 @@ internal class BokehProcessor(
                     composite.vec2("uPresent", if (presentA) 1f else 0f, if (presentB) 1f else 0f)
                     composite.float("uStrength", blur)
                     drawTriangle()
-                    present(o, slot.ts)
+                    present(o, slot.ts)?.let { failure = it }
                 } catch (e: Throwable) {
-                    stats.error("Ausgabe", e)
+                    failure = "${e.javaClass.simpleName}: ${e.message}"
                 }
             }
+            failure?.let { stats.outputFailed(it) }
             val gapNs = if (pick != null && pick.a != pick.b) maskNs[pick.b] - maskNs[pick.a] else -1L
             stats.frameOut(slot.ts, pick, blurred = true, subject = blur > 0f, stale = stale, gapNs = gapNs)
         } finally {
@@ -516,9 +538,11 @@ internal class BokehProcessor(
         drawTriangle()
     }
 
-    private fun present(o: Output, ts: Long) {
+    /** Bild mit dem Zeitstempel der Kamera abgeben; null = geklappt, sonst was schiefging. */
+    private fun present(o: Output, ts: Long): String? {
         EGLExt.eglPresentationTimeANDROID(display, o.egl, ts)
-        if (!EGL14.eglSwapBuffers(display, o.egl)) stats.swapFailed(EGL14.eglGetError())
+        if (EGL14.eglSwapBuffers(display, o.egl)) return null
+        return "eglSwapBuffers: EGL-Fehler 0x${Integer.toHexString(EGL14.eglGetError())}"
     }
 
     // ---------------------------------------------------- Bilder für die KI
@@ -651,6 +675,8 @@ internal class BokehProcessor(
     private fun uploadMasks() {
         while (true) {
             val m = synchronized(pendingLock) { pending.removeFirstOrNull() } ?: return
+            // Masken zu Bildern vor dem letzten Neubeginn (neuer Eingang, neue Lage) passen nicht mehr.
+            if (m.ns < flowStartNs) continue
             val i = maskNext
             maskNext = (maskNext + 1) % MASKS
             if (maskCount < MASKS) maskCount++
@@ -711,6 +737,8 @@ internal class BokehProcessor(
         queue.clear()
         maskCount = 0
         maskNext = 0
+        shownBlur = 0f
+        flowStartNs = Long.MAX_VALUE
         synchronized(pendingLock) { pending.clear() }
     }
 
@@ -1109,6 +1137,8 @@ internal class BokehProcessor(
         const val BLUR_SIGMA = 3.5
         /** Bis 0,4 s Abstand gilt eine Maske als aktuell; ältere lassen die Unschärfe ausklingen. */
         const val MAX_MASK_DISTANCE_NS = 400_000_000L
+        /** So viel Unschärfe kommt je Bild höchstens dazu: von null bis voll in 8 Bildern. */
+        const val BLUR_RAMP = 0.125f
         /** So viel früher, als die KI das nächste Bild nimmt, bereitet die Pipeline es vor. */
         const val LEAD_MS = 45.0
         const val MASKS = 8
@@ -1141,8 +1171,8 @@ internal class PipelineStats {
     private var gaps = 0
     private var lostEstimate = 0
     private var dropped = 0
-    private var swapFailures = 0
-    private var lastSwapError = 0
+    private var outputFailures = 0
+    private var lastOutputFailure = ""
     private var lastIn = 0L
     private var lastOut = 0L
     private var aiFrames = 0
@@ -1151,12 +1181,14 @@ internal class PipelineStats {
     private var outOfOrder = 0
     private var thumbnail: String? = null
     private val intervals = Series()
-    private val frameCpuMs = Series()
+    private val frameMs = Series()
+    private val outMs = Series()
     private val aiMs = Series()
     private val oneSidedMs = Series()
     private val maskGapMs = Series()
     // Abschnitt für den Verlauf (etwa alle 30 s).
-    private val windowFrameCpuMs = Series()
+    private val windowFrameMs = Series()
+    private var windowOutputFailures = 0
     private var windowIn = 0
     private var windowOut = 0
     private var windowGaps = 0
@@ -1198,19 +1230,20 @@ internal class PipelineStats {
         gaps = 0
         lostEstimate = 0
         dropped = 0
-        swapFailures = 0
+        outputFailures = 0
         lastIn = 0L
         lastOut = 0L
         aiFrames = 0
         aiFramesWithoutDepth = 0
         masksIn = 0
         outOfOrder = 0
-        for (series in listOf(intervals, frameCpuMs, aiMs, oneSidedMs, maskGapMs, windowFrameCpuMs)) series.clear()
+        for (series in listOf(intervals, frameMs, outMs, aiMs, oneSidedMs, maskGapMs, windowFrameMs)) series.clear()
         clearWindow()
     }
 
     private fun clearWindow() {
-        windowFrameCpuMs.clear()
+        windowFrameMs.clear()
+        windowOutputFailures = 0
         windowIn = 0
         windowOut = 0
         windowGaps = 0
@@ -1270,10 +1303,16 @@ internal class PipelineStats {
         lastIn = ts
     }
 
-    /** Rechenzeit des Pipeline-Threads für ein Bild (CPU, ohne die Grafikeinheit) und fürs KI-Bild. */
-    fun frameDone(totalMs: Double, aiFrameMs: Double) = synchronized(lock) {
-        frameCpuMs.add(totalMs)
-        windowFrameCpuMs.add(totalMs)
+    /**
+     * Zeit auf dem Pipeline-Thread für ein Bild, davon für die Ausgabe und fürs KI-Bild. Das ist
+     * Uhrzeit, keine reine Rechenzeit: Warten auf die Grafikeinheit (Lesen des KI-Bildes) und auf
+     * freie Puffer (Abgabe des Bildes) zählt mit. Dauert ein Bild länger als ein Bildabstand,
+     * droht ein verlorenes Bild.
+     */
+    fun frameDone(totalMs: Double, outputMs: Double, aiFrameMs: Double) = synchronized(lock) {
+        frameMs.add(totalMs)
+        windowFrameMs.add(totalMs)
+        outMs.add(outputMs)
         aiMs.add(aiFrameMs)
     }
 
@@ -1311,9 +1350,11 @@ internal class PipelineStats {
 
     fun dropped() = synchronized(lock) { dropped++ }
 
-    fun swapFailed(eglError: Int) = synchronized(lock) {
-        swapFailures++
-        lastSwapError = eglError
+    /** Ein Bild ließ sich nicht (in alle Ausgaben) abgeben; einmal je Bild gezählt. */
+    fun outputFailed(what: String) = synchronized(lock) {
+        outputFailures++
+        windowOutputFailures++
+        lastOutputFailure = what.take(200)
     }
 
     fun aiFrame(withDepth: Boolean) = synchronized(lock) {
@@ -1339,7 +1380,8 @@ internal class PipelineStats {
     /** Abschnitt für den Verlauf (etwa alle 30 s). */
     fun closeWindow(): JSONObject = synchronized(lock) {
         val o = JSONObject().put("bilderEin", windowIn).put("bilderAus", windowOut).put("luecken", windowGaps)
-        windowFrameCpuMs.json()?.let { o.put("jeBildCpuMs", it) }
+        windowFrameMs.json()?.let { o.put("jeBildMs", it) }
+        if (windowOutputFailures > 0) o.put("ausgabeFehler", windowOutputFailures)
         if (windowWithMask > 0) {
             o.put("gemischtProzent", Math.round(windowMixed * 100.0 / windowWithMask))
             if (windowStale > 0) o.put("alteMaskeProzent", Math.round(windowStale * 100.0 / windowWithMask))
@@ -1355,7 +1397,7 @@ internal class PipelineStats {
             .put("fehlendeBilderGeschaetzt", lostEstimate)
         if (dropped > 0) o.put("verworfen", dropped)
         if (outOfOrder > 0) o.put("zeitRueckwaerts", outOfOrder)
-        if (swapFailures > 0) o.put("ausgabeFehler", swapFailures).put("letzterEglFehler", "0x" + Integer.toHexString(lastSwapError))
+        if (outputFailures > 0) o.put("ausgabeFehler", outputFailures).put("letzterAusgabeFehler", lastOutputFailure)
         if (aiFrames > 0 || masksIn > 0) {
             o.put("kiBilder", aiFrames).put("masken", masksIn)
             if (aiFramesWithoutDepth > 0) o.put("kiBilderOhneTiefe", aiFramesWithoutDepth)
@@ -1371,11 +1413,12 @@ internal class PipelineStats {
         }
         val ms = JSONObject()
         intervals.json()?.let { ms.put("bildabstand", it) }
-        frameCpuMs.json()?.let { ms.put("jeBildCpu", it) }
+        frameMs.json()?.let { ms.put("jeBild", it) }
+        outMs.json()?.let { ms.put("ausgabe", it) }
         aiMs.json()?.let { ms.put("kiBild", it) }
         // Nur eine Maske in der Nähe: wie weit sie vom Bild weg war. Zwei Masken: wie weit sie auseinanderlagen.
         oneSidedMs.json()?.let { ms.put("maskeEinseitig", it) }
-        maskGapMs.json()?.let { ms.put("maskenAbstand", it) }
+        maskGapMs.json()?.let { ms.put("maskenLuecke", it) }
         o.put("ms", ms)
         if (notes.length() > 0) o.put("hinweise", JSONArray(notes.toString()))
         thumbnail?.let { o.put("kiBildJpegBase64", it) }

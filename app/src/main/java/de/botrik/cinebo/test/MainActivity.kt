@@ -1735,7 +1735,9 @@ class MainActivity : ComponentActivity() {
         }
         val blurred = Math.round(p.optInt("mitMotiv") * 100.0 / frames).toInt()
         val withoutMask = Math.round(p.optInt("ohneMaske") * 100.0 / frames).toInt()
-        val stale = Math.round(p.optInt("mitAlterMaske") * 100.0 / frames).toInt()
+        // Wie gemischtProzent bezogen auf die Bilder, die eine KI-Maske hatten.
+        val withMaskFrames = frames - p.optInt("ohneMaske")
+        val stale = if (withMaskFrames > 0) Math.round(p.optInt("mitAlterMaske") * 100.0 / withMaskFrames).toInt() else 0
         val mixed = p.optInt("gemischtProzent")
         var text = "Hintergrund auf $blurred % der Bilder unscharf, $mixed % zwischen zwei KI-Masken gemischt"
         if (withoutMask > 5) text += ", $withoutMask % ohne KI-Maske"

@@ -3,6 +3,7 @@
 // weigh.frag). 13 Pixel breit, über 7 bilineare Abgriffe: Mitte plus je drei Paare, deren
 // Gewichte und Abstände die App vorab ausrechnet (uWeight, uOffset).
 precision highp float;
+precision highp sampler2D;   // Halbfloat-Texturen mit voller Genauigkeit lesen
 
 uniform sampler2D uSrc;
 uniform vec2 uDir;          // ein Pixel in Abtastrichtung

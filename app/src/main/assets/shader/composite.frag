@@ -3,6 +3,7 @@
 // reinem Hintergrund (siehe weigh.frag). Die Maske für diesen Zeitpunkt mischt die KI-Masken
 // davor (A) und danach (B).
 precision highp float;
+precision highp sampler2D;   // Halbfloat-Texturen mit voller Genauigkeit lesen
 
 uniform sampler2D uSharp;     // Kamerabild im st-Raum (Ring)
 uniform sampler2D uBg;        // Hintergrund verkleinert, gewichtet und unscharf: (rgb · w, w)
