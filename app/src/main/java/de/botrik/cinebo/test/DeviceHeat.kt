@@ -6,6 +6,7 @@ import android.content.IntentFilter
 import android.os.BatteryManager
 import android.os.Build
 import android.os.PowerManager
+import android.os.SystemClock
 import org.json.JSONObject
 
 /** Wärme und Akku: was Android fremden Apps darüber verrät. */
@@ -45,6 +46,9 @@ object DeviceHeat {
         return o
     }
 
+    /** Name der Wärmestufe zu ihrer Nummer (0 keine bis 6 Abschaltung). */
+    fun stageNameAt(status: Int): String = stageOrder.getOrElse(status) { status.toString() }
+
     /** Ab welchem Drosselindex das System welche Stufe meldet (ab Android 15). */
     fun thresholds(context: Context): JSONObject? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM) return null
@@ -52,5 +56,75 @@ object DeviceHeat {
         val o = JSONObject()
         for ((status, value) in pm.thermalHeadroomThresholds) o.put(stageName(status), r2(value.toDouble()))
         return o
+    }
+}
+
+/**
+ * Wärmeregelung der KI: liest die Wärmestufe höchstens alle 2 s und sagt, wie viel Abstand
+ * zwei KI-Durchgänge mindestens haben sollen (siehe [PipelineMath.minIntervalMs]). Zählt mit,
+ * wie lange jede Stufe galt und wie oft die KI deshalb wartete. Nur vom KI-Thread benutzen.
+ */
+internal class HeatGovernor(context: Context) {
+    private val pm = context.getSystemService(PowerManager::class.java)
+    private val seconds = DoubleArray(7)
+    private var lastRead = 0L
+    private var lastAccount = 0L
+    private var waits = 0
+    private var waitedMs = 0L
+    private var running = false
+
+    /** Aktuelle Wärmestufe (0 keine bis 6 Abschaltung). */
+    var status = 0
+        private set
+
+    /** Beim Start der Live-Schleife: Zählung von vorn. */
+    fun reset() {
+        seconds.fill(0.0)
+        lastRead = 0L
+        lastAccount = SystemClock.elapsedRealtime()
+        waits = 0
+        waitedMs = 0L
+        status = 0
+        running = true
+    }
+
+    /** Beim Ende der Live-Schleife: Die Zeit danach zählt nicht mehr mit. */
+    fun finish() {
+        if (!running) return
+        account(SystemClock.elapsedRealtime())
+        running = false
+    }
+
+    /** Mindestabstand zwischen zwei Durchgängen in ms (0 = keiner). */
+    fun minIntervalMs(): Long {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastRead >= 2000L) {
+            account(now)
+            status = pm.currentThermalStatus.coerceIn(0, 6)
+            lastRead = now
+        }
+        return PipelineMath.minIntervalMs(status)
+    }
+
+    /** Die KI hat [ms] gewartet, weil die Wärmeregelung bremste. */
+    fun noteWait(ms: Long) {
+        waits++
+        waitedMs += ms
+    }
+
+    private fun account(now: Long) {
+        if (lastAccount > 0L) seconds[status] += (now - lastAccount) / 1000.0
+        lastAccount = now
+    }
+
+    fun toJson(): JSONObject {
+        if (running) account(SystemClock.elapsedRealtime())
+        val stages = JSONObject()
+        for (i in seconds.indices) if (seconds[i] > 0.0) stages.put(DeviceHeat.stageNameAt(i), r1(seconds[i]))
+        return JSONObject()
+            .put("sekundenJeStufe", stages)
+            .put("gebremsteDurchgaenge", waits)
+            .put("gewartetS", r1(waitedMs / 1000.0))
+            .put("regel", "ab stark höchstens 5/s, ab kritisch 3/s, ab Notfall 1/s")
     }
 }

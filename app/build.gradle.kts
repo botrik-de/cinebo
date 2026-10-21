@@ -6,9 +6,9 @@ plugins {
 }
 
 // Jede Version aus GitHub Actions bekommt eine eigene, steigende Nummer.
-// Der Name (z. B. 0.2.7) kommt aus dem Bau-Ablauf, damit App und Release gleich heißen.
+// Der Name (z. B. 0.3.15) kommt aus dem Bau-Ablauf, damit App und Release gleich heißen.
 val buildNumber = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
-val versionLabel = System.getenv("CINEBO_VERSION") ?: "0.2.$buildNumber"
+val versionLabel = System.getenv("CINEBO_VERSION") ?: "0.3.$buildNumber"
 
 // Eine Stelle für Qualcomms QNN-Version (gradle.properties): Der Delegate in der App und die
 // QNN-Laufzeit, die die App selbst lädt, müssen zusammenpassen.

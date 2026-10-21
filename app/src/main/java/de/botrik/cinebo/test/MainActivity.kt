@@ -3,6 +3,7 @@ package de.botrik.cinebo.test
 import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -17,10 +18,10 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import android.os.SystemClock
+import android.provider.MediaStore
 import android.provider.Settings
 import android.text.TextUtils
 import android.util.Range
-import android.util.Size
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -42,13 +43,12 @@ import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.Camera
+import androidx.camera.core.CameraEffect
 import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
-import androidx.camera.core.UseCase
+import androidx.camera.core.UseCaseGroup
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
-import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FileOutputOptions
 import androidx.camera.video.Quality
@@ -78,29 +78,31 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.util.concurrent.Executors
+import java.io.IOException
 import kotlin.coroutines.resume
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * Test-App, Stufe 2b des Machbarkeitstests: Wie schnell laufen Tiefe (Depth Anything V2) und
- * Verfolgung (EdgeTAM) auf dem KI-Chip in seiner besten Einstellung, mit schnelleren Bausteinen
- * und als Schnellverfolgung, auch während einer 4K-Aufnahme und über 10 Minuten? Alles landet
- * in einem Bericht, den man kopieren oder teilen kann.
+ * Test-App, Stufe 3 des Machbarkeitstests: Die Grafik-Pipeline sitzt als CameraX-Effekt vor
+ * Vorschau und Videoaufnahme. Sie gibt der KI echte Kamerabilder während der 4K-Aufnahme,
+ * legt die Maske der Verfolgung auf genau das Bild, zu dem sie gehört, und macht den
+ * Hintergrund unscharf; eine Wärmeregelung nimmt die KI bei Hitze zurück. Clips mit und ohne
+ * Unschärfe landen in der Galerie, alle Messwerte in einem Bericht zum Kopieren oder Teilen.
  */
 class MainActivity : ComponentActivity() {
 
     private companion object {
-        val ORDER = listOf("kichip", "leistung", "tiefe", "verfolgung", "live", "kidauer")
+        val ORDER = listOf("kichip", "leistung", "tiefe", "verfolgung", "live", "vergleich", "kidauer")
 
         val TITLES = mapOf(
             "kichip" to "KI-Chip",
             "leistung" to "Leistungsstufen · KI-Chip",
             "tiefe" to "Tiefe · Depth Anything",
             "verfolgung" to "Verfolgung · EdgeTAM",
-            "live" to "Live mit 4K · 30 s",
+            "live" to "4K mit Unschärfe · 30 s",
+            "vergleich" to "Vergleichsclip · 10 s",
             "kidauer" to "KI-Dauertest · 10 min"
         )
 
@@ -109,17 +111,28 @@ class MainActivity : ComponentActivity() {
             "leistung" to "Misst jedes Modell in jeder Leistungsstufe des KI-Chips und nimmt die schnellste.",
             "tiefe" to "Wie schnell und wie genau der KI-Chip die Tiefe eines Bildes schätzt.",
             "verfolgung" to "Wie schnell EdgeTAM ein Objekt Bild für Bild wiederfindet, mit Speicher und als Schnellverfolgung.",
-            "live" to "30 Sekunden 4K mit 30 fps, beide Modelle rechnen auf dem Kamerabild mit.",
-            "kidauer" to "10 Minuten 4K mit beiden Modellen: Tempo, Wärme und Akku."
+            "live" to "30 Sekunden 4K mit 30 fps: Die KI verfolgt das Motiv, der Hintergrund wird unscharf. Der Clip kommt in die Galerie.",
+            "vergleich" to "10 Sekunden 4K ohne Grafik-Pipeline, wie CameraX allein filmt: zum Vergleich mit dem Unschärfe-Clip und der OPPO-Kamera. Der Clip kommt in die Galerie.",
+            "kidauer" to "10 Minuten 4K mit Unschärfe und Wärmeregelung: Tempo, Wärme und Akku."
         )
 
         const val LIVE_SECONDS = 30
+        const val COMPARE_SECONDS = 10
         const val LONG_SECONDS = 600
         const val LOG_EVERY_S = 30.0
         const val FPS = 30
 
-        /** Ziel aus dem Plan: Die KI schafft 10–15 Durchgänge pro Sekunde (beide Modelle zusammen). */
+        /** Album der Clips in der Galerie. */
+        const val GALLERY_FOLDER = "CineBo"
+
+        /** Ziel aus dem Plan für die Einzelmessung: Die KI schafft 10–15 Durchgänge pro Sekunde (beide Modelle zusammen). */
         const val TARGET_HZ = 10.0
+
+        /**
+         * Darunter liegen die Masken der KI mehr als 0,2 s auseinander und die Unschärfe hinkt bei
+         * Bewegung sichtbar; die Wärmeregelung darf so weit bremsen, das steht dann gelb da.
+         */
+        const val MIN_LIVE_HZ = 5.0
 
         val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
         val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
@@ -160,15 +173,17 @@ class MainActivity : ComponentActivity() {
     private val engineLazy = lazy { AiEngine(applicationContext) }
     private val engine by engineLazy
     private val pool = FramePool()
-    private val prep by lazy { FramePrep() }
-    private val analyzerExecutor = Executors.newSingleThreadExecutor { Thread(it, "analyse") }
-    @Volatile private var feeding = false
-    @Volatile private var prepError: String? = null
-    private var analysisSize: String? = null
+    /** Die Grafik-Pipeline der aktuellen Bindung (null: nur Vorschau). */
+    private var pipeline: BokehProcessor? = null
+    /** Für ein einzelnes Kamerabild ohne laufende KI: die Pipeline liefert, solange [on] gilt. */
+    private val grabDemand = object : AiDemand {
+        @Volatile var on = false
+        override val nextTakeNs: Long get() = 0L
+        override val waiting: Boolean get() = on
+    }
     private var liveJob: Job? = null
     private var liveError: String? = null
     private var badgeJob: Job? = null
-    @Volatile private var liveVisible = false
 
     private var job: Job? = null
     private var running: String? = null
@@ -195,8 +210,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var previewBox: FrameLayout
     private lateinit var stage: StageLayout
     private lateinit var previewView: PreviewView
-    private lateinit var maskOverlay: MaskOverlay
-    private lateinit var depthView: DepthView
+    private lateinit var tapOverlay: TapOverlay
     private lateinit var recBadge: TextView
     private lateinit var aiBadge: TextView
     private lateinit var permissionPanel: LinearLayout
@@ -227,34 +241,6 @@ class MainActivity : ComponentActivity() {
             result: TotalCaptureResult
         ) {
             if (counting) frames.add(result)
-        }
-    }
-
-    /** Bereitet Kamerabilder für die KI vor, aber nur, wenn sie gerade welche braucht. */
-    private val analyzer = ImageAnalysis.Analyzer { image ->
-        try {
-            if (!feeding) return@Analyzer
-            val slot = pool.acquire() ?: return@Analyzer
-            try {
-                prep.fill(image, slot)
-                pool.publish(slot)
-            } catch (e: Throwable) {
-                pool.giveBack(slot)
-                prepError = e.toString().take(300)
-            }
-        } finally {
-            image.close()
-        }
-    }
-
-    /** Bilder der KI für die Vorschau (kommt vom KI-Thread). */
-    private val sink = object : LiveSink {
-        override fun onPictures(depth: IntArray, mask: IntArray, present: Boolean) {
-            previewBox.post {
-                if (!liveVisible) return@post
-                depthView.show(depth)
-                if (present) maskOverlay.showMask(mask) else maskOverlay.clearMask()
-            }
         }
     }
 
@@ -474,9 +460,11 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        feeding = false
+        grabDemand.on = false
+        // CameraX löst die Kamera mit dem Lebenszyklus; die Pipeline wartet, bis CameraX sie freigibt.
+        pipeline?.release()
+        pipeline = null
         if (engineLazy.isInitialized()) engine.shutdown()
-        analyzerExecutor.shutdown()
         super.onDestroy()
     }
 
@@ -515,57 +503,40 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Verbindet Vorschau, falls angegeben Videoaufnahme, und falls gewünscht Bilder für die KI
-     * mit der Hauptkamera. Schafft die Kamera die Bilder für die KI neben 4K nicht in 1280 × 720,
-     * versucht sie 640 × 360 und zuletzt ganz ohne; was geklappt hat, steht in [analysisSize].
+     * Verbindet Vorschau und, falls angegeben, Videoaufnahme mit der Hauptkamera. Mit [effect]
+     * sitzt die Grafik-Pipeline als CameraX-Effekt davor: CameraX teilt dann einen Kamerastrom,
+     * schickt ihn durch die Pipeline und kopiert ihre Ausgabe in Vorschau und Video. Die Pipeline
+     * der vorigen Bindung gibt diese Funktion frei, sobald CameraX sie nicht mehr braucht.
      */
     @OptIn(ExperimentalCamera2Interop::class)
-    private fun bind(videoCapture: VideoCapture<Recorder>?, withAnalysis: Boolean = false): Camera {
+    private fun bind(videoCapture: VideoCapture<Recorder>?, effect: BokehProcessor? = null): Camera {
         val p = provider ?: throw IllegalStateException("Kamera noch nicht bereit")
+        // Streng 16:9: Sonst wählt CameraX 1.4 für den geteilten Strom ein 4:3-Sensorformat, das
+        // Video wäre ein hochgerechneter Ausschnitt und die Vorschau zeigte mehr als das Video.
         val builder = Preview.Builder().setResolutionSelector(
             ResolutionSelector.Builder()
-                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+                .setAspectRatioStrategy(AspectRatioStrategy(AspectRatio.RATIO_16_9, AspectRatioStrategy.FALLBACK_RULE_NONE))
                 .build()
         )
-        Camera2Interop.Extender(builder).setSessionCaptureCallback(captureCallback)
+        val interop = Camera2Interop.Extender(builder).setSessionCaptureCallback(captureCallback)
+        if (videoCapture != null || effect != null) {
+            // Geteilter Strom: CameraX 1.4 übernimmt die Bildrate der Videoaufnahme dann nicht.
+            interop.setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(FPS, FPS))
+        }
         val newPreview = builder.build()
         newPreview.setSurfaceProvider(previewView.surfaceProvider)
         p.unbindAll()
+        pipeline?.release()
+        pipeline = effect
         preview = newPreview
-        analysisSize = null
-        if (!withAnalysis) return bindUseCases(p, listOfNotNull(newPreview, videoCapture))
-        var lastError: Exception? = null
-        for (size in listOf(Size(1280, 720), Size(640, 360))) {
-            val analysis = buildAnalysis(size)
-            try {
-                val camera = bindUseCases(p, listOfNotNull(newPreview, videoCapture, analysis))
-                val real = analysis.resolutionInfo?.resolution
-                analysisSize = if (real != null) "${real.width}x${real.height}" else "${size.width}x${size.height}"
-                return camera
-            } catch (e: Exception) {
-                lastError = e
-                p.unbindAll()
-            }
+        val group = UseCaseGroup.Builder().addUseCase(newPreview)
+        if (videoCapture != null) group.addUseCase(videoCapture)
+        if (effect != null) {
+            val targets = CameraEffect.PREVIEW or if (videoCapture != null) CameraEffect.VIDEO_CAPTURE else 0
+            group.addEffect(PipelineEffect(targets, effect))
         }
-        analysisSize = "keine: ${lastError?.message ?: "unbekannt"}".take(200)
-        return bindUseCases(p, listOfNotNull(newPreview, videoCapture))
+        return p.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, group.build())
     }
-
-    private fun bindUseCases(p: ProcessCameraProvider, useCases: List<UseCase>): Camera =
-        p.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, *useCases.toTypedArray())
-
-    private fun buildAnalysis(size: Size): ImageAnalysis =
-        ImageAnalysis.Builder()
-            .setResolutionSelector(
-                ResolutionSelector.Builder()
-                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
-                    .setResolutionStrategy(ResolutionStrategy(size, ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
-                    .build()
-            )
-            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-            .build()
-            .also { it.setAnalyzer(analyzerExecutor, analyzer) }
 
     /** Nur die Vorschau; gibt zurück, ob sie läuft. Ein Fehler steht danach in der Statuszeile. */
     private fun showPreviewOnly(): Boolean = try {
@@ -694,13 +665,15 @@ class MainActivity : ComponentActivity() {
     /**
      * KI-Schnelltest: KI-Chip prüfen und alle Modelle laden (wie in Stufe 2), die Leistungsstufen
      * des Chips vergleichen, in der schnellsten jedes Modell und jede Kette messen, mit der CPU und
-     * Metas Original vergleichen und zuletzt 30 Sekunden 4K filmen, während beide mitrechnen.
+     * Metas Original vergleichen, dann 30 Sekunden 4K mit Unschärfe filmen, während beide Modelle
+     * mitrechnen, und zuletzt 10 Sekunden ohne Unschärfe zum Vergleich.
      */
     private fun runQuickTest() = launchTest {
-        hintOverride = "Lass die App offen und richte die Kamera auf eine Szene mit einem Gegenstand in der Mitte. " +
-            "Der Test dauert beim ersten Mal etwa zehn Minuten, danach etwa fünf."
+        hintOverride = "Lass die App offen und richte die Kamera auf eine Person oder einen Gegenstand in der Mitte, " +
+            "mit etwas Abstand zum Hintergrund. Der Test dauert beim ersten Mal etwa zehn Minuten, danach etwa fünf."
         val tests = readTests()
         tests.remove("live")
+        tests.remove("vergleich")
         report.remove("ki")
 
         running = "kichip"
@@ -738,9 +711,9 @@ class MainActivity : ComponentActivity() {
         running = "leistung"
         render()
         reveal("leistung")
-        val frame = cameraFrame()
+        val (frame, frameInfo) = cameraFrame()
         try {
-            ki.put("bild", frameInfo(frame))
+            ki.put("bild", frameInfo)
             val perf = withContext(engine.dispatcher) {
                 engine.perfMatrix(frame) { what, done, total ->
                     runOnUiThread { setStatus(Phase.BUSY, "Leistungsstufen · ${min(done + 1, total)} von $total · $what", null, done / total.toFloat()) }
@@ -799,54 +772,62 @@ class MainActivity : ComponentActivity() {
         running = "live"
         render()
         reveal("live")
-        putTest("live", recordWithAi("live", LIVE_SECONDS))
+        putTest("live", recordWithAi("live", LIVE_SECONDS, keepClip = true))
+        if (stopRequested) return@launchTest
+
+        running = "vergleich"
+        render()
+        reveal("vergleich")
+        putTest("vergleich", recordComparison())
         doneText = "KI-Schnelltest fertig"
     }
 
-    /** Ein vorbereitetes Kamerabild für die KI (ohne Aufnahme); der Aufrufer gibt es mit pool.release zurück. */
-    private suspend fun cameraFrame(): FrameSlot {
+    /**
+     * Ein vorbereitetes Kamerabild für die KI (ohne Aufnahme), aus der Grafik-Pipeline wie live,
+     * samt Angaben für den Bericht. Danach läuft wieder die einfache Vorschau, damit die Pipeline
+     * die Messungen nicht mit Grafikarbeit stört. Der Aufrufer gibt das Bild mit pool.release zurück.
+     */
+    private suspend fun cameraFrame(): Pair<FrameSlot, JSONObject> {
         setStatus(Phase.BUSY, "Holt ein Kamerabild …")
-        bind(null, withAnalysis = true)
+        val effect = BokehProcessor(applicationContext, strength = 0f, aiPool = pool, aiDemand = grabDemand, thumbnailAfter = 1)
+        bind(null, effect)
         delay(300)
         waitForStreaming(5000)
         delay(1500) // Belichtung und Weißabgleich einpendeln lassen
-        return grabFrame() ?: throw IllegalStateException(
-            "Die Kamera liefert keine Bilder für die KI (${analysisSize ?: "?"})" +
-                (prepError?.let { ". Vorbereitung: $it" } ?: ".")
+        val frame = grabFrame() ?: throw IllegalStateException(
+            "Die Grafik-Pipeline liefert keine Kamerabilder für die KI" + pipelineNote(effect)
         )
+        val info = frameInfo(frame, effect)
+        showPreviewOnly()
+        return frame to info
+    }
+
+    /** Was die Pipeline über sich weiß, als Satzende für eine Fehlermeldung. */
+    private fun pipelineNote(effect: BokehProcessor): String {
+        val o = effect.stats.toJson()
+        val notes = o.optJSONArray("hinweise")
+        val first = if (notes != null && notes.length() > 0) notes.optString(0) else null
+        return when {
+            first != null -> ": ${first.take(200)}"
+            o.optInt("bilderEin") == 0 -> ": Die Kamera gab ihr kein Bild."
+            else -> "."
+        }
     }
 
     private fun runLongTest() = launchTest {
-        hintOverride = "Leg das Handy hin, Kamera nach vorn auf eine Szene mit einem Gegenstand in der Mitte. Die App bleibt offen, die Aufnahme läuft 10 Minuten."
+        hintOverride = "Leg das Handy hin, die Kamera auf eine Person oder einen Gegenstand mit etwas Abstand zum Hintergrund. " +
+            "Die App bleibt offen, die Aufnahme läuft 10 Minuten."
         running = "kidauer"
         render()
         reveal("kidauer")
-        // Liefert die Kamera neben 4K keine Bilder für die KI, rechnet sie auf einem Standbild. Das
-        // entsteht sonst im Schnelltest; nach einem Neustart der App holt der Dauertest es selbst.
-        // Klappt das nicht, läuft der Dauertest trotzdem (die KI rechnet dann nur auf Kamerabildern).
-        var stillMissing: String? = null
-        if (!withContext(engine.dispatcher) { engine.hasStill() }) {
-            try {
-                val frame = cameraFrame()
-                try {
-                    withContext(engine.dispatcher) { engine.setStill(frame) }
-                } finally {
-                    pool.release(frame)
-                }
-            } catch (e: CancellationException) {
-                // Abbruch (auch eine Unterart von IllegalStateException) beendet den Test wie bisher.
-                throw e
-            } catch (e: IllegalStateException) {
-                stillMissing = e.message ?: e.toString()
-            }
-        }
-        val result = recordWithAi("kidauer", LONG_SECONDS)
-        stillMissing?.let { result.put("ohneStandbild", it) }
-        putTest("kidauer", result)
+        putTest("kidauer", recordWithAi("kidauer", LONG_SECONDS))
         doneText = "KI-Dauertest fertig"
     }
 
-    /** KI-Vorschau ohne Aufnahme: Tiefe und Verfolgung live ansehen, Objekt antippen. */
+    /**
+     * KI-Vorschau ohne Aufnahme: das Bild mit Unschärfe, wie es aufgenommen würde. Antippen
+     * wählt das Motiv, das scharf bleibt.
+     */
     private fun onPreviewButton() {
         if (running == "vorschau") {
             requestStop()
@@ -855,13 +836,15 @@ class MainActivity : ComponentActivity() {
         if (running != null || !modelsOk) return
         launchTest {
             running = "vorschau"
-            hintOverride = "Tippe im Kamerabild auf ein Objekt: Die gelbe Markierung folgt ihm. Rechts die Tiefe, hell ist nah."
+            hintOverride = "Tippe im Kamerabild auf eine Person oder einen Gegenstand: Das Motiv bleibt scharf, der Hintergrund wird unscharf. " +
+                "Das Bild läuft eine Drittelsekunde hinterher, damit Motiv und Unschärfe genau zusammenpassen."
             render()
             setStatus(Phase.BUSY, "Bereitet die KI vor …")
             val load = ensureLiveModels()
             if (load != null) report.optJSONObject("ki")?.put("ladenVorschau", load)
-            bind(null, withAnalysis = true)
-            startLive(allowStill = false)
+            val effect = BokehProcessor(applicationContext, strength = 1f, aiPool = pool, aiDemand = engine, thumbnailAfter = 0)
+            bind(null, effect)
+            startLive(effect)
             setStatus(Phase.LIVE, "KI-Vorschau läuft")
             try {
                 while (!stopRequested && liveJob?.isActive == true) delay(200)
@@ -902,43 +885,42 @@ class MainActivity : ComponentActivity() {
         setStatus(Phase.BUSY, "Lädt die Modelle auf den KI-Chip · $n von $total", null, done / total.toFloat())
     }
 
-    /** Holt ein vorbereitetes Kamerabild; der Aufrufer gibt es mit pool.release zurück. */
+    /** Holt ein frisches Kamerabild aus der Pipeline; der Aufrufer gibt es mit pool.release zurück. */
     private suspend fun grabFrame(): FrameSlot? {
-        prepError = null
         pool.drain()
-        feeding = true
+        grabDemand.on = true
         try {
             return withContext(Dispatchers.IO) { pool.take(6000) }
         } finally {
-            feeding = false
+            grabDemand.on = false
             pool.drain()
         }
     }
 
-    private fun frameInfo(frame: FrameSlot): JSONObject {
+    private fun frameInfo(frame: FrameSlot, effect: BokehProcessor): JSONObject {
         val o = JSONObject()
         o.put("kameraBild", "${frame.width}x${frame.height}")
-        o.put("drehung", frame.rotation)
-        o.put("analyse", analysisSize ?: "?")
+        o.put("quelle", "Grafik-Pipeline")
         o.put("vorbereitungMs", r1(frame.prepMs))
-        prepError?.let { o.put("vorbereitungFehler", it) }
+        o.put("pipeline", effect.stats.toJson())
         return o
     }
 
-    private fun startLive(allowStill: Boolean) {
+    /**
+     * Startet die KI-Schleife auf den Bildern von [effect]: Die Pipeline bereitet die Bilder im
+     * Takt der KI vor und bekommt jede Maske zurück. Antippen im Bild wählt ein neues Motiv.
+     */
+    private fun startLive(effect: BokehProcessor) {
         pool.drain()
-        prepError = null
         liveError = null
-        feeding = true
         engine.beginLive()
         engine.stats.reset()
+        engine.maskSink = effect
         pool.resetCounters()
-        liveVisible = true
-        stage.showDepth = true
-        maskOverlay.onTap = { u, v -> engine.track(u, v) }
+        tapOverlay.onTap = { u, v -> engine.track(u, v) }
         liveJob = lifecycleScope.launch(engine.dispatcher) {
             try {
-                engine.runLive(pool, sink, allowStill)
+                engine.runLive(pool, allowStill = false)
             } catch (e: Throwable) {
                 liveError = "KI-Schleife: $e".take(400)
             }
@@ -950,13 +932,9 @@ class MainActivity : ComponentActivity() {
         engine.requestStop()
         liveJob?.join()
         liveJob = null
-        feeding = false
+        engine.maskSink = null
         pool.drain()
-        liveVisible = false
-        maskOverlay.onTap = null
-        maskOverlay.clearMask()
-        depthView.clear()
-        stage.showDepth = false
+        tapOverlay.onTap = null
         badgeJob?.cancel()
         badgeJob = null
         aiBadge.visibility = View.GONE
@@ -983,37 +961,47 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * 4K mit 30 fps aufnehmen, während beide Modelle auf den Kamerabildern rechnen.
-     * Alle 30 Sekunden ein Eintrag: Tempo der KI, Bildrate, Wärme und Akku.
+     * 4K mit 30 fps durch die Grafik-Pipeline aufnehmen: Beide Modelle rechnen auf den
+     * Kamerabildern, die Maske der Verfolgung macht den Hintergrund unscharf, die Wärmeregelung
+     * nimmt die KI bei Hitze zurück. Alle 30 Sekunden ein Eintrag: Tempo der KI, Bildrate,
+     * Pipeline, Wärme und Akku. Mit [keepClip] kommt der Clip in die Galerie.
      */
-    private suspend fun recordWithAi(key: String, seconds: Int): JSONObject {
+    private suspend fun recordWithAi(key: String, seconds: Int, keepClip: Boolean = false): JSONObject {
         setStatus(Phase.BUSY, "Bereitet die KI vor …")
         val load = ensureLiveModels()
-        startLive(allowStill = true)
+        val effect = BokehProcessor(
+            applicationContext, strength = 1f, aiPool = pool, aiDemand = engine,
+            thumbnailAfter = if (keepClip) BokehProcessor.THUMBNAIL_AFTER else 0
+        )
+        startLive(effect)
         val log = JSONArray()
         var next = LOG_EVERY_S
         var prevFrames = -1L
         var prevTs = 0L
         var prevBytes = 0L
         var prevT = 0.0
-        // Die KI-Zahlen gelten nur für die Zeit der Aufnahme: Beim Ende der Aufnahme werden sie
-        // festgehalten und die KI angehalten, bevor die Datei ausgewertet wird.
+        // Die KI- und Pipeline-Zahlen gelten nur für die Zeit der Aufnahme: Beim Ende der Aufnahme
+        // werden sie festgehalten; die KI hält an, sobald die Datei fertig ist.
         var aiTotal: JSONObject? = null
+        var pipelineTotal: JSONObject? = null
         var prepared = 0L
         var skipped = 0L
         val result = try {
             record(
-                key, FPS, seconds, stabilize = false, withAnalysis = true,
+                key, FPS, seconds, stabilize = false, effect = effect,
+                clipName = if (keepClip) "CineBo-Unschaerfe-${fileStamp()}.mp4" else null,
                 onStart = {
                     engine.stats.reset()
+                    effect.stats.resetCounters()
                     pool.resetCounters()
                 },
                 onStop = {
                     aiTotal = engine.stats.totalJson()
+                    pipelineTotal = effect.stats.toJson()
                     prepared = pool.prepared
                     skipped = pool.skipped
-                    engine.requestStop()
                 },
+                afterStop = { engine.requestStop() },
                 shouldStop = { liveJob?.isActive == false }
             ) { t, stats ->
                 if (t >= next) {
@@ -1028,6 +1016,7 @@ class MainActivity : ComponentActivity() {
                     }
                     val window = engine.stats.closeWindow()
                     entry.put("ki", window)
+                    entry.put("pipeline", effect.stats.closeWindow())
                     val heat = DeviceHeat.read(this@MainActivity)
                     entry.put("waerme", heat)
                     log.put(entry)
@@ -1052,22 +1041,32 @@ class MainActivity : ComponentActivity() {
         val ai = aiTotal ?: engine.stats.totalJson()
         ai.put("kameraBilderFuerKi", if (aiTotal != null) prepared else pool.prepared)
         ai.put("kameraBilderVerworfen", if (aiTotal != null) skipped else pool.skipped)
-        ai.put("analyse", analysisSize ?: "?")
         val (setting, chainName) = withContext(engine.dispatcher) { engine.chip to engine.liveTrackerName() }
         ai.put("einstellung", setting.key)
         ai.put("verfolgungKette", chainName)
         ai.put("memoryAttention", engine.liveAttn.key)
-        prepError?.let { ai.put("vorbereitungFehler", it) }
+        ai.put("waermeregelung", withContext(engine.dispatcher) { engine.heatJson() })
         liveError?.let { ai.put("fehler", it) }
         result.put("ki", ai)
+        result.put("pipeline", pipelineTotal ?: effect.stats.toJson())
         result.put("verlauf", log)
         if (load != null) result.put("laden", load)
         return result
     }
 
     /**
-     * Nimmt in 4K 16:9 auf, zählt dabei jedes Kamerabild und wertet danach die Datei aus.
-     * Die Datei wird anschließend gelöscht; es bleiben nur die Messwerte.
+     * Vergleichsclip: 10 Sekunden 4K ohne Grafik-Pipeline, so wie CameraX allein filmt. Neben dem
+     * Unschärfe-Clip zeigt er, was die Pipeline am Bild ändert (Farben, Schärfe), neben einem Clip
+     * der OPPO-Kamera, wie weit CameraX von ihr entfernt ist. Kommt in die Galerie.
+     */
+    private suspend fun recordComparison(): JSONObject =
+        record("vergleich", FPS, COMPARE_SECONDS, stabilize = false, clipName = "CineBo-Vergleich-${fileStamp()}.mp4")
+
+    /**
+     * Nimmt in 4K 16:9 auf, zählt dabei jedes Kamerabild und wertet danach die Datei aus. Mit
+     * [effect] läuft alles durch die Grafik-Pipeline. Mit [clipName] kommt der Clip danach in die
+     * Galerie (Album CineBo), sonst wird die Datei gelöscht und es bleiben nur die Messwerte.
+     * [onStop] hält beim Ende der Aufnahme die Zahlen fest, [afterStop] kommt, wenn die Datei steht.
      */
     @OptIn(ExperimentalCamera2Interop::class)
     private suspend fun record(
@@ -1075,10 +1074,12 @@ class MainActivity : ComponentActivity() {
         fps: Int,
         seconds: Int,
         stabilize: Boolean,
-        withAnalysis: Boolean = false,
+        effect: BokehProcessor? = null,
+        clipName: String? = null,
         recordingHint: String? = null,
         onStart: () -> Unit = {},
         onStop: () -> Unit = {},
+        afterStop: () -> Unit = {},
         shouldStop: () -> Boolean = { false },
         onTick: (Double, RecordingStats?) -> Unit = { _, _ -> }
     ): JSONObject {
@@ -1094,27 +1095,27 @@ class MainActivity : ComponentActivity() {
                 .put("fps", fps)
                 .put("sekunden", seconds)
                 .put("stabilisator", stabilize)
-                .put("kiBilder", withAnalysis)
+                .put("pipeline", effect != null)
+                .put("unschaerfe", effect?.blurs == true)
         )
-        val label = "4K · $fps" + if (stabilize) " · Stabilisator" else ""
+        val label = "4K · $fps" + (if (stabilize) " · Stabilisator" else "") + (if (effect?.blurs == true) " · Unschärfe" else "")
         setStatus(Phase.BUSY, "Kamera startet · $label")
 
+        // Ohne eigenes Seitenverhältnis ist 4K genau die Größe aus dem Profil des Encoders (3840 × 2160).
         val recorder = Recorder.Builder()
             .setQualitySelector(QualitySelector.from(Quality.UHD))
-            .setAspectRatio(AspectRatio.RATIO_16_9)
             .build()
         val builder = VideoCapture.Builder(recorder).setTargetFrameRate(Range(fps, fps))
         if (stabilize) builder.setVideoStabilizationEnabled(true)
         val videoCapture = builder.build()
 
         val camera = try {
-            bind(videoCapture, withAnalysis)
+            bind(videoCapture, effect)
         } catch (e: Exception) {
             out.put("fehler", "Kamera ließ sich so nicht starten: ${e.message ?: e.javaClass.simpleName}")
             return attachEvents(out)
         }
         out.put("kamera", Camera2CameraInfo.from(camera.cameraInfo).cameraId)
-        if (withAnalysis) out.put("analyse", analysisSize ?: "?")
         delay(300)
         waitForStreaming(5000)
         delay(1500) // Belichtung und Weißabgleich einpendeln lassen
@@ -1203,11 +1204,20 @@ class MainActivity : ComponentActivity() {
             counting = false
             onStop()
             recBadge.visibility = View.GONE
+            // Die Pipeline gibt jedes Bild um ihre Verzögerung später aus, mit dem Zeitstempel der
+            // Kamera. Der Encoder wartet nach dem Stopp auf das erste Bild ab der Stoppzeit (bis
+            // zu 1 s), so kommt das Ende der Aufnahme noch vollständig hinein.
             if (!finished.isCompleted) recording.stop()
         }
 
         setStatus(Phase.BUSY, "Wertet die Aufnahme aus …")
-        val end = withTimeoutOrNull(30_000) { finished.await() }
+        // Die KI rechnet weiter, bis die Datei fertig ist: Auch die letzten, verzögert
+        // ausgegebenen Bilder bekommen ihre Masken.
+        val end = try {
+            withTimeoutOrNull(30_000) { finished.await() }
+        } finally {
+            afterStop()
+        }
         val endText = when {
             end == null -> "keine Rückmeldung vom Recorder"
             end.hasError() -> finalizeText(end.error)
@@ -1237,11 +1247,47 @@ class MainActivity : ComponentActivity() {
                 JSONObject().put("fehler", "Auswertung ging nicht: ${e.message ?: e.javaClass.simpleName}")
             }
             out.put("datei", analysis)
+            if (clipName != null) {
+                setStatus(Phase.BUSY, "Legt den Clip in die Galerie …")
+                out.put("galerie", saveToGallery(file, clipName))
+            }
         } else {
             out.put("datei", JSONObject().put("fehler", "keine Datei"))
         }
         file.delete()
         return out
+    }
+
+    /**
+     * Kopiert einen Clip in die Galerie, Album [GALLERY_FOLDER]. Ein halb geschriebener Eintrag
+     * wird bei einem Fehler wieder entfernt; der Fehler steht dann im Bericht.
+     */
+    private suspend fun saveToGallery(file: File, name: String): JSONObject = withContext(Dispatchers.IO) {
+        val folder = "${Environment.DIRECTORY_MOVIES}/$GALLERY_FOLDER"
+        val out = JSONObject().put("name", name).put("ordner", folder)
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, name)
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.RELATIVE_PATH, folder)
+            put(MediaStore.Video.Media.IS_PENDING, 1)
+        }
+        val resolver = contentResolver
+        val uri = try {
+            resolver.insert(MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values)
+        } catch (e: Exception) {
+            return@withContext out.put("fehler", "Galerie nimmt keinen Clip an: ${e.message ?: e.javaClass.simpleName}")
+        } ?: return@withContext out.put("fehler", "Galerie nimmt keinen Clip an")
+        try {
+            val stream = resolver.openOutputStream(uri) ?: throw IOException("kein Schreibzugang")
+            stream.use { target -> file.inputStream().use { it.copyTo(target, 1 shl 20) } }
+            values.clear()
+            values.put(MediaStore.Video.Media.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
+            out.put("mb", (file.length() / 1e6).roundToInt())
+        } catch (e: Exception) {
+            resolver.delete(uri, null, null)
+            out.put("fehler", "Clip ließ sich nicht in die Galerie legen: ${e.message ?: e.javaClass.simpleName}")
+        }
     }
 
     private fun finalizeText(code: Int): String = when (code) {
@@ -1290,7 +1336,7 @@ class MainActivity : ComponentActivity() {
 
     private fun reportText(): String {
         val o = JSONObject()
-        o.put("app", JSONObject().put("name", "CineBo Test").put("stufe", "2b").put("version", appVersion).put("erstellt", nowIso()))
+        o.put("app", JSONObject().put("name", "CineBo Test").put("stufe", "3").put("version", appVersion).put("erstellt", nowIso()))
         val keys = report.keys()
         while (keys.hasNext()) {
             val k = keys.next()
@@ -1356,7 +1402,7 @@ class MainActivity : ComponentActivity() {
             "leistung" -> perfSummary()
             "tiefe" -> depthSummary()
             "verfolgung" -> trackSummary()
-            else -> readTests().optJSONObject(key)?.let { liveSummary(key, it) }
+            else -> readTests().optJSONObject(key)?.let { recordingSummary(key, it) }
                 ?: (Mark.OPEN to DESCRIPTIONS.getValue(key))
         }
     }
@@ -1528,59 +1574,66 @@ class MainActivity : ComponentActivity() {
         return mark to parts.joinToString(" · ")
     }
 
-    private fun liveSummary(key: String, r: JSONObject): Pair<Mark, String> {
+    /**
+     * Zusammenfassung einer Aufnahme durch die Pipeline: zuerst das Video (darum geht es in der
+     * Abnahme), dann KI und Unschärfe, beim Dauertest Wärme und Akku, zuletzt wo der Clip liegt.
+     */
+    private fun recordingSummary(key: String, r: JSONObject): Pair<Mark, String> {
         val error = r.optString("fehler")
         if (error.isNotEmpty()) return Mark.FAIL to error
         val ai = r.optJSONObject("ki")
         val aiError = ai?.optString("fehler").orEmpty()
         if (aiError.isNotEmpty()) return Mark.FAIL to aiError
         val file = r.optJSONObject("datei")
-        val parts = mutableListOf<String>()
-        var mark = Mark.OK
-        if (key == "kidauer" && file != null && file.has("dauerS")) parts += "${clock(file.optDouble("dauerS").toLong())} min"
-        if (ai != null && ai.has("hz")) {
-            val hz = ai.optDouble("hz")
-            var text = "KI: ${de(hz, 0)} Durchgänge pro Sekunde"
-            val log = r.optJSONArray("verlauf")
-            if (key == "kidauer" && log != null && log.length() > 1) {
-                var lo = Double.MAX_VALUE
-                var hi = 0.0
-                for (i in 0 until log.length()) {
-                    val w = log.optJSONObject(i)?.optJSONObject("ki")?.optDouble("hz", Double.NaN) ?: Double.NaN
-                    if (w.isNaN()) continue
-                    lo = min(lo, w)
-                    hi = max(hi, w)
-                }
-                if (lo <= hi) text = "KI: ${de(lo, 0)} bis ${de(hi, 0)} Durchgänge pro Sekunde"
-                if (lo < TARGET_HZ) mark = Mark.WARN
-            }
-            parts += text
-            if (hz < TARGET_HZ) mark = Mark.WARN
-            if (ai.optInt("aufStandbild") > 0) {
-                parts += "ohne Kamerabilder für die KI (Standbild)"
-                mark = Mark.WARN
-            }
-            aspectNote(ai.optString("analyse"))?.let {
-                parts += it
-                mark = Mark.WARN
-            }
-        } else {
-            parts += "KI lief nicht mit"
-            mark = Mark.WARN
-        }
-        if (file != null && file.has("fps")) {
-            val fps = file.optDouble("fps")
-            val lost = lostAfterStart(file)
-            parts += "${sizeText(file)} mit ${de(fps, 1)} fps"
-            parts += lostText(lost)
-            if (fps < FPS * 0.95 || lost > 0) mark = Mark.WARN
-        } else {
+        if (file == null || !file.has("fps")) {
             val reason = endNote(r) ?: file?.optString("fehler")?.ifEmpty { null } ?: "keine auswertbare Aufnahme"
             return Mark.FAIL to reason.replaceFirstChar { it.uppercase() }
         }
-        ai?.optInt("objektGefundenProzent", -1)?.takeIf { it >= 0 }?.let { parts += "Objekt in $it % der Durchgänge gefunden" }
-        ai?.optJSONObject("ms")?.optJSONObject("alterErgebnis")?.optDouble("median", Double.NaN)?.takeIf { !it.isNaN() }?.let {
-            parts += "Ergebnis ${de(it, 0)} ms nach dem Kamerabild fertig"
+        val parts = mutableListOf<String>()
+        var mark = Mark.OK
+        if (key == "kidauer" && file.has("dauerS")) parts += "${clock(file.optDouble("dauerS").toLong())} min"
+        val fps = file.optDouble("fps")
+        val lost = lostAfterStart(file)
+        parts += "${sizeText(file)} mit ${de(fps, 1)} fps"
+        parts += lostText(lost)
+        if (fps < FPS * 0.95 || lost > 0) mark = Mark.WARN
+        if (key != "vergleich") {
+            if (ai != null && ai.has("hz")) {
+                val hz = ai.optDouble("hz")
+                var lo = hz
+                var hi = hz
+                val log = r.optJSONArray("verlauf")
+                if (key == "kidauer" && log != null && log.length() > 1) {
+                    lo = Double.MAX_VALUE
+                    hi = 0.0
+                    for (i in 0 until log.length()) {
+                        val w = log.optJSONObject(i)?.optJSONObject("ki")?.optDouble("hz", Double.NaN) ?: Double.NaN
+                        if (w.isNaN()) continue
+                        lo = min(lo, w)
+                        hi = max(hi, w)
+                    }
+                    if (lo > hi) {
+                        lo = hz
+                        hi = hz
+                    }
+                }
+                parts += if (de(lo, 0) == de(hi, 0)) "KI ${de(hz, 0)} Durchgänge pro Sekunde" else "KI ${de(lo, 0)} bis ${de(hi, 0)} Durchgänge pro Sekunde"
+                if (lo < MIN_LIVE_HZ) mark = Mark.WARN
+            } else {
+                parts += "KI lief nicht mit"
+                mark = Mark.WARN
+            }
+            blurNote(r.optJSONObject("pipeline"))?.let { (warn, text) ->
+                parts += text
+                if (warn) mark = Mark.WARN
+            }
+            ai?.optInt("objektGefundenProzent", -1)?.takeIf { it >= 0 }?.let { parts += "Motiv in $it % der Durchgänge gefunden" }
+            ai?.optJSONObject("waermeregelung")?.let { heat ->
+                val waited = heat.optDouble("gewartetS", 0.0)
+                if (heat.optInt("gebremsteDurchgaenge") > 0) {
+                    parts += "Wärmeregelung bremste die KI um insgesamt ${clock(waited.roundToInt().toLong())} min"
+                }
+            }
         }
         if (key == "kidauer") {
             val heat = r.optJSONObject("waerme")
@@ -1601,23 +1654,41 @@ class MainActivity : ComponentActivity() {
                 if (DeviceHeat.stageOrder.indexOf(stage) > DeviceHeat.stageOrder.indexOf(hottest)) hottest = stage
             }
             parts += "Wärmestufe höchstens $hottest"
-            if (DeviceHeat.stageOrder.indexOf(hottest) >= 2) mark = Mark.WARN
+            if (DeviceHeat.stageOrder.indexOf(hottest) >= 3) mark = Mark.WARN
         }
         endNote(r)?.let {
             parts += it
             mark = Mark.WARN
         }
+        r.optJSONObject("galerie")?.let { g ->
+            val failed = g.optString("fehler")
+            if (failed.isNotEmpty()) {
+                parts += failed
+                mark = Mark.WARN
+            } else {
+                parts += "Clip in der Galerie, Album $GALLERY_FOLDER"
+            }
+        }
         return mark to parts.joinToString(" · ")
     }
 
-    /** Liefert die Kamera die KI-Bilder nicht in 16:9, sitzt die Markierung nicht genau auf dem Bild. */
-    private fun aspectNote(size: String?): String? {
-        val m = Regex("(\\d+)x(\\d+)").find(size ?: return null) ?: return null
-        val w = m.groupValues[1].toDouble()
-        val h = m.groupValues[2].toDouble()
-        if (w <= 0 || h <= 0) return null
-        val ratio = max(w, h) / min(w, h)
-        return if (kotlin.math.abs(ratio - 16.0 / 9.0) > 0.03) "KI-Bilder nicht in 16:9 ($size), Markierung kann versetzt sein" else null
+    /**
+     * Wie gut die Unschärfe zur KI passte: auf wie vielen Bildern sie lag und wie viele die Masken
+     * davor und danach mischten. Gibt (Warnung, Text) zurück oder null ohne Zahlen.
+     */
+    private fun blurNote(p: JSONObject?): Pair<Boolean, String>? {
+        if (p == null) return null
+        val blurred = p.optInt("mitUnschaerfe")
+        if (blurred <= 0) {
+            val note = p.optJSONArray("hinweise")?.optString(0).orEmpty()
+            return true to if (note.isNotEmpty()) "Keine Unschärfe: ${note.take(120)}" else "Keine Unschärfe"
+        }
+        val withMask = 100 - Math.round(p.optInt("ohneMaske") * 100.0 / blurred).toInt()
+        val mixed = p.optInt("gemischtProzent")
+        var text = "Unschärfe auf $withMask % der Bilder, $mixed % zwischen zwei Masken gemischt"
+        val gaps = p.optInt("luecken")
+        if (gaps > 0) text += ", ${p.optInt("fehlendeBilderGeschaetzt")} Kamerabilder fehlten der Pipeline"
+        return (withMask < 95 || mixed < 80 || gaps > 0) to text
     }
 
     private fun endNote(r: JSONObject): String? = when (val end = r.optString("ende")) {
@@ -1665,14 +1736,17 @@ class MainActivity : ComponentActivity() {
             !modelsOk -> DownloadUi.hint(downloadState())
             !has(Manifest.permission.CAMERA) -> "Die Test-App braucht Zugriff auf Kamera und Mikrofon."
             !quickDone -> "Starte den KI-Schnelltest. Er lädt beide KI-Modelle auf den KI-Chip, sucht dessen schnellste " +
-                "Leistungsstufe, misst Tempo und Genauigkeit und filmt dann 30 Sekunden in 4K, während beide mitrechnen. " +
-                "Beim ersten Mal übersetzt der Chip jedes Modell neu; rechne mit etwa zehn Minuten, danach etwa fünf.$noMic"
+                "Leistungsstufe und misst Tempo und Genauigkeit. Dann filmt er 30 Sekunden in 4K mit Unschärfe und " +
+                "10 Sekunden ohne, zum Vergleich; beide Clips kommen in die Galerie. Beim ersten Mal übersetzt der Chip " +
+                "jedes Modell neu; rechne mit etwa zehn Minuten, danach etwa fünf.$noMic"
             repeatReason("live") != null -> repeatReason("live")!!
-            !tests.has("kidauer") -> "Jetzt der KI-Dauertest: Handy hinlegen, Kamera auf eine Szene mit einem Gegenstand " +
-                "in der Mitte. Vorher kannst du in der KI-Vorschau auf Dinge tippen und zusehen, wie die Markierung folgt.$noMic"
+            repeatReason("vergleich") != null -> repeatReason("vergleich")!!
+            !tests.has("kidauer") -> "Jetzt der KI-Dauertest: Handy hinlegen, Kamera auf eine Person oder einen Gegenstand " +
+                "mit etwas Abstand zum Hintergrund. Vorher kannst du in der KI-Vorschau auf ein Motiv tippen und zusehen, " +
+                "wie der Hintergrund unscharf wird.$noMic"
             repeatReason("kidauer") != null -> repeatReason("kidauer")!!
-            else -> "Alles gemessen. Kopiere den Bericht und füge ihn bei mir im Chat ein. " +
-                "In der KI-Vorschau kannst du Tiefe und Verfolgung weiter ausprobieren."
+            else -> "Alles gemessen. Kopiere den Bericht und füge ihn bei mir im Chat ein. Die Clips liegen in der " +
+                "Galerie im Album $GALLERY_FOLDER. In der KI-Vorschau kannst du die Unschärfe weiter ausprobieren."
         }
     }
 
@@ -1833,7 +1907,7 @@ class MainActivity : ComponentActivity() {
         header.addView(version, lp(WRAP, WRAP))
         root.addView(header, lp(MATCH, dp(48f)))
 
-        // Bühne: Kamerabild mit Maske, daneben die Tiefe
+        // Bühne: das Kamerabild, wie es aufgenommen wird; Antippen wählt das Motiv
         previewBox = FrameLayout(this)
         val cameraPanel = panel()
         previewView = PreviewView(this).apply {
@@ -1842,8 +1916,8 @@ class MainActivity : ComponentActivity() {
             setBackgroundColor(Color.BLACK)
         }
         cameraPanel.addView(previewView, FrameLayout.LayoutParams(MATCH, MATCH))
-        maskOverlay = MaskOverlay(this)
-        cameraPanel.addView(maskOverlay, FrameLayout.LayoutParams(MATCH, MATCH))
+        tapOverlay = TapOverlay(this)
+        cameraPanel.addView(tapOverlay, FrameLayout.LayoutParams(MATCH, MATCH))
         recBadge = badge(Palette.red).apply { visibility = View.GONE }
         cameraPanel.addView(recBadge, FrameLayout.LayoutParams(WRAP, WRAP).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -1854,15 +1928,7 @@ class MainActivity : ComponentActivity() {
             gravity = Gravity.BOTTOM or Gravity.START
             setMargins(dp(10f), 0, dp(10f), dp(10f))
         })
-        val depthPanel = panel()
-        depthView = DepthView(this)
-        depthPanel.addView(depthView, FrameLayout.LayoutParams(MATCH, MATCH))
-        val depthBadge = badge(null).apply { text = "Tiefe · hell ist nah" }
-        depthPanel.addView(depthBadge, FrameLayout.LayoutParams(WRAP, WRAP).apply {
-            gravity = Gravity.TOP or Gravity.START
-            setMargins(dp(10f), dp(10f), dp(10f), 0)
-        })
-        stage = StageLayout(this, cameraPanel, depthPanel)
+        stage = StageLayout(this, cameraPanel)
         previewBox.addView(stage, FrameLayout.LayoutParams(MATCH, MATCH))
         permissionPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL

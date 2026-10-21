@@ -47,7 +47,7 @@ internal class EdgeTamTracker(
     private val coords: ByteBuffer,
     private val labels: ByteBuffer,
 ) : Tracker {
-    private val maskBuf = directBuffer(MaskPainter.SIZE * MaskPainter.SIZE * 4)
+    private val maskBuf = directBuffer(MASK_SIZE * MASK_SIZE * 4)
     private val sparseBuf = decoder.newSparse()
     private val sparseScratch = FloatArray((decoder.points + 1) * D)
     private val promptU = FloatArray(decoder.points)
@@ -57,7 +57,7 @@ internal class EdgeTamTracker(
     private val ptrs = attn.newInput(2)
     private val bias = attn.newInput(3)
 
-    private val maskFloats = FloatArray(MaskPainter.SIZE * MaskPainter.SIZE)
+    private val maskFloats = FloatArray(MASK_SIZE * MASK_SIZE)
     private val hidden = FloatArray(maskFloats.size) { -1024f }
     private val zeroBias = FloatArray(TOK_MEM) { 0f }
     private val maskedBias = FloatArray(TOK_MEM) { MASK }
@@ -275,14 +275,14 @@ internal class FastTracker(
     private val coords: ByteBuffer,
     private val labels: ByteBuffer,
 ) : Tracker {
-    private val maskBuf = directBuffer(MaskPainter.SIZE * MaskPainter.SIZE * 4)
+    private val maskBuf = directBuffer(MASK_SIZE * MASK_SIZE * 4)
     private val sparseBuf = decoder.newSparse()
     private val sparseScratch = FloatArray((decoder.points + 1) * PromptEncoder.D)
     private val promptU = FloatArray(decoder.points)
     private val promptV = FloatArray(decoder.points)
     private val promptLabels = IntArray(decoder.points)
     private val ptrScratch = FloatArray(PromptEncoder.D)
-    private val maskFloats = FloatArray(MaskPainter.SIZE * MaskPainter.SIZE)
+    private val maskFloats = FloatArray(MASK_SIZE * MASK_SIZE)
     private val hidden = FloatArray(maskFloats.size) { -1024f }
 
     /** Punkt (u, v) im quadratischen Bild, 0 bis 1: Mitte der Maske im Bild davor. */
@@ -371,7 +371,7 @@ internal class FastTracker(
     /** Neuer Punkt: der Maskenpunkt nächst dem Schwerpunkt der Maske; false, wenn die Maske leer ist. */
     private fun updatePoint(): Boolean {
         if (!present) return false
-        val found = maskCenter(mask(), MaskPainter.SIZE) ?: return false
+        val found = maskCenter(mask(), MASK_SIZE) ?: return false
         point[0] = found[0]
         point[1] = found[1]
         return true

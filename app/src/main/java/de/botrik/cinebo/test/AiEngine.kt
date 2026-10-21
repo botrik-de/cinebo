@@ -40,18 +40,13 @@ internal enum class ModelId(val asset: String, val title: String, val fp16: Bool
     }
 }
 
-/** Was die Vorschau während der KI-Läufe zeigt. Wird auf dem KI-Thread aufgerufen. */
-internal interface LiveSink {
-    fun onPictures(depth: IntArray, mask: IntArray, present: Boolean)
-}
-
 /**
  * Lädt die Modelle auf den KI-Chip, vergleicht die Einstellungen des Chips, misst die Modelle
  * einzeln und als Ketten, prüft die Genauigkeit gegen die CPU und gegen Metas Original und lässt
  * Tiefe und Verfolgung auf den Kamerabildern laufen. Alles läuft auf einem eigenen Thread („ki“);
  * die Methoden hier nur über [dispatcher] aufrufen.
  */
-internal class AiEngine(private val context: Context) {
+internal class AiEngine(private val context: Context) : AiDemand {
 
     private val executor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "ki").apply { priority = Thread.NORM_PRIORITY + 2 }
@@ -97,6 +92,22 @@ internal class AiEngine(private val context: Context) {
     @Volatile private var stopLive = false
     @Volatile private var pendingTap: FloatArray? = null
 
+    // Takt für die Grafik-Pipeline (siehe AiDemand); schreibt nur der KI-Thread.
+    @Volatile private var nextTake = 0L
+    @Volatile private var aiWaiting = false
+    override val nextTakeNs: Long get() = nextTake
+    override val waiting: Boolean get() = aiWaiting
+
+    /** Bekommt nach jedem Durchgang auf einem Kamerabild die Maske (Grafik-Pipeline); sonst null. */
+    @Volatile var maskSink: MaskSink? = null
+
+    /** Wärmeregelung der Live-Schleife; ihr Ergebnis über [heatJson]. */
+    private val heat = HeatGovernor(context)
+    private val maskBytes = ByteArray(MASK_SIZE * MASK_SIZE)
+
+    /** Wie die Wärmeregelung im letzten Live-Lauf gebremst hat (über [dispatcher] aufrufen). */
+    fun heatJson(): JSONObject = heat.toJson()
+
     /**
      * Stopp-Knopf während einer Messung: Leistungstest, Einzelmessung, Genauigkeit und Prüfvideo
      * hören nach dem laufenden Schritt auf und geben zurück, was sie bis dahin haben.
@@ -134,10 +145,6 @@ internal class AiEngine(private val context: Context) {
         }
 
     val stats = LiveStats()
-    private val depthPainter = DepthPainter(DEPTH_W, DEPTH_H)
-    private val depthPixels = Array(2) { IntArray(DEPTH_W * DEPTH_H) }
-    private val maskPixels = Array(2) { IntArray(MaskPainter.SIZE * MaskPainter.SIZE) }
-    private var flip = 0
 
     fun loaded(id: ModelId): Boolean = models.containsKey(id)
 
@@ -595,7 +602,7 @@ internal class AiEngine(private val context: Context) {
     /** Zeit eines Memory-Encoders, wie die Kette sie sieht: Wanduhr mit dem Weiterreichen der Puffer, dazu die Zeit im Modell. */
     private fun writerTiming(writer: MemoryWriter): JSONObject {
         val emb = directBuffer(64 * 64 * EdgeTamTracker.D * 4)
-        val mask = directBuffer(MaskPainter.SIZE * MaskPainter.SIZE * 4)
+        val mask = directBuffer(MASK_SIZE * MASK_SIZE * 4)
         val result = FloatArray(EdgeTamTracker.TOK_MEM * EdgeTamTracker.MEM_DIM)
         val used = models.values.toList()
         try {
@@ -798,8 +805,8 @@ internal class AiEngine(private val context: Context) {
                     progress("Vergleicht den Decoder wie im Original")
                     val sparse = metaCpu.newSparse()
                     prompt.write(floatArrayOf(0.5f), floatArrayOf(0.5f), intArrayOf(1), FloatArray(2 * PromptEncoder.D), sparse)
-                    val outC = directBuffer(MaskPainter.SIZE * MaskPainter.SIZE * 4)
-                    val outN = directBuffer(MaskPainter.SIZE * MaskPainter.SIZE * 4)
+                    val outC = directBuffer(MASK_SIZE * MASK_SIZE * 4)
+                    val outN = directBuffer(MASK_SIZE * MASK_SIZE * 4)
                     val ptrC = FloatArray(PromptEncoder.D)
                     val ptrN = FloatArray(PromptEncoder.D)
                     val scoreC = metaCpu.run(pix, hr1, hr2, sparse, outC, ptrC)
@@ -1079,7 +1086,7 @@ internal class AiEngine(private val context: Context) {
     private fun readMask(zip: ZipFile, name: String): FloatArray {
         val bmp = decode(zip, name)
         try {
-            require(bmp.width == MaskPainter.SIZE && bmp.height == MaskPainter.SIZE) { "$name: ${bmp.width}×${bmp.height}" }
+            require(bmp.width == MASK_SIZE && bmp.height == MASK_SIZE) { "$name: ${bmp.width}×${bmp.height}" }
             val px = IntArray(bmp.width * bmp.height)
             bmp.getPixels(px, 0, bmp.width, 0, 0, bmp.width, bmp.height)
             return FloatArray(px.size) { if ((px[it] and 0xFF) >= 128) 1f else -1f }
@@ -1192,22 +1199,50 @@ internal class AiEngine(private val context: Context) {
     fun liveTrackerName(): String = tracker?.name ?: "keine"
 
     /**
-     * Läuft, bis [requestStop] kommt: nimmt das jeweils neueste Kamerabild, rechnet die Tiefe
-     * und verfolgt das Objekt. Kommen länger keine Kamerabilder und gibt es ein Standbild,
-     * rechnet sie darauf weiter (das steht dann im Bericht).
+     * Läuft, bis [requestStop] kommt: nimmt das jeweils neueste Kamerabild aus der Grafik-Pipeline,
+     * verfolgt das Objekt, gibt die Maske an [maskSink] und rechnet die Tiefe. Kommen länger keine
+     * Kamerabilder und gibt es ein Standbild, rechnet sie darauf weiter (das steht dann im Bericht).
      */
-    fun runLive(pool: FramePool, sink: LiveSink?, allowStill: Boolean) {
+    fun runLive(pool: FramePool, allowStill: Boolean) {
         val depth = models[ModelId.DEPTH] ?: error("Tiefenmodell nicht geladen")
         val t = tracker ?: error("EdgeTAM nicht geladen")
         val used = liveSet().mapNotNull { models[it] }
         liveRunning = true
         t.reset()
-        depthPainter.reset()
+        heat.reset()
+        nextTake = 0L
         var lastFrame = SystemClock.elapsedRealtime()
+        var lastStart = 0L
+        var expectedMs = Double.NaN
         try {
             used.forEach { it.vote() }
             while (!stopLive) {
-                val taken = pool.take(100)
+                // Wärmeregelung: Wird das Handy heiß, rechnet die KI seltener (siehe HeatGovernor).
+                val gap = heat.minIntervalMs()
+                if (gap > 0 && lastStart > 0) {
+                    val until = lastStart + gap
+                    var now = SystemClock.elapsedRealtime()
+                    if (now < until) {
+                        nextTake = System.nanoTime() + (until - now) * 1_000_000L
+                        heat.noteWait(until - now)
+                        while (!stopLive && now < until) {
+                            Thread.sleep(min(until - now, 50L))
+                            now = SystemClock.elapsedRealtime()
+                        }
+                        if (stopLive) break
+                    }
+                }
+                // Kommen seit 600 ms keine Kamerabilder (die Kamera gibt neben 4K keins heraus),
+                // rechnet die KI ohne Pause auf dem Standbild weiter und schaut nur nach, ob doch
+                // wieder ein Kamerabild da ist. Bis Stufe 2b wartete sie jedes Mal 100 ms darauf;
+                // das halbierte die gemessene Rate.
+                val onStill = allowStill && still != null && SystemClock.elapsedRealtime() - lastFrame >= 600
+                aiWaiting = true
+                val taken = try {
+                    pool.take(if (onStill) 0 else 100)
+                } finally {
+                    aiWaiting = false
+                }
                 val slot: FrameSlot
                 val fromPool: Boolean
                 if (taken != null) {
@@ -1222,11 +1257,13 @@ internal class AiEngine(private val context: Context) {
                 }
                 try {
                     val start = System.nanoTime()
+                    lastStart = SystemClock.elapsedRealtime()
+                    // Wann die KI voraussichtlich das nächste Bild nimmt: Danach richtet die
+                    // Grafik-Pipeline das nächste Bild ein, damit es frisch ist.
+                    nextTake = if (expectedMs.isNaN()) 0L else start + (max(expectedMs, gap.toDouble()) * 1e6).toLong()
                     // Wie alt das Kamerabild ist, wenn die KI es aufnimmt. Je nach Gerät zählt die
                     // Kamera ab Systemstart mit oder ohne Tiefschlaf.
                     val age = if (fromPool) frameAgeMs(slot.timestampNs) else Double.NaN
-                    depth.run(arrayOf(slot.depth))
-                    val depthNative = depth.lastNativeMs
                     val tap = pendingTap
                     if (tap != null) pendingTap = null
                     // Startbild: neu angetippt oder der erste Durchgang (Mitte des Bildes).
@@ -1236,7 +1273,18 @@ internal class AiEngine(private val context: Context) {
                     } else {
                         t.step(slot.enc)
                     }
+                    // Die Maske gehört zu genau diesem Kamerabild (Zeitstempel); die Pipeline legt
+                    // sie auf dasselbe Bild, wenn sie es verzögert ausgibt (siehe BokehProcessor).
+                    // Sie geht vor der Tiefe hinaus, damit die Pipeline weniger warten muss.
+                    val masks = maskSink
+                    if (masks != null && fromPool) {
+                        PipelineMath.maskProbabilities(t.mask(), maskBytes)
+                        masks.onMask(slot.timestampNs, maskBytes, t.present)
+                    }
+                    depth.run(arrayOf(slot.depth))
+                    val depthNative = depth.lastNativeMs
                     val aiMs = (System.nanoTime() - start) / 1e6
+                    expectedMs = if (expectedMs.isNaN()) aiMs else expectedMs * 0.8 + aiMs * 0.2
                     // Das Ergebnis ist fertig, wenn das Bild so alt ist wie beim Aufnehmen plus die Rechenzeit.
                     stats.add(
                         aiMs = aiMs, depthMs = depthNative, encMs = t.encMs,
@@ -1245,19 +1293,14 @@ internal class AiEngine(private val context: Context) {
                         ageMs = age, resultAgeMs = age + aiMs,
                         present = t.present, restart = tap != null, still = !fromPool
                     )
-                    if (sink != null) {
-                        flip = 1 - flip
-                        depthPainter.paint(depth.output(0), slot.depthContent, depthPixels[flip])
-                        MaskPainter.paint(t.mask(), maskPixels[flip], MASK_COLOR)
-                        sink.onPictures(depthPixels[flip], maskPixels[flip], t.present)
-                    }
                 } finally {
                     if (fromPool) pool.release(slot)
                 }
-                if (!fromPool) Thread.sleep(25) // Standbild: im Takt der Kamera bleiben
             }
         } finally {
             used.forEach { it.release() }
+            nextTake = 0L
+            heat.finish()
             liveRunning = false
         }
     }
@@ -1273,9 +1316,6 @@ internal class AiEngine(private val context: Context) {
         const val WARMUP = 3
         const val RUNS = 20
         const val MATRIX_RUNS = 10
-        const val DEPTH_W = 144
-        const val DEPTH_H = 256
-        val MASK_COLOR = Palette.amber
 
         /** Die volle Kette, die live läuft: „voll“ mit unserem Decoder wie im Original, sonst „vollQualcomm“. */
         fun liveChainKey(metaDecoder: Boolean): String = if (metaDecoder) "voll" else "vollQualcomm"

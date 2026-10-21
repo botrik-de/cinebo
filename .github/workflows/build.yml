@@ -20,7 +20,7 @@ concurrency:
 
 env:
   # Stufe 2 des Machbarkeitstests: Versionen 0.2.x
-  CINEBO_VERSION: 0.2.${{ github.run_number }}
+  CINEBO_VERSION: 0.3.${{ github.run_number }}
   # Welche selbst exportierten EdgeTAM-Teile in die App kommen (Release modelle-<Version>)
   MODELLE_VERSION: '2'
   # Größer darf die APK nicht werden; alles Große lädt die App selbst.
@@ -224,5 +224,5 @@ jobs:
           gh release create "test-${{ github.run_number }}" cinebo-test.apk bau-info.txt \
             --target "${{ github.sha }}" \
             --title "CineBo Test $CINEBO_VERSION" \
-            --notes "Testversion $CINEBO_VERSION für das OPPO Find N6: KI-Messung (Stufe 2b). Die KI-Modelle lädt die App beim ersten Start selbst (KI-Satz $KI_SATZ)." \
+            --notes "Testversion $CINEBO_VERSION für das OPPO Find N6: Grafik-Pipeline mit KI und Unschärfe (Stufe 3). Die KI-Modelle lädt die App beim ersten Start selbst (KI-Satz $KI_SATZ)." \
             --latest

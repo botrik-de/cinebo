@@ -351,12 +351,19 @@ internal object Npu {
         o.put("qnnSdk", BuildConfig.QNN_VERSION)
         try {
             loadLibraries(context)
-            o.put("delegateApi", QnnDelegate.getVersion().joinToString("."))
+            // checkCapability lädt die JNI-Bibliothek des Delegates; getVersion tut das nicht und
+            // scheitert davor (Stufe 2b: UnsatisfiedLinkError). Darum erst die Fähigkeiten.
             o.put("htpFp16", QnnDelegate.checkCapability(QnnDelegate.Capability.HTP_RUNTIME_FP16))
             o.put("htpQuantisiert", QnnDelegate.checkCapability(QnnDelegate.Capability.HTP_RUNTIME_QUANTIZED))
             o.put("dsp", QnnDelegate.checkCapability(QnnDelegate.Capability.DSP_RUNTIME))
         } catch (e: Throwable) {
             o.put("fehler", e.toString())
+        }
+        // Nur eine Angabe für den Bericht: Scheitert sie, ist der Chip deshalb nicht unerreichbar.
+        try {
+            o.put("delegateApi", QnnDelegate.getVersion().joinToString("."))
+        } catch (e: Throwable) {
+            o.put("delegateApiFehler", e.toString().take(200))
         }
         val libs = JSONArray()
         File(context.applicationInfo.nativeLibraryDir).listFiles()?.sortedBy { it.name }?.forEach {
