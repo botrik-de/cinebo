@@ -229,13 +229,37 @@ internal object PipelineMath {
 
     /**
      * Wärmeregelung: kürzester Abstand zwischen zwei KI-Durchgängen je Wärmestufe von Android
-     * (0 keine, 1 leicht, 2 mittel, 3 stark, 4 kritisch, 5 Notfall, 6 Abschaltung).
+     * (0 keine, 1 leicht, 2 mittel, 3 stark, 4 kritisch, 5 Notfall, 6 Abschaltung). Unter etwa
+     * 5,7 Durchgängen pro Sekunde reichen 10 Bilder Verzögerung nicht mehr für Masken vor und
+     * nach jedem Bild; deshalb spart die Regelung zuerst die Tiefe ein ([depthEvery]) und bremst
+     * die Verfolgung erst ab „kritisch“ unter 6 pro Sekunde.
      */
     fun minIntervalMs(thermalStatus: Int): Long = when {
-        thermalStatus >= 5 -> 1000L
-        thermalStatus >= 4 -> 333L
-        thermalStatus >= 3 -> 200L
+        thermalStatus >= 5 -> 333L
+        thermalStatus >= 4 -> 200L
+        thermalStatus >= 3 -> 167L
         else -> 0L
+    }
+
+    /**
+     * Wie oft die KI live die Tiefe rechnet: 1 = jeden Durchgang, 4 = jeden vierten, 0 = gar nicht.
+     * In Stufe 3 braucht die Unschärfe die Tiefe noch nicht; sie läuft für die Messung mit und
+     * fällt bei Hitze als Erstes weg.
+     */
+    fun depthEvery(thermalStatus: Int): Int = when {
+        thermalStatus >= 4 -> 0
+        thermalStatus >= 3 -> 4
+        else -> 1
+    }
+
+    /**
+     * Stärke der Unschärfe nach dem Alter der nächsten KI-Maske: voll bis 0,4 s, dann gleichmäßig
+     * weniger bis 0 bei 1,5 s. So schaltet die Unschärfe nie hart ab, wenn die KI stockt.
+     */
+    fun maskFade(ageNs: Long): Float = when {
+        ageNs <= 400_000_000L -> 1f
+        ageNs >= 1_500_000_000L -> 0f
+        else -> 1f - (ageNs - 400_000_000L) / 1_100_000_000f
     }
 
     /** Wahrscheinlichkeit 0 bis 255 zu Logits von −16 bis 16 in Achtelschritten (Sigmoid). */

@@ -258,9 +258,24 @@ class PipelineMathTest {
     fun waermeregelung() {
         assertEquals(0L, PipelineMath.minIntervalMs(0))
         assertEquals(0L, PipelineMath.minIntervalMs(2))
-        assertEquals(200L, PipelineMath.minIntervalMs(3))
-        assertEquals(333L, PipelineMath.minIntervalMs(4))
-        assertEquals(1000L, PipelineMath.minIntervalMs(6))
+        assertEquals(167L, PipelineMath.minIntervalMs(3))
+        assertEquals(200L, PipelineMath.minIntervalMs(4))
+        assertEquals(333L, PipelineMath.minIntervalMs(5))
+        assertEquals(333L, PipelineMath.minIntervalMs(6))
+        // Zuerst fällt die Tiefe weg, die Verfolgung bleibt bis „stark“ über 5,7 pro Sekunde.
+        assertEquals(1, PipelineMath.depthEvery(2))
+        assertEquals(4, PipelineMath.depthEvery(3))
+        assertEquals(0, PipelineMath.depthEvery(4))
+        assertTrue(1000.0 / PipelineMath.minIntervalMs(3) >= 5.7)
+    }
+
+    @Test
+    fun unschaerfeKlingtMitAlterDerMaskeAus() {
+        assertEquals(1f, PipelineMath.maskFade(0L), 0f)
+        assertEquals(1f, PipelineMath.maskFade(400_000_000L), 0f)
+        assertEquals(0.5f, PipelineMath.maskFade(950_000_000L), 1e-6f)
+        assertEquals(0f, PipelineMath.maskFade(1_500_000_000L), 0f)
+        assertEquals(0f, PipelineMath.maskFade(Long.MAX_VALUE), 0f)
     }
 
     @Test

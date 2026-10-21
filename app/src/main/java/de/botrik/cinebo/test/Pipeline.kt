@@ -12,6 +12,7 @@ import android.opengl.GLES11Ext
 import android.opengl.GLES30
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Process
 import android.util.Size
 import android.view.Surface
 import androidx.camera.core.CameraEffect
@@ -33,12 +34,19 @@ internal interface AiDemand {
 
     /** Die KI wartet gerade auf ein Bild. */
     val waiting: Boolean
+
+    /** Rechnet die KI beim nächsten Durchgang die Tiefe? Sonst spart sich die Pipeline das Tiefenbild. */
+    val depthNeeded: Boolean
 }
 
 /** Nimmt die Masken der KI an (vom KI-Thread). */
 internal interface MaskSink {
-    /** [probabilities] (256 × 256, Zeile 0 oben) gehört zum Kamerabild [frameNs]; wird sofort kopiert. */
-    fun onMask(frameNs: Long, probabilities: ByteArray, present: Boolean)
+    /**
+     * [probabilities] (256 × 256, Zeile 0 oben) gehört zum Kamerabild [frameNs]; wird sofort
+     * kopiert. [generation] zählt, wie oft die Verfolgung neu angesetzt hat (Antippen): Masken
+     * verschiedener Motive mischt die Pipeline nicht.
+     */
+    fun onMask(frameNs: Long, probabilities: ByteArray, present: Boolean, generation: Int)
 }
 
 /** CameraX-Effekt mit unserem Prozessor: ein Kamerastrom für Vorschau (und Video). */
@@ -49,14 +57,15 @@ internal class PipelineEffect(targets: Int, processor: BokehProcessor) :
  * Die Grafik-Pipeline aus Stufe 3, als Effekt in CameraX: Jedes Kamerabild geht hier durch,
  * bevor CameraX es an Vorschau und Videoaufnahme gibt.
  *
- * - Für die KI rendert sie bei Bedarf ein aufrechtes Bild (1024² gestreckt für EdgeTAM, 518²
- *   eingepasst für die Tiefe) und liest es als Gleitkommazahlen direkt in den [FramePool].
  * - Für die Unschärfe hält sie die letzten Bilder in einem Ring und gibt jedes erst
  *   [requestedDelay] Bilder später aus. Bis dahin hat die KI die Masken zu den KI-Bildern davor
  *   und danach gerechnet; das Bild bekommt die Mischung beider nach der Zeit. So sind Bild und
- *   Maske verschweißt. Die Ausgabe trägt den Zeitstempel der Kamera; die Zeitachse der Aufnahme
- *   samt Ton stimmt deshalb trotz der Verzögerung.
- * - Ohne Unschärfe ([strength] 0) reicht sie jedes Bild sofort durch (Vergleichsclip).
+ *   Maske verschweißt. Die Unschärfe entsteht nur aus Hintergrund (kein Lichthof ums Motiv).
+ *   Die Ausgabe trägt den Zeitstempel der Kamera; die Zeitachse der Aufnahme samt Ton stimmt
+ *   deshalb trotz der Verzögerung.
+ * - Für die KI rendert sie bei Bedarf ein aufrechtes Bild (1024² gestreckt für EdgeTAM, 518²
+ *   eingepasst für die Tiefe) und liest es als Gleitkommazahlen direkt in den [FramePool].
+ * - Ohne Unschärfe ([strength] 0) reicht sie jedes Bild sofort durch.
  *
  * Für jede Bindung an CameraX einen neuen Prozessor nehmen und ihn nach dem Lösen mit
  * [release] freigeben. Alles läuft auf einem eigenen Thread mit einem OpenGL-ES-3-Kontext.
@@ -74,15 +83,16 @@ internal class BokehProcessor(
     private val thumbnailAfter: Int = THUMBNAIL_AFTER,
 ) : SurfaceProcessor, MaskSink {
 
-    private val thread = HandlerThread("pipeline").apply { start() }
+    // Hohe Priorität wie bei der Bildausgabe: Wer hier zu spät kommt, verliert Bilder.
+    private val thread = HandlerThread("pipeline", Process.THREAD_PRIORITY_URGENT_DISPLAY).apply { start() }
     private val handler = Handler(thread.looper)
 
     /**
-     * Auf diesem Thread läuft alles; CameraX ruft den Prozessor darüber auf. Nach dem Freigeben
-     * verwirft er Aufträge still (wie CameraX' eigener Prozessor), statt CameraX mit einer
-     * Ausnahme zu stören.
+     * Auf diesem Thread läuft alles; CameraX ruft den Prozessor darüber auf. Ist der Thread nach
+     * dem Freigeben schon beendet, läuft ein später Auftrag direkt; alle Einstiege sind dann
+     * harmlos, und CameraX wartet nie vergeblich auf eine Antwort.
      */
-    val executor: Executor = Executor { r -> handler.post(r) }
+    val executor: Executor = Executor { r -> if (!handler.post(r)) r.run() }
 
     val stats = PipelineStats()
 
@@ -90,6 +100,7 @@ internal class BokehProcessor(
 
     @Volatile private var releaseRequested = false
     private var glDone = false
+    private val forceRelease = Runnable { finishRelease(force = true) }
     private var display: EGLDisplay = EGL14.EGL_NO_DISPLAY
     private var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
     private var eglConfig: EGLConfig? = null
@@ -100,6 +111,7 @@ internal class BokehProcessor(
     private lateinit var pack: Program
     private lateinit var downOes: Program
     private lateinit var down: Program
+    private lateinit var weigh: Program
     private lateinit var gauss: Program
     private lateinit var composite: Program
     private var floatPacking = false
@@ -109,7 +121,7 @@ internal class BokehProcessor(
         /** Drehung vom gespeicherten Puffer zum aufrechten Bild laut CameraX; −1 = noch unbekannt. */
         @Volatile var rotation = -1
         var released = false
-        /** Zuletzt gemeldete Lage (st-Drehung, aufrecht, Spiegelung), damit der Bericht jede Änderung sieht. */
+        /** Zuletzt gemeldete Lage (st-Drehung, Rest bis aufrecht); ändert sie sich, beginnt der Fluss neu. */
         var orientationKey = ""
     }
 
@@ -122,18 +134,26 @@ internal class BokehProcessor(
     private val outputs = ArrayList<Output>()
     private val stMatrix = FloatArray(16)
 
-    // Ring der verzögerten Bilder: volles Bild (Pufferausrichtung) und seine unscharfe Fassung.
-    private class Slot(val tex: Int, val fbo: Int, val blurTex: Int, val blurFbo: Int) {
+    // Ring der verzögerten Bilder im st-Raum: volles Bild und seine Fassung in einem Achtel der Größe.
+    private class Slot(val tex: Int, val fbo: Int, val smallTex: Int, val smallFbo: Int) {
         var ts = 0L
     }
 
     private var ring: List<Slot> = emptyList()
     private var ringSize: Size? = null
     private var ringFailedFor: Size? = null
+    private var smallW = 1
+    private var smallH = 1
     private var delay = 0
     private val queue = ArrayDeque<Slot>()
     private val freeSlots = ArrayDeque<Slot>()
-    private val blurScratch = IntArray(6) // Texturen und Framebuffer: Viertel, Achtel, Achtel (Zwischenschritt)
+    // Zwischenstufen: Viertel (Verkleinern), Hintergrund und Gauß-Zwischenschritt (Achtel).
+    private var quarterTex = 0
+    private var quarterFbo = 0
+    private var bgTex = 0
+    private var bgFbo = 0
+    private var bgTmpTex = 0
+    private var bgTmpFbo = 0
 
     // Bilder für die KI.
     private var encTex = 0
@@ -144,6 +164,7 @@ internal class BokehProcessor(
     private var encPackFbo = 0
     private var depthPackTex = 0
     private var depthPackFbo = 0
+    private var aiTargetsFailed = false
     private val encLayout = PipelineMath.PackLayout(FrameSlot.ENC, ENC_PACK_WIDTH)
     private val depthLayout = PipelineMath.PackLayout(FrameSlot.DEPTH, DEPTH_PACK_WIDTH)
     private var rgbaRead: ByteBuffer? = null
@@ -155,13 +176,14 @@ internal class BokehProcessor(
     private val maskTex = IntArray(MASKS)
     private val maskNs = LongArray(MASKS)
     private val maskPresent = BooleanArray(MASKS)
+    private val maskGeneration = IntArray(MASKS)
     private var maskCount = 0
     private var maskNext = 0
     private val pendingLock = Any()
     private val pending = ArrayDeque<PendingMask>()
     private val maskUpload: ByteBuffer = ByteBuffer.allocateDirect(MASK_SIZE * MASK_SIZE)
 
-    private class PendingMask(val ns: Long, val bytes: ByteArray, val present: Boolean)
+    private class PendingMask(val ns: Long, val bytes: ByteArray, val present: Boolean, val generation: Int)
 
     // ---------------------------------------------------- SurfaceProcessor
 
@@ -228,10 +250,10 @@ internal class BokehProcessor(
         stats.error("CameraX", e)
     }
 
-    override fun onMask(frameNs: Long, probabilities: ByteArray, present: Boolean) {
+    override fun onMask(frameNs: Long, probabilities: ByteArray, present: Boolean, generation: Int) {
         val copy = probabilities.copyOf(MASK_SIZE * MASK_SIZE)
         synchronized(pendingLock) {
-            pending.addLast(PendingMask(frameNs, copy, present))
+            pending.addLast(PendingMask(frameNs, copy, present, generation))
             while (pending.size > MAX_PENDING_MASKS) pending.removeFirst()
         }
     }
@@ -247,8 +269,7 @@ internal class BokehProcessor(
      */
     fun release() {
         releaseRequested = true
-        handler.post { finishRelease(force = false) }
-        handler.postDelayed({ finishRelease(force = true) }, RELEASE_TIMEOUT_MS)
+        if (handler.post { finishRelease(force = false) }) handler.postDelayed(forceRelease, RELEASE_TIMEOUT_MS)
     }
 
     private fun finishRelease(force: Boolean) {
@@ -273,7 +294,8 @@ internal class BokehProcessor(
         }
         display = EGL14.EGL_NO_DISPLAY
         glDone = true
-        handler.removeCallbacksAndMessages(null)
+        // Nur die Zeitgrenze zurücknehmen; was CameraX schon geschickt hat, läuft noch durch.
+        handler.removeCallbacks(forceRelease)
         thread.quitSafely()
     }
 
@@ -303,13 +325,18 @@ internal class BokehProcessor(
             val rotationDegrees = if (input.rotation >= 0) input.rotation else stRotation
             val upright = PipelineMath.uprightFromSt(rotationDegrees, stMatrix)
             val (sw, sh) = PipelineMath.stSize(input.size.width, input.size.height, stMatrix)
-            val key = "$stRotation/$upright/${input.rotation}"
+            val key = "$stRotation/$upright"
             if (key != input.orientationKey) {
+                // Gespeicherte Bilder und Masken passen nicht mehr zu einer neuen Lage.
+                if (input.orientationKey.isNotEmpty()) {
+                    resetFlow()
+                    stats.note("Lage geändert: st $stRotation°, bis aufrecht $upright°")
+                }
                 input.orientationKey = key
                 stats.orientation(stRotation, PipelineMath.stMirrored(stMatrix), upright, sw, sh)
             }
-            var aiMs = Double.NaN
-            if (aiPool != null) aiMs = maybeAiFrame(input, ts, sw, sh, upright)
+            // Erst das Bild für Vorschau und Aufnahme, dann das KI-Bild: Das Lesen des KI-Bildes
+            // wartet auf die Grafikeinheit und soll die Ausgabe nicht aufhalten.
             if (outputs.isNotEmpty()) {
                 if (strength > 0f && ensureRing(Size(sw, sh))) {
                     pushRing(input, ts, sw, sh)
@@ -318,6 +345,7 @@ internal class BokehProcessor(
                     drawDirect(input, ts)
                 }
             }
+            val aiMs = if (aiPool != null) maybeAiFrame(input, ts, sw, sh, upright) else Double.NaN
             stats.frameDone((System.nanoTime() - t0) / 1e6, aiMs)
         } catch (e: Throwable) {
             stats.error("Bild", e)
@@ -326,59 +354,159 @@ internal class BokehProcessor(
 
     /** Ohne Unschärfe: Kamerabild direkt in jede Ausgabe, mit seinem Zeitstempel. */
     private fun drawDirect(input: Input, ts: Long) {
-        for (o in outputs) {
-            o.target.updateTransformMatrix(o.matrix, stMatrix)
-            makeCurrent(o.egl)
-            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
-            GLES30.glViewport(0, 0, o.size.width, o.size.height)
+        for (o in outputs.toList()) {
+            try {
+                o.target.updateTransformMatrix(o.matrix, stMatrix)
+                makeCurrent(o.egl)
+                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+                GLES30.glViewport(0, 0, o.size.width, o.size.height)
+                copyOes.use()
+                bindOes(0, input.oes)
+                copyOes.int("uCam", 0)
+                copyOes.mat("uTex", o.matrix)
+                drawTriangle()
+                present(o, ts)
+            } catch (e: Throwable) {
+                stats.error("Ausgabe", e)
+            }
+        }
+        stats.frameOut(ts, null, blurred = false, subject = false, stale = false, gapNs = -1L)
+    }
+
+    /** Kamerabild in den Ring (st-Raum, [w] × [h]) und seine Fassung in einem Achtel der Größe dazu. */
+    private fun pushRing(input: Input, ts: Long, w: Int, h: Int) {
+        val slot = freeSlots.removeFirstOrNull() ?: queue.removeFirst().also { stats.dropped() }
+        try {
+            slot.ts = ts
+            // Scharfes Bild: vUv ist die Koordinate im st-Raum; die Matrix der SurfaceTexture führt
+            // zur Textur. Der Ring hat die Größe des st-Raums, so bleibt jeder Bildpunkt erhalten.
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, slot.fbo)
+            GLES30.glViewport(0, 0, w, h)
             copyOes.use()
             bindOes(0, input.oes)
             copyOes.int("uCam", 0)
-            copyOes.mat("uTex", o.matrix)
+            copyOes.mat("uTex", stMatrix)
             drawTriangle()
-            present(o, ts)
+            // Verkleinert: auf ein Viertel (4 × 4 Pixel aus der Kamera gemittelt), dann auf ein Achtel.
+            // Die Unschärfe daraus entsteht erst bei der Ausgabe, mit der Maske dieses Zeitpunkts.
+            val (qw, qh) = quarter(w, h)
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, quarterFbo)
+            GLES30.glViewport(0, 0, qw, qh)
+            downOes.use()
+            bindOes(0, input.oes)
+            downOes.int("uCam", 0)
+            downOes.mat("uTex", stMatrix)
+            downOes.vec2("uStep", 1f / w, 1f / h)
+            drawTriangle()
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, slot.smallFbo)
+            GLES30.glViewport(0, 0, smallW, smallH)
+            down.use()
+            bind2d(0, quarterTex)
+            down.int("uSrc", 0)
+            drawTriangle()
+            queue.addLast(slot)
+        } catch (e: Throwable) {
+            freeSlots.addLast(slot)
+            throw e
         }
-        stats.frameOut(ts, null, blurred = false, subject = false)
     }
 
-    /** Kamerabild in den Ring (st-Raum, [w] × [h]) und seine unscharfe Fassung dazu. */
-    private fun pushRing(input: Input, ts: Long, w: Int, h: Int) {
-        val slot = freeSlots.removeFirstOrNull() ?: queue.removeFirst().also { stats.dropped() }
-        slot.ts = ts
-        // Scharfes Bild: vUv ist die Koordinate im st-Raum; die Matrix der SurfaceTexture führt
-        // zur Textur. Der Ring hat die Größe des st-Raums, so bleibt jeder Bildpunkt erhalten.
-        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, slot.fbo)
-        GLES30.glViewport(0, 0, w, h)
-        copyOes.use()
-        bindOes(0, input.oes)
-        copyOes.int("uCam", 0)
-        copyOes.mat("uTex", stMatrix)
-        drawTriangle()
-        // Unscharf: auf ein Viertel (4 × 4 Pixel aus der Kamera), auf ein Achtel, Gauß waagerecht und senkrecht.
-        val (qw, qh) = quarter(w, h)
-        val (ew, eh) = eighth(w, h)
-        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, blurScratch[1])
-        GLES30.glViewport(0, 0, qw, qh)
-        downOes.use()
-        bindOes(0, input.oes)
-        downOes.int("uCam", 0)
-        downOes.mat("uTex", stMatrix)
-        downOes.vec2("uStep", 1f / w, 1f / h)
-        drawTriangle()
-        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, blurScratch[3])
-        GLES30.glViewport(0, 0, ew, eh)
-        down.use()
-        bind2d(0, blurScratch[0])
-        down.int("uSrc", 0)
-        drawTriangle()
-        gaussPass(blurScratch[2], blurScratch[5], 1f / ew, 0f, ew, eh)
-        gaussPass(blurScratch[4], slot.blurFbo, 0f, 1f / eh, ew, eh)
-        queue.addLast(slot)
+    /**
+     * Ein verzögertes Bild mit der Maske seines Zeitpunkts ausgeben; [upright]: Drehung st-Raum →
+     * aufrecht. Der Platz im Ring kommt in jedem Fall zurück, auch wenn eine Ausgabe scheitert:
+     * Sonst stünde das Bild für immer.
+     */
+    private fun emit(slot: Slot, upright: Int) {
+        try {
+            var pick = PipelineMath.pickMasks(maskNs, maskCount, slot.ts, MAX_MASK_DISTANCE_NS)
+            var fade = 1f
+            var stale = false
+            if (pick == null) {
+                // Stockt die KI, gilt die nächste Maske weiter, mit nachlassender Unschärfe: Das
+                // Bild springt nie hart zwischen unscharf und scharf.
+                pick = PipelineMath.pickMasks(maskNs, maskCount, slot.ts, Long.MAX_VALUE)
+                if (pick != null) {
+                    fade = PipelineMath.maskFade(pick.distanceNs)
+                    stale = true
+                }
+            }
+            // Nach dem Antippen eines neuen Motivs nicht zwischen altem und neuem Motiv überblenden.
+            if (pick != null && pick.a != pick.b && maskGeneration[pick.a] != maskGeneration[pick.b]) {
+                pick = if (pick.mix < 0.5f) pick.copy(b = pick.a, mix = 0f) else pick.copy(a = pick.b, mix = 0f)
+            }
+            val presentA = pick != null && maskPresent[pick.a]
+            val presentB = pick != null && maskPresent[pick.b]
+            val blur = if (pick != null && (presentA || presentB)) strength * fade else 0f
+            val bufToMask = PipelineMath.bufferToUpright(upright)
+            if (pick != null && blur > 0f) renderBackground(slot, pick, presentA, presentB, bufToMask)
+            val stInverse = PipelineMath.invert(stMatrix) ?: PipelineMath.identity()
+            for (o in outputs.toList()) {
+                try {
+                    o.target.updateTransformMatrix(o.matrix, stMatrix)
+                    // Ausgabe-Koordinate → st-Raum: Die Ausgabematrix führt zur Textur, die Umkehrung
+                    // der SurfaceTexture-Matrix von dort zurück in den st-Raum, in dem der Ring liegt.
+                    val outToBuf = PipelineMath.multiply(stInverse, o.matrix)
+                    makeCurrent(o.egl)
+                    GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+                    GLES30.glViewport(0, 0, o.size.width, o.size.height)
+                    composite.use()
+                    // Texturen vor jedem Zeichnen neu binden (ein Zwischenschritt kann Einheiten belegt haben).
+                    bind2d(0, slot.tex)
+                    bind2d(1, bgTex)
+                    bind2d(2, slot.smallTex)
+                    bind2d(3, maskTex[pick?.a ?: 0])
+                    bind2d(4, maskTex[pick?.b ?: 0])
+                    composite.int("uSharp", 0)
+                    composite.int("uBg", 1)
+                    composite.int("uSmall", 2)
+                    composite.int("uMaskA", 3)
+                    composite.int("uMaskB", 4)
+                    composite.mat("uOutToBuf", outToBuf)
+                    composite.mat("uBufToMask", bufToMask)
+                    composite.float("uMix", pick?.mix ?: 0f)
+                    composite.vec2("uPresent", if (presentA) 1f else 0f, if (presentB) 1f else 0f)
+                    composite.float("uStrength", blur)
+                    drawTriangle()
+                    present(o, slot.ts)
+                } catch (e: Throwable) {
+                    stats.error("Ausgabe", e)
+                }
+            }
+            val gapNs = if (pick != null && pick.a != pick.b) maskNs[pick.b] - maskNs[pick.a] else -1L
+            stats.frameOut(slot.ts, pick, blurred = true, subject = blur > 0f, stale = stale, gapNs = gapNs)
+        } finally {
+            // Nichts bleibt gebunden, was ein späterer Schritt als Ziel beschreibt.
+            for (unit in 0 until 5) bind2d(unit, 0)
+            freeSlots.addLast(slot)
+        }
     }
 
-    private fun gaussPass(src: Int, dstFbo: Int, dx: Float, dy: Float, w: Int, h: Int) {
+    /**
+     * Unschärfe nur aus Hintergrund für [slot]: verkleinertes Bild mal Anteil Hintergrund
+     * (weigh.frag), dann Gauß waagerecht und senkrecht. Ergebnis (rgb · w, w) in [bgTex];
+     * composite.frag teilt durch w.
+     */
+    private fun renderBackground(slot: Slot, pick: PipelineMath.MaskPick, presentA: Boolean, presentB: Boolean, bufToMask: FloatArray) {
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, bgFbo)
+        GLES30.glViewport(0, 0, smallW, smallH)
+        weigh.use()
+        bind2d(0, slot.smallTex)
+        bind2d(1, maskTex[pick.a])
+        bind2d(2, maskTex[pick.b])
+        weigh.int("uSmall", 0)
+        weigh.int("uMaskA", 1)
+        weigh.int("uMaskB", 2)
+        weigh.mat("uBufToMask", bufToMask)
+        weigh.float("uMix", pick.mix)
+        weigh.vec2("uPresent", if (presentA) 1f else 0f, if (presentB) 1f else 0f)
+        drawTriangle()
+        gaussPass(bgTex, bgTmpFbo, 1f / smallW, 0f)
+        gaussPass(bgTmpTex, bgFbo, 0f, 1f / smallH)
+    }
+
+    private fun gaussPass(src: Int, dstFbo: Int, dx: Float, dy: Float) {
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, dstFbo)
-        GLES30.glViewport(0, 0, w, h)
+        GLES30.glViewport(0, 0, smallW, smallH)
         gauss.use()
         bind2d(0, src)
         gauss.int("uSrc", 0)
@@ -388,49 +516,9 @@ internal class BokehProcessor(
         drawTriangle()
     }
 
-    /** Ein verzögertes Bild mit der Maske seines Zeitpunkts ausgeben; [upright]: Drehung st-Raum → aufrecht. */
-    private fun emit(slot: Slot, upright: Int) {
-        val pick = PipelineMath.pickMasks(maskNs, maskCount, slot.ts, MAX_MASK_DISTANCE_NS)
-        val bufToMask = PipelineMath.bufferToUpright(upright)
-        val stInverse = PipelineMath.invert(stMatrix) ?: PipelineMath.identity()
-        for (o in outputs) {
-            o.target.updateTransformMatrix(o.matrix, stMatrix)
-            // Ausgabe-Koordinate → st-Raum: Die Ausgabematrix führt zur Textur, die Umkehrung
-            // der SurfaceTexture-Matrix von dort zurück in den st-Raum, in dem der Ring liegt.
-            val outToBuf = PipelineMath.multiply(stInverse, o.matrix)
-            makeCurrent(o.egl)
-            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
-            GLES30.glViewport(0, 0, o.size.width, o.size.height)
-            composite.use()
-            // Texturen vor jedem Zeichnen neu binden (ein Zwischenschritt kann Einheiten belegt haben).
-            bind2d(0, slot.tex)
-            bind2d(1, slot.blurTex)
-            bind2d(2, maskTex[pick?.a ?: 0])
-            bind2d(3, maskTex[pick?.b ?: 0])
-            composite.int("uSharp", 0)
-            composite.int("uBlur", 1)
-            composite.int("uMaskA", 2)
-            composite.int("uMaskB", 3)
-            composite.mat("uOutToBuf", outToBuf)
-            composite.mat("uBufToMask", bufToMask)
-            composite.float("uMix", pick?.mix ?: 0f)
-            composite.vec2(
-                "uPresent",
-                if (pick != null && maskPresent[pick.a]) 1f else 0f,
-                if (pick != null && maskPresent[pick.b]) 1f else 0f
-            )
-            composite.float("uStrength", if (pick != null) strength else 0f)
-            drawTriangle()
-            present(o, slot.ts)
-        }
-        val subject = pick != null && (maskPresent[pick.a] || maskPresent[pick.b])
-        stats.frameOut(slot.ts, pick, blurred = true, subject = subject)
-        freeSlots.addLast(slot)
-    }
-
     private fun present(o: Output, ts: Long) {
         EGLExt.eglPresentationTimeANDROID(display, o.egl, ts)
-        if (!EGL14.eglSwapBuffers(display, o.egl)) stats.note("eglSwapBuffers: Fehler 0x${Integer.toHexString(EGL14.eglGetError())}")
+        if (!EGL14.eglSwapBuffers(display, o.egl)) stats.swapFailed(EGL14.eglGetError())
     }
 
     // ---------------------------------------------------- Bilder für die KI
@@ -443,22 +531,24 @@ internal class BokehProcessor(
         val pool = aiPool ?: return Double.NaN
         val demand = aiDemand ?: return Double.NaN
         if (!PipelineMath.shouldPrepare(System.nanoTime(), demand.nextTakeNs, demand.waiting, LEAD_MS)) return Double.NaN
+        if (!ensureAiTargets()) return Double.NaN
         val slot = pool.acquire() ?: return Double.NaN
         val start = System.nanoTime()
         try {
-            ensureAiTargets()
+            val withDepth = demand.depthNeeded
             val (uw, uh) = PipelineMath.uprightSize(sw, sh, upright)
             val uprightToTex = PipelineMath.multiply(stMatrix, PipelineMath.uprightToBuffer(upright))
             drawAiFrame(input, encFbo, FrameSlot.ENC, uprightToTex, FULL, uw, uh)
             val box = PipelineMath.letterbox(uw, uh, FrameSlot.DEPTH)
-            drawAiFrame(input, depthFbo, FrameSlot.DEPTH, uprightToTex, box, uw, uh)
+            if (withDepth) drawAiFrame(input, depthFbo, FrameSlot.DEPTH, uprightToTex, box, uw, uh)
             if (floatPacking) {
                 packAndRead(encTex, encPackFbo, encLayout, slot.enc)
-                packAndRead(depthTex, depthPackFbo, depthLayout, slot.depth)
+                if (withDepth) packAndRead(depthTex, depthPackFbo, depthLayout, slot.depth)
             } else {
                 readAsFloats(encFbo, FrameSlot.ENC, slot.enc)
-                readAsFloats(depthFbo, FrameSlot.DEPTH, slot.depth)
+                if (withDepth) readAsFloats(depthFbo, FrameSlot.DEPTH, slot.depth)
             }
+            slot.hasDepth = withDepth
             slot.depthContent.set(box[0], box[1], box[2], box[3])
             slot.timestampNs = ts
             slot.width = uw
@@ -485,7 +575,7 @@ internal class BokehProcessor(
                     stats.error("Vorschaubild", e)
                 }
             }
-            stats.aiFrame()
+            stats.aiFrame(withDepth)
             pool.publish(slot)
             return slot.prepMs
         } catch (e: Throwable) {
@@ -572,6 +662,7 @@ internal class BokehProcessor(
             GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, 0, MASK_SIZE, MASK_SIZE, GLES30.GL_RED, GLES30.GL_UNSIGNED_BYTE, maskUpload)
             maskNs[i] = m.ns
             maskPresent[i] = m.present
+            maskGeneration[i] = m.generation
             stats.maskIn()
         }
     }
@@ -614,7 +705,7 @@ internal class BokehProcessor(
         output.target.close()
     }
 
-    /** Neuer Eingang: alte Bilder und Masken gelten nicht mehr. */
+    /** Neuer Eingang oder neue Lage: alte Bilder und Masken gelten nicht mehr. */
     private fun resetFlow() {
         freeSlots.addAll(queue)
         queue.clear()
@@ -625,6 +716,10 @@ internal class BokehProcessor(
 
     // ---------------------------------------------------- OpenGL
 
+    /**
+     * EGL und alle Programme einrichten. Scheitert ein Schritt, wird alles wieder abgebaut, damit
+     * ein neuer Versuch sauber beginnt und kein halb eingerichteter Zustand bleibt.
+     */
     private fun ensureGl() {
         if (display != EGL14.EGL_NO_DISPLAY) return
         check(!glDone) { "Pipeline schon freigegeben" }
@@ -632,44 +727,60 @@ internal class BokehProcessor(
         check(dpy != EGL14.EGL_NO_DISPLAY) { "Kein EGL-Display" }
         val version = IntArray(2)
         check(EGL14.eglInitialize(dpy, version, 0, version, 1)) { "EGL startet nicht: 0x${Integer.toHexString(EGL14.eglGetError())}" }
-        val attrs = intArrayOf(
-            EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8, EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
-            EGL14.EGL_DEPTH_SIZE, 0, EGL14.EGL_STENCIL_SIZE, 0,
-            EGL14.EGL_RENDERABLE_TYPE, EGLExt.EGL_OPENGL_ES3_BIT_KHR,
-            EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT or EGL14.EGL_PBUFFER_BIT,
-            EGLExt.EGL_RECORDABLE_ANDROID, 1,
-            EGL14.EGL_NONE
-        )
-        val configs = arrayOfNulls<EGLConfig>(1)
-        val count = IntArray(1)
-        check(EGL14.eglChooseConfig(dpy, attrs, 0, configs, 0, 1, count, 0) && count[0] > 0) { "Keine passende EGL-Konfiguration" }
-        val config = configs[0]
-        val ctx = EGL14.eglCreateContext(dpy, config, EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE), 0)
-        check(ctx != null && ctx != EGL14.EGL_NO_CONTEXT) { "Kein OpenGL-ES-3-Kontext: 0x${Integer.toHexString(EGL14.eglGetError())}" }
-        val pb = EGL14.eglCreatePbufferSurface(dpy, config, intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0)
-        check(pb != null && pb != EGL14.EGL_NO_SURFACE) { "Keine Pbuffer-Fläche: 0x${Integer.toHexString(EGL14.eglGetError())}" }
         display = dpy
-        eglContext = ctx
-        eglConfig = config
-        pbuffer = pb
-        makeCurrent(pbuffer)
-        val vaos = IntArray(1)
-        GLES30.glGenVertexArrays(1, vaos, 0)
-        vao = vaos[0]
-        GLES30.glBindVertexArray(vao)
-        copyOes = Program("copy_oes.frag")
-        aiFrame = Program("ai_frame.frag")
-        pack = Program("pack.frag")
-        downOes = Program("down_oes.frag")
-        down = Program("down.frag")
-        gauss = Program("gauss.frag")
-        composite = Program("composite.frag")
-        createMaskTextures()
-        val glVersion = GLES30.glGetString(GLES30.GL_VERSION) ?: "?"
-        val extensions = GLES30.glGetString(GLES30.GL_EXTENSIONS) ?: ""
-        floatPacking = glVersion.contains("OpenGL ES 3.2") || extensions.contains("GL_EXT_color_buffer_float")
-        stats.gl(GLES30.glGetString(GLES30.GL_RENDERER) ?: "?", glVersion)
-        checkGl("Start")
+        try {
+            val attrs = intArrayOf(
+                EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8, EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
+                EGL14.EGL_DEPTH_SIZE, 0, EGL14.EGL_STENCIL_SIZE, 0,
+                EGL14.EGL_RENDERABLE_TYPE, EGLExt.EGL_OPENGL_ES3_BIT_KHR,
+                EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT or EGL14.EGL_PBUFFER_BIT,
+                EGLExt.EGL_RECORDABLE_ANDROID, 1,
+                EGL14.EGL_NONE
+            )
+            val configs = arrayOfNulls<EGLConfig>(1)
+            val count = IntArray(1)
+            check(EGL14.eglChooseConfig(dpy, attrs, 0, configs, 0, 1, count, 0) && count[0] > 0) { "Keine passende EGL-Konfiguration" }
+            eglConfig = configs[0]
+            val ctx = EGL14.eglCreateContext(dpy, eglConfig, EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE), 0)
+            check(ctx != null && ctx != EGL14.EGL_NO_CONTEXT) { "Kein OpenGL-ES-3-Kontext: 0x${Integer.toHexString(EGL14.eglGetError())}" }
+            eglContext = ctx
+            val pb = EGL14.eglCreatePbufferSurface(dpy, eglConfig, intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0)
+            check(pb != null && pb != EGL14.EGL_NO_SURFACE) { "Keine Pbuffer-Fläche: 0x${Integer.toHexString(EGL14.eglGetError())}" }
+            pbuffer = pb
+            makeCurrent(pbuffer)
+            val vaos = IntArray(1)
+            GLES30.glGenVertexArrays(1, vaos, 0)
+            vao = vaos[0]
+            GLES30.glBindVertexArray(vao)
+            GLES30.glClearColor(0f, 0f, 0f, 0f)
+            copyOes = Program("copy_oes.frag")
+            aiFrame = Program("ai_frame.frag")
+            pack = Program("pack.frag")
+            downOes = Program("down_oes.frag")
+            down = Program("down.frag")
+            weigh = Program("weigh.frag")
+            gauss = Program("gauss.frag")
+            composite = Program("composite.frag")
+            createMaskTextures()
+            val glVersion = GLES30.glGetString(GLES30.GL_VERSION) ?: "?"
+            val extensions = GLES30.glGetString(GLES30.GL_EXTENSIONS) ?: ""
+            floatPacking = glVersion.contains("OpenGL ES 3.2") || extensions.contains("GL_EXT_color_buffer_float")
+            stats.gl(GLES30.glGetString(GLES30.GL_RENDERER) ?: "?", glVersion)
+            checkGl("Start")
+        } catch (e: Throwable) {
+            try {
+                EGL14.eglMakeCurrent(dpy, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+                if (pbuffer != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(dpy, pbuffer)
+                if (eglContext != EGL14.EGL_NO_CONTEXT) EGL14.eglDestroyContext(dpy, eglContext)
+                EGL14.eglTerminate(dpy)
+            } catch (_: Throwable) {
+            }
+            pbuffer = EGL14.EGL_NO_SURFACE
+            eglContext = EGL14.EGL_NO_CONTEXT
+            eglConfig = null
+            display = EGL14.EGL_NO_DISPLAY
+            throw e
+        }
     }
 
     private fun makeCurrent(surface: EGLSurface) {
@@ -677,8 +788,9 @@ internal class BokehProcessor(
     }
 
     /**
-     * Ring für [requestedDelay] Bilder Verzögerung. Reicht der Grafikspeicher nicht, geht es mit
-     * weniger Bildern weiter; klappt auch das nicht, ohne Unschärfe (steht im Bericht).
+     * Ring für [requestedDelay] Bilder Verzögerung samt Zwischenstufen. Reicht der Grafikspeicher
+     * nicht, geht es mit weniger Bildern weiter; klappt auch das nicht, ohne Unschärfe (steht im
+     * Bericht).
      */
     private fun ensureRing(size: Size): Boolean {
         if (ringSize == size && ring.isNotEmpty()) return true
@@ -687,32 +799,49 @@ internal class BokehProcessor(
         val (qw, qh) = quarter(size.width, size.height)
         val (ew, eh) = eighth(size.width, size.height)
         drainGlErrors()
-        val scratch = listOf(qw to qh, ew to eh, ew to eh).map { (w, h) -> allocate(w, h) }
-        if (scratch.any { it == null }) {
-            scratch.filterNotNull().forEach { deleteTarget(it) }
+        val q = allocate(qw, qh, GLES30.GL_RGBA8)
+        // Der gewichtete Hintergrund braucht Halbfloat, sonst zeigen sich Stufen am Motivrand.
+        var bg = allocate(ew, eh, GLES30.GL_RGBA16F)
+        var tmp = allocate(ew, eh, GLES30.GL_RGBA16F)
+        if (bg == null || tmp == null) {
+            bg?.let { deleteTarget(it) }
+            tmp?.let { deleteTarget(it) }
+            bg = allocate(ew, eh, GLES30.GL_RGBA8)
+            tmp = allocate(ew, eh, GLES30.GL_RGBA8)
+            stats.note("Unschärfe mit 8 Bit statt Halbfloat")
+        }
+        if (q == null || bg == null || tmp == null) {
+            listOfNotNull(q, bg, tmp).forEach { deleteTarget(it) }
             ringFailedFor = size
-            stats.note("Kein Grafikspeicher für die Unschärfe")
+            stats.note("Kein Grafikspeicher für die Unschärfe: ohne Unschärfe weiter")
             return false
         }
-        scratch.forEachIndexed { i, t -> blurScratch[i * 2] = t!!.first; blurScratch[i * 2 + 1] = t.second }
+        quarterTex = q.first
+        quarterFbo = q.second
+        bgTex = bg.first
+        bgFbo = bg.second
+        bgTmpTex = tmp.first
+        bgTmpFbo = tmp.second
+        smallW = ew
+        smallH = eh
         val wanted = requestedDelay.coerceIn(1, MAX_DELAY)
         for (d in listOf(wanted, (wanted + 1) / 2, 2).distinct().filter { it <= wanted }) {
             val slots = ArrayList<Slot>()
             var ok = true
             for (i in 0..d) {
-                val sharp = allocate(size.width, size.height)
-                val blur = if (sharp != null) allocate(ew, eh) else null
-                if (sharp == null || blur == null) {
+                val sharp = allocate(size.width, size.height, GLES30.GL_RGBA8)
+                val small = if (sharp != null) allocate(ew, eh, GLES30.GL_RGBA8) else null
+                if (sharp == null || small == null) {
                     sharp?.let { deleteTarget(it) }
                     ok = false
                     break
                 }
-                slots.add(Slot(sharp.first, sharp.second, blur.first, blur.second))
+                slots.add(Slot(sharp.first, sharp.second, small.first, small.second))
             }
             if (!ok) {
                 for (s in slots) {
                     deleteTarget(s.tex to s.fbo)
-                    deleteTarget(s.blurTex to s.blurFbo)
+                    deleteTarget(s.smallTex to s.smallFbo)
                 }
                 stats.note("Grafikspeicher reicht nicht für $d Bilder Verzögerung")
                 continue
@@ -723,32 +852,41 @@ internal class BokehProcessor(
             queue.clear()
             delay = d
             ringSize = size
-            stats.ring(d, slots.size, slots.size * size.width.toLong() * size.height * 4)
+            stats.ring(d, slots.size, slots.size * (size.width.toLong() * size.height + ew.toLong() * eh) * 4)
             return true
         }
-        for (i in 0 until 3) deleteTarget(blurScratch[i * 2] to blurScratch[i * 2 + 1])
-        blurScratch.fill(0)
+        freeScratch()
         ringFailedFor = size
         stats.note("Kein Grafikspeicher für die Verzögerung: ohne Unschärfe weiter")
         return false
     }
 
-    /** RGBA8-Textur mit Framebuffer; null, wenn der Grafikspeicher nicht reicht. */
-    private fun allocate(w: Int, h: Int): Pair<Int, Int>? {
-        val tex = texture(w, h, GLES30.GL_RGBA8, linear = true)
-        val err = GLES30.glGetError()
-        if (err != GLES30.GL_NO_ERROR) {
+    /**
+     * Textur mit Framebuffer; null, wenn das Format nicht geht oder der Grafikspeicher nicht
+     * reicht. Das Löschen danach belegt den Speicher wirklich, so fällt ein Mangel gleich auf.
+     */
+    private fun allocate(w: Int, h: Int, internal: Int): Pair<Int, Int>? {
+        val tex = texture(w, h, internal, linear = true)
+        if (GLES30.glGetError() != GLES30.GL_NO_ERROR) {
             GLES30.glDeleteTextures(1, intArrayOf(tex), 0)
             drainGlErrors()
             return null
         }
-        return try {
-            tex to framebuffer(tex)
+        val fbo = try {
+            framebuffer(tex)
         } catch (e: Throwable) {
             GLES30.glDeleteTextures(1, intArrayOf(tex), 0)
             drainGlErrors()
-            null
+            return null
         }
+        GLES30.glViewport(0, 0, w, h)
+        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
+        if (GLES30.glGetError() != GLES30.GL_NO_ERROR) {
+            deleteTarget(tex to fbo)
+            drainGlErrors()
+            return null
+        }
+        return tex to fbo
     }
 
     private fun deleteTarget(t: Pair<Int, Int>) {
@@ -756,27 +894,55 @@ internal class BokehProcessor(
         if (t.first != 0) GLES30.glDeleteTextures(1, intArrayOf(t.first), 0)
     }
 
+    private fun freeScratch() {
+        deleteTarget(quarterTex to quarterFbo)
+        deleteTarget(bgTex to bgFbo)
+        deleteTarget(bgTmpTex to bgTmpFbo)
+        quarterTex = 0
+        quarterFbo = 0
+        bgTex = 0
+        bgFbo = 0
+        bgTmpTex = 0
+        bgTmpFbo = 0
+    }
+
     private fun freeRing() {
         if (ring.isEmpty()) return
         for (s in ring) {
             deleteTarget(s.tex to s.fbo)
-            deleteTarget(s.blurTex to s.blurFbo)
+            deleteTarget(s.smallTex to s.smallFbo)
         }
-        for (i in 0 until 3) deleteTarget(blurScratch[i * 2] to blurScratch[i * 2 + 1])
-        blurScratch.fill(0)
+        freeScratch()
         ring = emptyList()
         ringSize = null
         queue.clear()
         freeSlots.clear()
     }
 
-    private fun ensureAiTargets() {
-        if (encFbo != 0) return
-        encTex = texture(FrameSlot.ENC, FrameSlot.ENC, GLES30.GL_RGBA8, linear = false)
-        encFbo = framebuffer(encTex)
-        depthTex = texture(FrameSlot.DEPTH, FrameSlot.DEPTH, GLES30.GL_RGBA8, linear = false)
-        depthFbo = framebuffer(depthTex)
-        checkGl("KI-Ziele")
+    /** Ziele für die KI-Bilder; false, wenn sie sich nicht anlegen ließen (dann ohne KI-Bilder, steht im Bericht). */
+    private fun ensureAiTargets(): Boolean {
+        if (encFbo != 0 && depthFbo != 0) return true
+        if (aiTargetsFailed) return false
+        try {
+            drainGlErrors()
+            encTex = texture(FrameSlot.ENC, FrameSlot.ENC, GLES30.GL_RGBA8, linear = false)
+            encFbo = framebuffer(encTex)
+            depthTex = texture(FrameSlot.DEPTH, FrameSlot.DEPTH, GLES30.GL_RGBA8, linear = false)
+            depthFbo = framebuffer(depthTex)
+            checkGl("KI-Ziele")
+        } catch (e: Throwable) {
+            // Einmal scheitern reicht: nicht bei jedem Bild neu versuchen und Speicher verlieren.
+            deleteTarget(encTex to encFbo)
+            deleteTarget(depthTex to depthFbo)
+            encTex = 0
+            encFbo = 0
+            depthTex = 0
+            depthFbo = 0
+            aiTargetsFailed = true
+            drainGlErrors()
+            stats.error("KI-Ziele", e)
+            return false
+        }
         if (floatPacking) {
             try {
                 drainGlErrors()
@@ -791,11 +957,17 @@ internal class BokehProcessor(
                 floatPacking = false
                 deleteTarget(encPackTex to encPackFbo)
                 deleteTarget(depthPackTex to depthPackFbo)
+                encPackTex = 0
+                encPackFbo = 0
+                depthPackTex = 0
+                depthPackFbo = 0
                 drainGlErrors()
                 stats.note("Gleitkomma-Rendern nicht möglich: ${e.message}")
             }
         }
-        stats.floatPacking(floatPacking)
+        stats.aiTargets(floatPacking, (FrameSlot.ENC * FrameSlot.ENC + FrameSlot.DEPTH * FrameSlot.DEPTH) * 4L +
+            if (floatPacking) (encLayout.width * encLayout.height + depthLayout.width * depthLayout.height) * 16L else 0L)
+        return true
     }
 
     private fun createMaskTextures() {
@@ -928,13 +1100,14 @@ internal class BokehProcessor(
     companion object {
         /**
          * 10 Bilder ≈ 333 ms: So lange braucht es, bis zu jedem Bild die KI-Masken davor und
-         * danach da sind (KI-Takt ≈ 130 ms, Bildalter ≈ 40 ms, Verfolgung ≈ 100 ms).
+         * danach da sind (KI-Takt ≈ 130 ms, Bildalter ≈ 40 ms, Verfolgung ≈ 100 ms); gilt ab
+         * etwa 5,7 KI-Durchgängen pro Sekunde (siehe PipelineMath.minIntervalMs).
          */
         const val DEFAULT_DELAY = 10
         const val MAX_DELAY = 12
         /** Breite der Unschärfe in Pixeln des Achtel-Bildes (≈ 28 Pixel in 4K). */
         const val BLUR_SIGMA = 3.5
-        /** Masken weiter als 0,4 s vom Bild entfernt gelten nicht mehr. */
+        /** Bis 0,4 s Abstand gilt eine Maske als aktuell; ältere lassen die Unschärfe ausklingen. */
         const val MAX_MASK_DISTANCE_NS = 400_000_000L
         /** So viel früher, als die KI das nächste Bild nimmt, bereitet die Pipeline es vor. */
         const val LEAD_MS = 45.0
@@ -962,26 +1135,35 @@ internal class PipelineStats {
     private var framesOut = 0
     private var blurredOut = 0
     private var withSubject = 0
+    private var withoutMask = 0
+    private var staleMask = 0
+    private var mixed = 0
     private var gaps = 0
     private var lostEstimate = 0
     private var dropped = 0
+    private var swapFailures = 0
+    private var lastSwapError = 0
     private var lastIn = 0L
     private var lastOut = 0L
     private var aiFrames = 0
+    private var aiFramesWithoutDepth = 0
     private var masksIn = 0
-    private var withoutMask = 0
-    private var mixed = 0
     private var outOfOrder = 0
     private var thumbnail: String? = null
     private val intervals = Series()
-    private val frameMs = Series()
+    private val frameCpuMs = Series()
     private val aiMs = Series()
-    private val maskDistanceMs = Series()
-    private val windowDistanceMs = Series()
-    private val windowFrameMs = Series()
+    private val oneSidedMs = Series()
+    private val maskGapMs = Series()
+    // Abschnitt für den Verlauf (etwa alle 30 s).
+    private val windowFrameCpuMs = Series()
     private var windowIn = 0
     private var windowOut = 0
     private var windowGaps = 0
+    private var windowBlurred = 0
+    private var windowMixed = 0
+    private var windowWithMask = 0
+    private var windowStale = 0
 
     private class Series {
         var values = DoubleArray(512)
@@ -1010,20 +1192,32 @@ internal class PipelineStats {
         framesOut = 0
         blurredOut = 0
         withSubject = 0
+        withoutMask = 0
+        staleMask = 0
+        mixed = 0
         gaps = 0
         lostEstimate = 0
         dropped = 0
+        swapFailures = 0
         lastIn = 0L
         lastOut = 0L
         aiFrames = 0
+        aiFramesWithoutDepth = 0
         masksIn = 0
-        withoutMask = 0
-        mixed = 0
         outOfOrder = 0
-        for (series in listOf(intervals, frameMs, aiMs, maskDistanceMs, windowDistanceMs, windowFrameMs)) series.clear()
+        for (series in listOf(intervals, frameCpuMs, aiMs, oneSidedMs, maskGapMs, windowFrameCpuMs)) series.clear()
+        clearWindow()
+    }
+
+    private fun clearWindow() {
+        windowFrameCpuMs.clear()
         windowIn = 0
         windowOut = 0
         windowGaps = 0
+        windowBlurred = 0
+        windowMixed = 0
+        windowWithMask = 0
+        windowStale = 0
     }
 
     fun gl(renderer: String, version: String) = synchronized(lock) {
@@ -1056,7 +1250,9 @@ internal class PipelineStats {
         info.put("verzoegerungBilder", delay).put("ringBilder", slots).put("ringMB", (bytes / 1e6).roundToInt())
     }
 
-    fun floatPacking(ok: Boolean) = synchronized(lock) { info.put("kiBildAlsGleitkomma", ok) }
+    fun aiTargets(floatPacking: Boolean, bytes: Long) = synchronized(lock) {
+        info.put("kiBildAlsGleitkomma", floatPacking).put("kiZieleMB", (bytes / 1e6).roundToInt())
+    }
 
     fun frameIn(ts: Long) = synchronized(lock) {
         framesIn++
@@ -1074,36 +1270,56 @@ internal class PipelineStats {
         lastIn = ts
     }
 
+    /** Rechenzeit des Pipeline-Threads für ein Bild (CPU, ohne die Grafikeinheit) und fürs KI-Bild. */
     fun frameDone(totalMs: Double, aiFrameMs: Double) = synchronized(lock) {
-        frameMs.add(totalMs)
-        windowFrameMs.add(totalMs)
+        frameCpuMs.add(totalMs)
+        windowFrameCpuMs.add(totalMs)
         aiMs.add(aiFrameMs)
     }
 
     /**
-     * Ein Bild ging hinaus. [blurred]: über den Weg mit Unschärfe (Ring und Masken);
-     * [subject]: eine der beiden Masken zeigte ein Motiv, der Hintergrund wurde also unscharf.
+     * Ein Bild ging hinaus. [blurred]: über den Weg mit Unschärfe (Ring und Masken); [subject]:
+     * der Hintergrund wurde unscharf; [stale]: die nächste Maske war älter als 0,4 s; [gapNs]:
+     * Abstand der beiden gemischten Masken (−1 = nur eine).
      */
-    fun frameOut(ts: Long, pick: PipelineMath.MaskPick?, blurred: Boolean, subject: Boolean) = synchronized(lock) {
+    fun frameOut(ts: Long, pick: PipelineMath.MaskPick?, blurred: Boolean, subject: Boolean, stale: Boolean, gapNs: Long) = synchronized(lock) {
         framesOut++
         windowOut++
         if (lastOut != 0L && ts <= lastOut) outOfOrder++
         lastOut = ts
         if (!blurred) return@synchronized
         blurredOut++
+        windowBlurred++
         if (subject) withSubject++
         if (pick == null) {
             withoutMask++
             return@synchronized
         }
-        maskDistanceMs.add(pick.distanceNs / 1e6)
-        windowDistanceMs.add(pick.distanceNs / 1e6)
-        if (pick.a != pick.b) mixed++
+        windowWithMask++
+        if (stale) {
+            staleMask++
+            windowStale++
+        }
+        if (pick.a != pick.b) {
+            mixed++
+            windowMixed++
+            if (gapNs >= 0) maskGapMs.add(gapNs / 1e6)
+        } else {
+            oneSidedMs.add(pick.distanceNs / 1e6)
+        }
     }
 
     fun dropped() = synchronized(lock) { dropped++ }
 
-    fun aiFrame() = synchronized(lock) { aiFrames++ }
+    fun swapFailed(eglError: Int) = synchronized(lock) {
+        swapFailures++
+        lastSwapError = eglError
+    }
+
+    fun aiFrame(withDepth: Boolean) = synchronized(lock) {
+        aiFrames++
+        if (!withDepth) aiFramesWithoutDepth++
+    }
 
     fun aiFrames(): Int = synchronized(lock) { aiFrames }
 
@@ -1123,13 +1339,13 @@ internal class PipelineStats {
     /** Abschnitt für den Verlauf (etwa alle 30 s). */
     fun closeWindow(): JSONObject = synchronized(lock) {
         val o = JSONObject().put("bilderEin", windowIn).put("bilderAus", windowOut).put("luecken", windowGaps)
-        windowFrameMs.json()?.let { o.put("jeBildMs", it) }
-        windowDistanceMs.json()?.let { o.put("maskenAbstandMs", it) }
-        windowIn = 0
-        windowOut = 0
-        windowGaps = 0
-        windowFrameMs.clear()
-        windowDistanceMs.clear()
+        windowFrameCpuMs.json()?.let { o.put("jeBildCpuMs", it) }
+        if (windowWithMask > 0) {
+            o.put("gemischtProzent", Math.round(windowMixed * 100.0 / windowWithMask))
+            if (windowStale > 0) o.put("alteMaskeProzent", Math.round(windowStale * 100.0 / windowWithMask))
+        }
+        if (windowBlurred > windowWithMask) o.put("ohneMaske", windowBlurred - windowWithMask)
+        clearWindow()
         o
     }
 
@@ -1139,19 +1355,27 @@ internal class PipelineStats {
             .put("fehlendeBilderGeschaetzt", lostEstimate)
         if (dropped > 0) o.put("verworfen", dropped)
         if (outOfOrder > 0) o.put("zeitRueckwaerts", outOfOrder)
-        if (aiFrames > 0 || masksIn > 0) o.put("kiBilder", aiFrames).put("masken", masksIn)
+        if (swapFailures > 0) o.put("ausgabeFehler", swapFailures).put("letzterEglFehler", "0x" + Integer.toHexString(lastSwapError))
+        if (aiFrames > 0 || masksIn > 0) {
+            o.put("kiBilder", aiFrames).put("masken", masksIn)
+            if (aiFramesWithoutDepth > 0) o.put("kiBilderOhneTiefe", aiFramesWithoutDepth)
+        }
         if (blurredOut > 0) {
             // mitUnschaerfeWeg: Bilder über Ring und Masken; mitMotiv: davon mit unscharfem
-            // Hintergrund (eine Maske zeigte ein Motiv); ohneMaske: keine KI-Maske in 0,4 s Nähe.
+            // Hintergrund; ohneMaske: noch gar keine KI-Maske; mitAlterMaske: nächste Maske älter
+            // als 0,4 s (Unschärfe klingt aus); gemischtProzent: Anteil mit Masken davor und danach.
             val withMask = blurredOut - withoutMask
             o.put("mitUnschaerfeWeg", blurredOut).put("mitMotiv", withSubject).put("ohneMaske", withoutMask)
+                .put("mitAlterMaske", staleMask)
             if (withMask > 0) o.put("gemischtProzent", Math.round(mixed * 100.0 / withMask))
         }
         val ms = JSONObject()
         intervals.json()?.let { ms.put("bildabstand", it) }
-        frameMs.json()?.let { ms.put("jeBild", it) }
+        frameCpuMs.json()?.let { ms.put("jeBildCpu", it) }
         aiMs.json()?.let { ms.put("kiBild", it) }
-        maskDistanceMs.json()?.let { ms.put("maskenAbstand", it) }
+        // Nur eine Maske in der Nähe: wie weit sie vom Bild weg war. Zwei Masken: wie weit sie auseinanderlagen.
+        oneSidedMs.json()?.let { ms.put("maskeEinseitig", it) }
+        maskGapMs.json()?.let { ms.put("maskenAbstand", it) }
         o.put("ms", ms)
         if (notes.length() > 0) o.put("hinweise", JSONArray(notes.toString()))
         thumbnail?.let { o.put("kiBildJpegBase64", it) }

@@ -60,9 +60,10 @@ object DeviceHeat {
 }
 
 /**
- * Wärmeregelung der KI: liest die Wärmestufe höchstens alle 2 s und sagt, wie viel Abstand
- * zwei KI-Durchgänge mindestens haben sollen (siehe [PipelineMath.minIntervalMs]). Zählt mit,
- * wie lange jede Stufe galt und wie oft die KI deshalb wartete. Nur vom KI-Thread benutzen.
+ * Wärmeregelung der KI: liest die Wärmestufe höchstens alle 2 s und sagt, wie oft die KI die
+ * Tiefe rechnet ([PipelineMath.depthEvery]) und wie viel Abstand zwei Durchgänge mindestens haben
+ * sollen ([PipelineMath.minIntervalMs]). Zählt mit, wie lange jede Stufe galt, wie oft die KI
+ * deshalb wartete und wie oft sie die Tiefe ausließ. Nur vom KI-Thread benutzen.
  */
 internal class HeatGovernor(context: Context) {
     private val pm = context.getSystemService(PowerManager::class.java)
@@ -71,6 +72,7 @@ internal class HeatGovernor(context: Context) {
     private var lastAccount = 0L
     private var waits = 0
     private var waitedMs = 0L
+    private var depthSkipped = 0
     private var running = false
 
     /** Aktuelle Wärmestufe (0 keine bis 6 Abschaltung). */
@@ -84,6 +86,7 @@ internal class HeatGovernor(context: Context) {
         lastAccount = SystemClock.elapsedRealtime()
         waits = 0
         waitedMs = 0L
+        depthSkipped = 0
         status = 0
         running = true
     }
@@ -112,6 +115,14 @@ internal class HeatGovernor(context: Context) {
         waitedMs += ms
     }
 
+    /** Wie oft die KI gerade die Tiefe rechnen soll (1 = immer, 4 = jedes vierte Mal, 0 = nie); gilt bis zum nächsten [minIntervalMs]. */
+    fun depthEvery(): Int = PipelineMath.depthEvery(status)
+
+    /** Ein Durchgang lief ohne Tiefe. */
+    fun noteDepthSkipped() {
+        depthSkipped++
+    }
+
     private fun account(now: Long) {
         if (lastAccount > 0L) seconds[status] += (now - lastAccount) / 1000.0
         lastAccount = now
@@ -125,6 +136,7 @@ internal class HeatGovernor(context: Context) {
             .put("sekundenJeStufe", stages)
             .put("gebremsteDurchgaenge", waits)
             .put("gewartetS", r1(waitedMs / 1000.0))
-            .put("regel", "ab stark höchstens 5/s, ab kritisch 3/s, ab Notfall 1/s")
+            .put("durchgaengeOhneTiefe", depthSkipped)
+            .put("regel", "ab stark Tiefe nur jedes 4. Mal und höchstens 6/s, ab kritisch ohne Tiefe und höchstens 5/s, ab Notfall höchstens 3/s")
     }
 }

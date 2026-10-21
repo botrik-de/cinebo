@@ -92,8 +92,13 @@ internal class AiEngine(private val context: Context) : AiDemand {
     // Takt für die Grafik-Pipeline (siehe AiDemand); schreibt nur der KI-Thread.
     @Volatile private var nextTake = 0L
     @Volatile private var aiWaiting = false
+    @Volatile private var wantDepth = true
     override val nextTakeNs: Long get() = nextTake
     override val waiting: Boolean get() = aiWaiting
+    override val depthNeeded: Boolean get() = wantDepth
+
+    /** Wie oft die Verfolgung neu angesetzt hat; die Pipeline mischt keine Masken verschiedener Motive. */
+    private var generation = 0
 
     /** Bekommt nach jedem Durchgang auf einem Kamerabild die Maske (Grafik-Pipeline); sonst null. */
     @Volatile var maskSink: MaskSink? = null
@@ -1198,6 +1203,8 @@ internal class AiEngine(private val context: Context) : AiDemand {
         t.reset()
         heat.reset()
         nextTake = 0L
+        wantDepth = true
+        var pass = 0L
         var lastStart = 0L
         var expectedMs = Double.NaN
         try {
@@ -1239,6 +1246,7 @@ internal class AiEngine(private val context: Context) : AiDemand {
                     // Startbild: neu angetippt oder der erste Durchgang (Mitte des Bildes).
                     val startFrame = tap != null || !t.started
                     if (startFrame) {
+                        generation++
                         t.start(slot.enc, tap?.get(0) ?: 0.5f, tap?.get(1) ?: 0.5f)
                     } else {
                         t.step(slot.enc)
@@ -1249,10 +1257,21 @@ internal class AiEngine(private val context: Context) : AiDemand {
                     val masks = maskSink
                     if (masks != null) {
                         PipelineMath.maskProbabilities(t.mask(), maskBytes)
-                        masks.onMask(slot.timestampNs, maskBytes, t.present)
+                        masks.onMask(slot.timestampNs, maskBytes, t.present, generation)
                     }
-                    depth.run(arrayOf(slot.depth))
-                    val depthNative = depth.lastNativeMs
+                    // Wärmeregelung: Bei Hitze fällt zuerst die Tiefe weg (live noch nicht gebraucht),
+                    // damit die Verfolgung schnell genug für die Masken bleibt.
+                    val every = heat.depthEvery()
+                    val runDepth = slot.hasDepth && every > 0 && pass % every == 0L
+                    val depthNative = if (runDepth) {
+                        depth.run(arrayOf(slot.depth))
+                        depth.lastNativeMs
+                    } else {
+                        heat.noteDepthSkipped()
+                        Double.NaN
+                    }
+                    pass++
+                    wantDepth = every > 0 && pass % every == 0L
                     val aiMs = (System.nanoTime() - start) / 1e6
                     expectedMs = if (expectedMs.isNaN()) aiMs else expectedMs * 0.8 + aiMs * 0.2
                     // Das Ergebnis ist fertig, wenn das Bild so alt ist wie beim Aufnehmen plus die Rechenzeit.

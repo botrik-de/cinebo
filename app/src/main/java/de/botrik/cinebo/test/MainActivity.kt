@@ -184,6 +184,7 @@ class MainActivity : ComponentActivity() {
         @Volatile var on = false
         override val nextTakeNs: Long get() = 0L
         override val waiting: Boolean get() = on
+        override val depthNeeded: Boolean get() = true
     }
     private var liveJob: Job? = null
     private var liveError: String? = null
@@ -1734,12 +1735,16 @@ class MainActivity : ComponentActivity() {
         }
         val blurred = Math.round(p.optInt("mitMotiv") * 100.0 / frames).toInt()
         val withoutMask = Math.round(p.optInt("ohneMaske") * 100.0 / frames).toInt()
+        val stale = Math.round(p.optInt("mitAlterMaske") * 100.0 / frames).toInt()
         val mixed = p.optInt("gemischtProzent")
         var text = "Hintergrund auf $blurred % der Bilder unscharf, $mixed % zwischen zwei KI-Masken gemischt"
         if (withoutMask > 5) text += ", $withoutMask % ohne KI-Maske"
+        if (stale > 5) text += ", $stale % mit einer KI-Maske älter als 0,4 s"
         val gaps = p.optInt("luecken")
         if (gaps > 0) text += ", ${p.optInt("fehlendeBilderGeschaetzt")} Kamerabilder fehlten der Grafik-Pipeline"
-        return (withoutMask > 5 || mixed < 80 || gaps > 0) to text
+        val failures = p.optInt("ausgabeFehler")
+        if (failures > 0) text += ", $failures Bilder ließen sich nicht ausgeben"
+        return (withoutMask > 5 || stale > 5 || mixed < 80 || gaps > 0 || failures > 0) to text
     }
 
     private fun endNote(r: JSONObject): String? = when (val end = r.optString("ende")) {

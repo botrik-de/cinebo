@@ -1,6 +1,7 @@
 #version 300 es
-// Gaußsche Unschärfe in einer Richtung. 13 Pixel breit, über 7 bilineare Abgriffe: Mitte plus
-// je drei Paare, deren Gewichte und Abstände der App vorab ausrechnet (uWeight, uOffset).
+// Gaußsche Unschärfe in einer Richtung, für alle vier Kanäle (auch das Gewicht in alpha, siehe
+// weigh.frag). 13 Pixel breit, über 7 bilineare Abgriffe: Mitte plus je drei Paare, deren
+// Gewichte und Abstände die App vorab ausrechnet (uWeight, uOffset).
 precision highp float;
 
 uniform sampler2D uSrc;
@@ -12,10 +13,10 @@ in vec2 vUv;
 out vec4 outColor;
 
 void main() {
-    vec3 c = texture(uSrc, vUv).rgb * uWeight[0];
+    vec4 c = texture(uSrc, vUv) * uWeight[0];
     for (int i = 1; i < 4; i++) {
         vec2 d = uDir * uOffset[i];
-        c += (texture(uSrc, vUv + d).rgb + texture(uSrc, vUv - d).rgb) * uWeight[i];
+        c += (texture(uSrc, vUv + d) + texture(uSrc, vUv - d)) * uWeight[i];
     }
-    outColor = vec4(c, 1.0);
+    outColor = c;
 }

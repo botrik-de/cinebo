@@ -22,6 +22,8 @@ internal class FrameSlot {
 
     /** Wo das Bild im 518er-Quadrat liegt (0 bis 1). */
     val depthContent = RectF()
+    /** Ob [depth] zu diesem Bild gehört; bei Hitze spart die Pipeline das Tiefenbild ein. */
+    var hasDepth = true
     var timestampNs = 0L
     var prepMs = 0.0
     var width = 0
