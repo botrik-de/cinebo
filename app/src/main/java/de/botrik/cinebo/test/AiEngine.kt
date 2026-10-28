@@ -1192,16 +1192,17 @@ internal class AiEngine(private val context: Context) : AiDemand {
      * gleich weit reicht. Tippt man noch einmal auf dieselbe Stelle (höchstens 3 % der Breite
      * daneben), nimmt die KI die nächstkleinere glaubwürdige Maske ([SubjectPick.choose] mit Rang,
      * reihum), sofern sie den vorigen Tipp höchstens [RETAP_MS] vorher angewandt hat. Wartet der
-     * vorige noch auf die KI, gilt er nur am neuen Ort, ohne neuen Rang: Man sieht das Ganze, bevor
-     * ein Teil kommt.
+     * vorige noch auf die KI oder ist sein Ergebnis noch nicht zu sehen ([RETAP_VISIBLE_MS]), gilt er
+     * nur am neuen Ort, ohne neuen Rang: Man sieht das Ganze, bevor ein Teil kommt.
      */
     fun track(u: Float, v: Float, aspect: Float = 1f) {
         val previous = lastTap
         val near = previous != null && kotlin.math.hypot(u - previous.u, (v - previous.v) * aspect) <= RETAP_DISTANCE
+        val sinceApplied = SystemClock.elapsedRealtime() - (previous?.appliedAt ?: 0L)
         val rank = when {
             previous == null || !near -> 0
-            previous.appliedAt == 0L -> previous.rank
-            SystemClock.elapsedRealtime() - previous.appliedAt <= RETAP_MS -> previous.rank + 1
+            previous.appliedAt == 0L || sinceApplied < RETAP_VISIBLE_MS -> previous.rank
+            sinceApplied <= RETAP_MS -> previous.rank + 1
             else -> 0
         }
         val tap = Tap(u, v, rank)
@@ -1512,6 +1513,9 @@ internal class AiEngine(private val context: Context) : AiDemand {
          */
         const val RETAP_MS = 2500L
         const val RETAP_DISTANCE = 0.03f
+
+        /** So lange nach dem Anwenden ist das Ergebnis eines Tipps noch nicht zu sehen (0,4 s Verzögerung plus Rechnen). */
+        const val RETAP_VISIBLE_MS = 500L
 
         /** Die volle Kette, die live läuft: „voll“ mit unserem Decoder wie im Original, sonst „vollQualcomm“. */
         fun liveChainKey(metaDecoder: Boolean): String = if (metaDecoder) "voll" else "vollQualcomm"

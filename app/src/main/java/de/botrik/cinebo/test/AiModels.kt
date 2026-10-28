@@ -221,7 +221,8 @@ internal class NpuModel private constructor(
             // Aus dem Zwischenspeicher, wenn QNN dabei keine neue übersetzte Datei angelegt hat.
             val added = if (npu != null) Npu.cacheDir(context).list()?.filter { it !in before }.orEmpty() else emptyList()
             val cached = npu != null && added.none { it.startsWith("qnn_binary") }
-            val log = LogProbe.since(wallStart)
+            // Kurz: Die Warnungen beim Übersetzen wiederholen sich; was zählt, steht in den letzten Zeilen.
+            val log = LogProbe.since(wallStart, max = 20)
             return NpuModel(asset, npu, interpreter, delegate, ms, cached, log)
         }
 
@@ -396,10 +397,12 @@ internal object LogProbe {
 
     /**
      * Passende Zeilen seit [sinceWallMs] (Wanduhr in ms). Höchstens [max] Zeilen; reicht der Platz
-     * nicht, bleiben die letzten, denn dort steht, wie viel eines Modells auf dem Chip läuft.
+     * nicht, bleiben die letzten. Die Zeile, wie viel eines Modells auf dem Chip läuft
+     * („Replacing …“), bleibt immer, auch wenn spätere Warnungen sie verdrängen würden.
      */
     fun since(sinceWallMs: Long, max: Int = 60): JSONArray {
         val kept = ArrayDeque<String>()
+        val delegations = mutableListOf<String>()
         var dropped = 0
         var process: java.lang.Process? = null
         try {
@@ -414,8 +417,8 @@ internal object LogProbe {
                     if (!KEYWORDS.containsMatchIn(line) || NOISE.containsMatchIn(line.trim())) continue
                     kept.addLast(line.trim().take(300))
                     if (kept.size > max) {
-                        kept.removeFirst()
-                        dropped++
+                        val gone = kept.removeFirst()
+                        if (REPLACING.containsMatchIn(gone)) delegations += gone else dropped++
                     }
                 }
             }
@@ -427,6 +430,7 @@ internal object LogProbe {
         }
         val out = JSONArray()
         if (dropped > 0) out.put("($dropped ältere Zeilen ausgelassen)")
+        delegations.forEach { out.put(it) }
         kept.forEach { out.put(it) }
         return out
     }

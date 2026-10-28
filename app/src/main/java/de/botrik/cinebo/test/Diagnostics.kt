@@ -157,6 +157,7 @@ internal class PowerMeter(context: Context) {
     private var previousCharge = Long.MIN_VALUE
     // Aus der letzten Akku-Meldung (einmal pro Sekunde gelesen; nur der Mess-Thread).
     private var volts = Double.NaN
+    private var voltsRaw = -1
     private var plugged = false
     private var errors = 0
 
@@ -215,7 +216,8 @@ internal class PowerMeter(context: Context) {
         if (slow) {
             val sticky = app.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
             if (sticky != null) {
-                volts = PowerMath.volts(sticky.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1))
+                voltsRaw = sticky.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1)
+                volts = PowerMath.volts(voltsRaw)
                 plugged = sticky.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0
                 val tenths = sticky.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE)
                 if (tenths != Int.MIN_VALUE) {
@@ -235,7 +237,7 @@ internal class PowerMeter(context: Context) {
         synchronized(lock) {
             if (firstRaw == null) {
                 firstRaw = JSONObject().put("stromRoh", raw).put("durchschnittRoh", averageRaw)
-                    .put("ladungRoh", charge).put("energieRoh", energy)
+                    .put("spannungRoh", voltsRaw).put("ladungRoh", charge).put("energieRoh", energy)
             }
             val changed = previousRaw != Int.MIN_VALUE && raw != previousRaw
             previousRaw = raw

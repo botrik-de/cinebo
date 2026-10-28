@@ -166,6 +166,9 @@ class MainActivity : ComponentActivity() {
         /** In diesen Abschnitten muss der Hintergrund unscharf sein, sonst misst er nicht, was er soll. */
         val POWER_BLUR = setOf("unschaerfe", "kibilder", "ki", "kiTiefe", "spitze")
 
+        /** In diesen Abschnitten läuft jedes Bild über die volle Verzögerung (Ring). */
+        val POWER_RING = setOf("verzoegern") + POWER_BLUR
+
         /** In diesen Abschnitten liest die App den Strom kurz alle 50 ms (wie der Akkuwächter misst). */
         val POWER_PROBES = setOf("aus", "ki")
 
@@ -174,6 +177,9 @@ class MainActivity : ComponentActivity() {
 
         /** So viel freier Speicher (Bytes) muss für die Aufnahmen im Strombedarf da sein. */
         const val POWER_MIN_FREE_BYTES = 2_500_000_000L
+
+        /** So viel freier Speicher (Bytes) braucht der Dauertest: 10 min 4K mit rund 51 Mbit/s sind 3,8 GB. */
+        const val LONG_MIN_FREE_BYTES = 4_500_000_000L
 
         /** So oft (Sekunden) steht der Stand für den Beendigungsgrund neu bereit (siehe ExitHistory.setState). */
         const val STATE_EVERY_S = 10.0
@@ -280,6 +286,8 @@ class MainActivity : ComponentActivity() {
     @Volatile private var cooling = false
     /** Warum die App einen Test wegen Hitze selbst beendet (Text für „ende“), sonst null. */
     private var heatStop: String? = null
+    /** Beginn des Strombedarfs (elapsedRealtime), für die Zeit je Abschnitt. */
+    private var powerBegan = 0L
     private var events: JSONArray? = null
     private var recordingSince = 0L
     private var testStartedAt = 0L
@@ -365,8 +373,8 @@ class MainActivity : ComponentActivity() {
         // mittendrin beendet und bekommt jetzt den passenden Grund.
         val exits = ExitHistory.read(this)
         closeUnfinishedTests(exits)
-        startNewVersion()
-        report.put("appVersion", appVersion)
+        // Scheitert das Ablegen des alten Berichts, bleibt seine Version stehen: Beim nächsten Start klappt es vielleicht.
+        if (startNewVersion()) report.put("appVersion", appVersion)
         report.put("beendigungen", exits)
         store.save(report)
         removeOldClips()
@@ -867,7 +875,7 @@ class MainActivity : ComponentActivity() {
             val reload = withContext(engine.dispatcher) {
                 engine.load(ModelId.entries) { done, total, _ -> runOnUiThread { loadingStatus(done, total) } }
             }
-            ki.put("ladenGewaehlt", reload)
+            ki.put("ladenGewaehlt", compactLoad(reload))
             saveAndRender()
             if (stopRequested) return@launchTest
 
@@ -989,7 +997,7 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * KI-Dauertest, ganz ohne Zutun: abkühlen, Strombedarf messen (gut 4 min), wieder abkühlen,
+     * KI-Dauertest, ganz ohne Zutun: abkühlen, Strombedarf messen (gut 5 min), wieder abkühlen,
      * dann 10 Minuten 4K mit KI. Jede Phase steht sofort im gespeicherten Bericht („phase“), damit
      * ein Rauswurf durch das System zeigt, wo er geschah. Vorher (siehe [onLongButton]): kein
      * Ladekabel, Akku ab 40 %, Energiesparmodus aus. Wird es beim Strombedarf zu heiß, hört nur
@@ -1013,7 +1021,7 @@ class MainActivity : ComponentActivity() {
             setPhase(entry, "strom")
             running = "strom"
             showHint(
-                "Misst jetzt gut 5 Minuten den Strombedarf: Bildschirm, Kamera, 4K-Aufnahme, Grafik, Unschärfe, KI und Tiefe einzeln. " +
+                "Misst jetzt gut 5 Minuten den Strombedarf: Bildschirm, Kamera, 4K-Aufnahme, Grafik, Verzögerung, Unschärfe, KI und Tiefe einzeln. " +
                     "Bitte nichts anfassen. Die Aufnahmen dabei löscht die App gleich wieder."
             )
             render()
@@ -1049,17 +1057,24 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
+     * Ein Lauf, der nicht regulär endete: weder „ok“ noch vom Nutzer gestoppt (vom System beendet,
+     * wegen Hitze, Fehler der Aufnahme, ohne laufende KI …). Sein Verlauf soll erhalten bleiben.
+     */
+    private fun aborted(t: JSONObject): Boolean {
+        val end = t.optString("ende")
+        return if (end.isEmpty()) t.has("fehler") else end != "ok" && end != "gestoppt"
+    }
+
+    /**
      * Ein neuer Lauf von [key] beginnt: Der vorige verschwindet aus „tests“. War er abgebrochen
-     * (vom System beendet, wegen Hitze oder mit Fehler), kommt er nach „fruehereLaeufe“ (je Test
-     * die letzten [MAX_PREVIOUS_RUNS]), damit sein Verlauf nicht verloren geht, bevor jemand den
-     * Bericht kopiert hat.
+     * ([aborted]), kommt er nach „fruehereLaeufe“ (je Test die letzten [MAX_PREVIOUS_RUNS]), damit
+     * sein Verlauf nicht verloren geht, bevor jemand den Bericht kopiert hat.
      */
     private fun retireRun(key: String) {
         val tests = report.optJSONObject("tests") ?: return
         val old = tests.optJSONObject(key) ?: return
         tests.remove(key)
-        val end = old.optString("ende")
-        if (end != KILLED && end != RUNNING && !end.startsWith(HEAT_STOP) && !end.startsWith("Fehler")) return
+        if (!aborted(old)) return
         val all = report.optJSONObject("fruehereLaeufe") ?: JSONObject().also { report.put("fruehereLaeufe", it) }
         val list = all.optJSONArray(key) ?: JSONArray().also { all.put(key, it) }
         list.put(old)
@@ -1110,6 +1125,10 @@ class MainActivity : ComponentActivity() {
         val pm = getSystemService(PowerManager::class.java)
         if (pm?.isPowerSaveMode == true) return "Energiesparmodus ist an" to
             "Schalte den Energiesparmodus aus und starte den Dauertest dann noch einmal. Er bremst Kamera und KI."
+        val free = (getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir).usableSpace
+        if (free < LONG_MIN_FREE_BYTES) return "Zu wenig Speicher frei" to
+            "Der Dauertest braucht für seine Aufnahmen etwa ${de(LONG_MIN_FREE_BYTES / 1e9, 1)} GB, frei sind ${de(free / 1e9, 1)} GB. " +
+                "Lösch große Dateien oder alte Clips und starte ihn dann noch einmal."
         return null
     }
 
@@ -1253,7 +1272,8 @@ class MainActivity : ComponentActivity() {
         launchTest(fixedScreen = false) {
             running = "vorschau"
             hintOverride = "Tippe im Kamerabild auf eine Person oder einen Gegenstand: Das ganze Motiv bleibt scharf, der Hintergrund wird unscharf. " +
-                "Tippst du gleich noch einmal auf dieselbe Stelle, nimmt die KI einen kleineren Teil. Ohne Tippen nimmt sie, was in der Mitte ist. " +
+                "Siehst du das Ergebnis und tippst innerhalb von zwei Sekunden noch einmal auf dieselbe Stelle, nimmt die KI einen kleineren Teil. " +
+                "Ohne Tippen nimmt sie, was in der Mitte ist. " +
                 "Das Bild läuft 0,4 Sekunden hinterher, damit Motiv und Unschärfe genau zusammenpassen."
             render()
             setStatus(Phase.BUSY, "Bereitet die KI vor …")
@@ -1303,7 +1323,31 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Lädt die Modelle für den Live-Betrieb, falls nötig. Gibt das Protokoll zurück oder null. */
+    /**
+     * Ladeprotokoll in kurz: Dauer, Zwischenspeicher, wie viel auf dem Chip läuft und Fehler (dann
+     * mit den letzten Zeilen aus dem Systemprotokoll). Ein- und Ausgänge und die übrigen Zeilen
+     * stehen schon beim ersten Laden im Bericht („ki.laden“); so bleibt der Bericht klein genug zum
+     * Kopieren.
+     */
+    private fun compactLoad(full: JSONObject): JSONObject {
+        val o = JSONObject()
+        for (key in full.keys()) {
+            val value = full.opt(key)
+            if (value is JSONObject) {
+                val m = JSONObject()
+                for (k in listOf("wo", "einstellung", "ladenMs", "ausZwischenspeicher", "aufDemChip", "fehler")) value.opt(k)?.let { m.put(k, it) }
+                if (value.has("fehler")) value.optJSONArray("protokoll")?.let { log ->
+                    m.put("protokoll", JSONArray().apply { for (i in max(0, log.length() - 10) until log.length()) put(log.opt(i)) })
+                }
+                o.put(key, m)
+            } else if (key != "zwischenspeicher") {
+                o.put(key, value)
+            }
+        }
+        return o
+    }
+
+    /** Lädt die Modelle für den Live-Betrieb, falls nötig. Gibt das Protokoll (in kurz) zurück oder null. */
     private suspend fun ensureLiveModels(): JSONObject? {
         // Leistungstest und Einzelmessung haben Einstellung und Bausteine gewählt; das gilt auch nach einem Neustart.
         // Live immer auf Dauerleistung (mit der Übersetzung der schnellsten Einstellung): In 0.3.15
@@ -1327,7 +1371,7 @@ class MainActivity : ComponentActivity() {
             report.put("letzteLadung", load)
             throw IllegalStateException("Die KI-Modelle ließen sich nicht laden. Die Gründe stehen im Bericht.")
         }
-        return load
+        return compactLoad(load)
     }
 
     private fun loadingStatus(done: Int, total: Int) {
@@ -1647,6 +1691,7 @@ class MainActivity : ComponentActivity() {
             ensureLiveModels()?.let { out.put("laden", it) }
             val meter = PowerMeter(this)
             val cpuStart = android.os.Process.getElapsedCpuTime()
+            powerBegan = SystemClock.elapsedRealtime()
             meter.start()
             try {
                 powerPhases(meter) { o ->
@@ -1663,8 +1708,9 @@ class MainActivity : ComponentActivity() {
             out.put("cpuS", r1((android.os.Process.getElapsedCpuTime() - cpuStart) / 1000.0))
             out.put("ende", heatStop ?: if (stopRequested) "gestoppt" else "ok")
             out.put("waermeNachher", DeviceHeat.read(this))
-            if (powerGo()) {
-                // Live wieder auf Dauerleistung, damit die Aufnahme gleich beginnen kann.
+            if (!stopRequested) {
+                // Live wieder auf Dauerleistung (auch nach einem Hitzestopp in „spitze“), damit die
+                // Aufnahme ohne Laden beginnen kann.
                 setStatus(Phase.BUSY, "Bereitet die KI vor …")
                 ensureLiveModels()?.let { out.put("ladenDanach", it) }
             }
@@ -1710,13 +1756,15 @@ class MainActivity : ComponentActivity() {
         synthetic.sink = effect
         val problem = try {
             powerRecording(effect) { alive ->
+                // Bricht die Aufnahme ab, messen die übrigen Abschnitte nichts Brauchbares mehr.
+                fun go() = powerGo() && alive()
                 add(powerMeasure("verzoegern", meter, POWER_SETTLE_BIND_MS, effect = effect, alive = alive))
-                if (powerGo()) {
+                if (go()) {
                     // Dieselbe feste Maske, jetzt als Motiv: Der Hintergrund wird unscharf.
                     effect.staticPresent = true
                     add(powerMeasure("unschaerfe", meter, POWER_SETTLE_SWITCH_MS, effect = effect, alive = alive))
                 }
-                if (powerGo()) {
+                if (go()) {
                     // KI-Bilder und Masken wie live, aber ohne KI-Chip.
                     pool.drain()
                     effect.staticMask = null
@@ -1724,7 +1772,7 @@ class MainActivity : ComponentActivity() {
                     add(powerMeasure("kibilder", meter, POWER_SETTLE_SWITCH_MS, source = synthetic, effect = effect, alive = alive))
                     withContext(Dispatchers.IO) { synthetic.stop() }
                 }
-                if (powerGo()) {
+                if (go()) {
                     // Die echte KI im selben Takt, ohne Tiefe.
                     synthetic.sink = null
                     engine.fixedLive = AiEngine.FixedLive(POWER_AI_INTERVAL_MS, 0)
@@ -1732,11 +1780,11 @@ class MainActivity : ComponentActivity() {
                     startPowerLive(effect)
                     add(powerMeasure("ki", meter, POWER_SETTLE_SWITCH_MS, source = engine, effect = effect, alive = alive))
                 }
-                if (powerGo() && liveJob?.isActive == true) {
+                if (go() && liveJob?.isActive == true) {
                     engine.fixedLive = AiEngine.FixedLive(POWER_AI_INTERVAL_MS, 1)
                     add(powerMeasure("kiTiefe", meter, POWER_SETTLE_SWITCH_MS, source = engine, effect = effect, alive = alive))
                 }
-                if (powerGo()) add(powerBurst(effect, meter, alive))
+                if (go()) add(powerBurst(effect, meter, alive))
                 withContext(NonCancellable) { stopLive() }
                 engine.fixedLive = null
             }
@@ -1767,7 +1815,7 @@ class MainActivity : ComponentActivity() {
                 powerMeasure("spitze", meter, POWER_SETTLE_SWITCH_MS, source = engine, effect = effect, alive = alive)
             }
         }
-        load?.let { o.put("laden", it) }
+        load?.let { o.put("laden", compactLoad(it)) }
         return o
     }
 
@@ -1873,6 +1921,7 @@ class MainActivity : ComponentActivity() {
         val before = cycles()
         val cpu0 = android.os.Process.getElapsedCpuTime()
         val began = SystemClock.elapsedRealtime()
+        o.put("s", r1((began - powerBegan) / 1000.0))
         waitPhase(key, POWER_HALF_MS, "misst, 1. Hälfte")
         val first = meter.closeWindow()
         if (powerGo()) waitPhase(key, POWER_HALF_MS, "misst, 2. Hälfte")
@@ -1883,13 +1932,16 @@ class MainActivity : ComponentActivity() {
         o.put("haelften", JSONArray().put(first).put(second))
         val w1 = first.optDouble("watt", Double.NaN)
         val w2 = second.optDouble("watt", Double.NaN)
+        val reasons = JSONArray()
         if (!w1.isNaN() && !w2.isNaN()) {
             val mean = (w1 + w2) / 2.0
             o.put("watt", r2(mean))
-            o.put("ampere", r4((first.optDouble("ampere") + second.optDouble("ampere")) / 2.0))
+            val amps = (first.optDouble("ampere", Double.NaN) + second.optDouble("ampere", Double.NaN)) / 2.0
+            if (amps.isFinite()) o.put("ampere", r4(amps))
             if (mean > 0 && kotlin.math.abs(w1 - w2) / mean > 0.05) o.put("schwankt", true)
+        } else {
+            reasons.put("keine Strommesswerte")
         }
-        val reasons = JSONArray()
         if (cameraOn) {
             val fps = if (frameCount > 1 && lastTs > firstTs) (frameCount - 1) / ((lastTs - firstTs) / 1e9) else 0.0
             o.put("kameraFps", r1(fps))
@@ -1903,6 +1955,17 @@ class MainActivity : ComponentActivity() {
         if (effect != null) {
             val p = effect.stats.closeWindow()
             o.put("pipeline", p)
+            // Was hinten ankam: Bildrate der Ausgabe, Weg über die Verzögerung, Unschärfe.
+            val outFps = if (seconds > 0) p.optInt("bilderAus") / seconds else 0.0
+            o.put("ausgabeFps", r1(outFps))
+            if (outFps < POWER_MIN_FPS) reasons.put("Grafik gab nur ${de(outFps, 1)} Bilder pro Sekunde aus")
+            if (key in POWER_RING) {
+                val delay = effect.stats.toJson().optInt("verzoegerungBilder", 0)
+                o.put("verzoegerungBilder", delay)
+                if (delay < BokehProcessor.DEFAULT_DELAY) reasons.put("Verzögerung nur $delay Bilder")
+                val ring = p.optInt("ueberRingProzent", 0)
+                if (ring < 95) reasons.put("nur $ring % der Bilder über die Verzögerung")
+            }
             val blurred = p.optInt("unscharfProzent", 0)
             if (key in POWER_BLUR && blurred < 80) reasons.put("Hintergrund nur auf $blurred % der Bilder unscharf")
         }
@@ -2273,22 +2336,22 @@ class MainActivity : ComponentActivity() {
      * abgebrochene Läufe und ein Absturz. Lässt sich der alte nicht ablegen (Speicher voll),
      * bleibt er, wie er ist.
      */
-    private fun startNewVersion() {
+    private fun startNewVersion(): Boolean {
         val previous = reportVersion(report)
-        if (previous.isEmpty() || previous == appVersion) return
-        val file = store.archive("bericht-stufe3-$previous", report) ?: return
+        if (previous.isEmpty() || previous == appVersion) return true
+        val file = store.archive("bericht-stufe3-$previous", report) ?: return false
         val note = JSONObject().put("version", previous).put("datei", file)
         val tests = report.optJSONObject("tests")
         val ended = JSONObject()
         tests?.keys()?.forEach { key ->
             val t = tests.optJSONObject(key) ?: return@forEach
-            val end = t.optString("ende")
-            if (end == KILLED || end.startsWith(HEAT_STOP) || end.startsWith("Fehler")) ended.put(key, t)
+            if (aborted(t)) ended.put(key, t)
         }
         if (ended.length() > 0) note.put("abgebrocheneTests", ended)
         report.optJSONObject("fruehereLaeufe")?.let { note.put("fruehereLaeufe", it) }
         report.optString("letzterAbsturz").takeIf { it.isNotEmpty() }?.let { note.put("absturz", it.take(3000)) }
         report = JSONObject().put("fruehereVersion", note)
+        return true
     }
 
     /** Mit welcher Version der Bericht entstand (ältere Berichte: aus Gerät, KI oder einem Test); leer, wenn er leer ist. */
@@ -2310,7 +2373,7 @@ class MainActivity : ComponentActivity() {
 
     private fun quickTestDone(): Boolean = ki()?.has("einzeln") == true && readTests().has("live")
 
-    private fun reportText(): String {
+    private fun reportText(pretty: Boolean = true): String {
         val o = JSONObject()
         o.put("app", JSONObject().put("name", "CineBo Test").put("stufe", "3").put("version", appVersion).put("erstellt", nowIso()))
         val keys = report.keys()
@@ -2318,14 +2381,22 @@ class MainActivity : ComponentActivity() {
             val k = keys.next()
             o.put(k, report.get(k))
         }
-        return o.toString(1)
+        return if (pretty) o.toString(1) else o.toString()
     }
 
+    /**
+     * Bericht in die Zwischenablage, ohne Einrückung (kleiner). Ist er zu groß für die
+     * Zwischenablage, sagt die Statuszeile, dass „Teilen“ ihn als Datei weitergibt.
+     */
     private fun copyReport() {
-        val clipboard = getSystemService(ClipboardManager::class.java)
-        clipboard.setPrimaryClip(ClipData.newPlainText("CineBo-KI-Bericht", reportText()))
-        copyButton.text = "Kopiert"
-        copyButton.postDelayed({ copyButton.text = "Bericht kopieren" }, 1800)
+        try {
+            val clipboard = getSystemService(ClipboardManager::class.java)
+            clipboard.setPrimaryClip(ClipData.newPlainText("CineBo-KI-Bericht", reportText(pretty = false)))
+            copyButton.text = "Kopiert"
+            copyButton.postDelayed({ copyButton.text = "Bericht kopieren" }, 1800)
+        } catch (e: Exception) {
+            setStatus(Phase.ERROR, "Bericht zu groß zum Kopieren: Tippe auf „Teilen“ und schick ihn als Datei")
+        }
     }
 
     private fun shareReport() {
@@ -2740,9 +2811,10 @@ class MainActivity : ComponentActivity() {
         val parts = mutableListOf<String>()
         val seconds = r.optDouble("laufS", Double.NaN)
         val where = if (key == "strom") {
+            // Der letzte gemessene Abschnitt (Einträge für Fehler haben keinen Titel).
             val list = r.optJSONArray("abschnitte")
-            val last = list?.optJSONObject(list.length() - 1)?.optString("abschnitt").orEmpty()
-            if (last.isEmpty()) "zu Beginn des Strombedarfs" else "beim Strombedarf nach „${POWER_PHASES[last] ?: last}“"
+            val last = (0 until (list?.length() ?: 0)).mapNotNull { list?.optJSONObject(it)?.optString("titel")?.takeIf { t -> t.isNotEmpty() } }.lastOrNull()
+            if (last == null) "zu Beginn des Strombedarfs" else "beim Strombedarf nach „$last“"
         } else {
             when (r.optString("phase")) {
                 "abkuehlen1" -> "beim Abkühlen vor dem Strombedarf"
@@ -2831,7 +2903,10 @@ class MainActivity : ComponentActivity() {
         val ai = watt("ki")
         if (!ai.isNaN()) parts += "4K mit Unschärfe und KI zusammen ${de(ai, 1)} W"
         val drift = delta("aufnahme2", "aufnahme")
-        if (!drift.isNaN()) parts += "4K am Ende ${plus(drift)}"
+        if (!drift.isNaN()) {
+            val apart = (byKey["aufnahme2"]?.optDouble("s", Double.NaN) ?: Double.NaN) - (byKey["aufnahme"]?.optDouble("s", Double.NaN) ?: Double.NaN)
+            parts += "4K am Ende ${plus(drift)}" + if (apart.isNaN()) "" else " nach ${clock(apart.toLong())} min"
+        }
         val invalid = POWER_PHASES.keys.mapNotNull { k ->
             byKey[k]?.optJSONArray("ungueltigWeil")?.let { why -> "${POWER_PHASES[k]}: ${why.optString(0)}" }
         }

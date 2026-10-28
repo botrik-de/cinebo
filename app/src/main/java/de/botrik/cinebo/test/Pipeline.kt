@@ -1437,8 +1437,11 @@ internal class PipelineStats {
     /** Abschnitt für den Verlauf (etwa alle 30 s). */
     fun closeWindow(): JSONObject = synchronized(lock) {
         val o = JSONObject().put("bilderEin", windowIn).put("bilderAus", windowOut).put("luecken", windowGaps)
-        // Anteil der ausgegebenen Bilder mit unscharfem Hintergrund (Motiv gefunden, Unschärfe an).
-        if (windowOut > 0) o.put("unscharfProzent", Math.round(windowSubject * 100.0 / windowOut))
+        // Anteil der ausgegebenen Bilder über die Verzögerung (Ring) und mit unscharfem Hintergrund.
+        if (windowOut > 0) {
+            o.put("ueberRingProzent", Math.round(windowBlurred * 100.0 / windowOut))
+            o.put("unscharfProzent", Math.round(windowSubject * 100.0 / windowOut))
+        }
         windowFrameMs.json()?.let { o.put("jeBildMs", it) }
         if (windowOutputFailures > 0) o.put("ausgabeFehler", windowOutputFailures)
         if (windowWithMask > 0) {
