@@ -272,6 +272,43 @@ internal object PipelineMath {
         else -> 3
     }
 
+    /** Was die Live-KI mit einem Kamerabild macht (siehe [livePlan]). */
+    data class LivePlan(
+        /** Bild auslassen: Ein Start braucht die Tiefe, und dieses Bild hat keine. */
+        val skip: Boolean,
+        /** Verfolgung (neu) starten: erstes Bild oder ein Tipp. */
+        val start: Boolean,
+        /** Tiefe vor der Verfolgung rechnen: Der Start wählt mit ihr das ganze Objekt. */
+        val depthFirst: Boolean,
+        /** Tiefe nach der Maske rechnen (im Takt, nur für die Messung). */
+        val depthAfter: Boolean,
+        /** Durchgänge seit der letzten Tiefe, nach diesem Bild. */
+        val sinceDepth: Int,
+        /** Fürs nächste Bild ein Tiefenbild anfordern. */
+        val wantDepth: Boolean,
+    )
+
+    /**
+     * Plan der Live-KI für ein Bild. [wantStart]: erstes Bild oder neuer Tipp; [startNeedsDepth]:
+     * der Start kann unter mehreren Masken wählen und braucht dafür die Tiefe ([SubjectPick]);
+     * [hasDepth]: das Bild bringt ein Tiefenbild mit; [every]: Tiefe jedes n-te Mal (0 = nur beim
+     * Start); [sinceDepth]: Durchgänge seit der letzten Tiefe. Ein Start ohne die nötige Tiefe lässt
+     * das Bild aus und fordert sie fürs nächste an; ein Start mit Tiefe rechnet sie zuerst. Sonst
+     * kommt die Tiefe im Takt nach der Maske, damit die Pipeline nicht länger auf sie wartet.
+     */
+    fun livePlan(wantStart: Boolean, startNeedsDepth: Boolean, hasDepth: Boolean, every: Int, sinceDepth: Int): LivePlan {
+        if (wantStart && startNeedsDepth && !hasDepth) {
+            return LivePlan(skip = true, start = false, depthFirst = false, depthAfter = false, sinceDepth = sinceDepth, wantDepth = true)
+        }
+        val depthFirst = wantStart && startNeedsDepth
+        val depthAfter = !depthFirst && hasDepth && every > 0 && sinceDepth + 1 >= every
+        val since = if (depthFirst || depthAfter) 0 else min(sinceDepth + 1, 1_000)
+        return LivePlan(
+            skip = false, start = wantStart, depthFirst = depthFirst, depthAfter = depthAfter,
+            sinceDepth = since, wantDepth = every > 0 && since + 1 >= every,
+        )
+    }
+
     /** Ab dieser Wärmestufe (Notfall) beendet die App einen laufenden Test selbst, bevor das System eingreift. */
     const val EMERGENCY_STATUS = 5
 

@@ -20,10 +20,11 @@ internal object PowerMath {
         return if (v < 20_000) v / 1_000.0 else v / 1_000_000.0
     }
 
-    /** Spannung in Volt aus EXTRA_VOLTAGE (mV; manche Geräte melden V). */
+    /** Spannung in Volt aus EXTRA_VOLTAGE (mV; manche Geräte melden V oder µV). */
     fun volts(raw: Int): Double = when {
         raw <= 0 -> Double.NaN
         raw < 100 -> raw.toDouble()
+        raw > 100_000 -> raw / 1_000_000.0
         else -> raw / 1000.0
     }
 

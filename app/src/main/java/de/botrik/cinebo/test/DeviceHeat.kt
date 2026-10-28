@@ -123,10 +123,15 @@ internal class HeatGovernor(context: Context) {
         return PipelineMath.minIntervalMs(level)
     }
 
-    /** Die KI hat [ms] gewartet, weil die Wärmeregelung bremste. */
+    /**
+     * Die KI hat [ms] auf ihren nächsten Durchgang gewartet. Als Bremsen der Wärmeregelung zählt
+     * nur, was über den Grundtakt (Stufe „keine“, 5 pro Sekunde) hinausgeht.
+     */
     fun noteWait(ms: Long) {
+        val extra = minOf(ms, PipelineMath.minIntervalMs(level) - PipelineMath.minIntervalMs(0))
+        if (extra <= 0L) return
         waits++
-        waitedMs += ms
+        waitedMs += extra
     }
 
     /** Wie oft die KI gerade die Tiefe rechnen soll (3 = jedes dritte Mal, 0 = nie); gilt bis zum nächsten [minIntervalMs]. */

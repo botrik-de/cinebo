@@ -18,6 +18,9 @@ internal interface Tracker {
     val convertMs: Double
     val totalMs: Double
 
+    /** Ob ein Start unter mehreren Masken wählen kann (sonst nimmt er die einzige des Decoders). */
+    val canChoose: Boolean
+
     /**
      * Startbild: Objekt an Stelle (u, v), beides 0 bis 1 im aufrechten Kamerabild. Mit [chooser]
      * wählt die App unter den Masken des Decoders (sonst wie im Original die beste Schätzung).
@@ -101,6 +104,7 @@ internal class EdgeTamTracker(
     var steps = 0L; private set
 
     override val started: Boolean get() = condMem != null
+    override val canChoose: Boolean get() = decoder.candidates > 1
 
     /** Masken und Schätzungen des Startbilds für [StartChooser]; erst beim ersten Bedarf angelegt. */
     private var candMasks: FloatArray? = null
@@ -312,6 +316,7 @@ internal class FastTracker(
 
     override val name: String = "schnell · Encoder ${encoder.name} · Decoder ${decoder.name} · Punkt aus dem Bild davor"
     override var started = false; private set
+    override val canChoose: Boolean get() = decoder.candidates > 1
     override var present = false; private set
     override var objectScore = 0f; private set
     override var encMs = 0.0; private set

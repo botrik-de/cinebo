@@ -94,6 +94,12 @@ internal class BokehProcessor(
      */
     @Volatile var staticMask: ByteArray? = staticMask
 
+    /**
+     * Für den Strombedarf: Gilt die feste Maske als Motiv? false = Ring und Ausgabe laufen wie
+     * sonst, aber ohne Hintergrund-Unschärfe; so lässt sich die Verzögerung allein messen.
+     */
+    @Volatile var staticPresent: Boolean = true
+
     /** Ob gerade die feste Maske im Maskenring liegt (nur Pipeline-Thread). */
     private var staticShown = false
 
@@ -691,7 +697,7 @@ internal class BokehProcessor(
     // ---------------------------------------------------- Masken
 
     private fun uploadMasks() {
-        val fixed = staticMask
+        val fixed = staticMask?.takeIf { it.size >= MASK_SIZE * MASK_SIZE }
         if (fixed == null && staticShown) {
             // Zurück zur KI: Die feste Maske gehört nicht zu ihren Bildern.
             staticShown = false
@@ -710,11 +716,11 @@ internal class BokehProcessor(
                 GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, maskTex[0])
                 GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, 0, MASK_SIZE, MASK_SIZE, GLES30.GL_RED, GLES30.GL_UNSIGNED_BYTE, maskUpload)
                 maskNs[0] = 0L
-                maskPresent[0] = true
                 maskGeneration[0] = 0
                 maskCount = 1
                 maskNext = 1
             }
+            maskPresent[0] = staticPresent
             return
         }
         while (true) {
@@ -1242,6 +1248,7 @@ internal class PipelineStats {
     private var windowMixed = 0
     private var windowWithMask = 0
     private var windowStale = 0
+    private var windowSubject = 0
 
     private class Series {
         var values = DoubleArray(512)
@@ -1297,6 +1304,7 @@ internal class PipelineStats {
         windowMixed = 0
         windowWithMask = 0
         windowStale = 0
+        windowSubject = 0
     }
 
     fun gl(renderer: String, version: String) = synchronized(lock) {
@@ -1375,7 +1383,10 @@ internal class PipelineStats {
         if (!blurred) return@synchronized
         blurredOut++
         windowBlurred++
-        if (subject) withSubject++
+        if (subject) {
+            withSubject++
+            windowSubject++
+        }
         if (pick == null) {
             withoutMask++
             return@synchronized
@@ -1426,6 +1437,8 @@ internal class PipelineStats {
     /** Abschnitt für den Verlauf (etwa alle 30 s). */
     fun closeWindow(): JSONObject = synchronized(lock) {
         val o = JSONObject().put("bilderEin", windowIn).put("bilderAus", windowOut).put("luecken", windowGaps)
+        // Anteil der ausgegebenen Bilder mit unscharfem Hintergrund (Motiv gefunden, Unschärfe an).
+        if (windowOut > 0) o.put("unscharfProzent", Math.round(windowSubject * 100.0 / windowOut))
         windowFrameMs.json()?.let { o.put("jeBildMs", it) }
         if (windowOutputFailures > 0) o.put("ausgabeFehler", windowOutputFailures)
         if (windowWithMask > 0) {

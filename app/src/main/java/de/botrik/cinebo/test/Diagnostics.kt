@@ -100,52 +100,67 @@ internal object ExitHistory {
 }
 
 /**
- * Leistungsaufnahme des ganzen Handys über den Akku: Strom jede Sekunde
- * (BATTERY_PROPERTY_CURRENT_NOW), Spannung aus der letzten Akku-Meldung, dazu als Gegenproben
- * der Ladungszähler, der Durchschnittsstrom des Akkus und (falls das Handy ihn führt) der
- * Energiezähler. Ergebnis in Watt je Abschnitt ([closeWindow]) und insgesamt ([total]); beim
- * Laden ungültig. Hersteller melden den Strom mal in µA, mal in mA und mit beliebigem
- * Vorzeichen: Kleine Beträge gelten als mA, gezählt wird der Betrag. Wie oft sich der Rohwert
- * von Messung zu Messung ändert, steht dabei: Erneuert das Handy ihn seltener als jede Sekunde,
- * stecken in einem Abschnitt weniger echte Messungen. Eigener Thread.
+ * Leistungsaufnahme des ganzen Handys über den Akku. Den Strom (BATTERY_PROPERTY_CURRENT_NOW)
+ * liest ein eigener Thread etwa 4-mal pro Sekunde in zufälligem Abstand (150 bis 350 ms), damit
+ * die Messung nicht im Gleichtakt mit Kamera (33 ms) und KI (200 ms) abtastet; Spannung,
+ * Temperatur und Akkustand aus der letzten Akku-Meldung einmal pro Sekunde. Gegenproben: der
+ * Ladungszähler, der Durchschnittsstrom des Akkus und, falls das Handy ihn führt, der
+ * Energiezähler. Ergebnis in Watt und Ampere je Abschnitt ([closeWindow]) und insgesamt
+ * ([total]); beim Laden ungültig. Hersteller melden den Strom mal in µA, mal in mA und mit
+ * beliebigem Vorzeichen: Kleine Beträge gelten als mA, gezählt wird der Betrag. Wie oft sich der
+ * Rohwert ändert, steht dabei; [probe] liest ihn kurz alle 50 ms und zeigt so, wie oft der
+ * Akkuwächter ihn erneuert.
  */
-internal class PowerMeter(context: Context, private val periodMs: Long = 1000L) {
+internal class PowerMeter(context: Context) {
     private val app = context.applicationContext
     private val battery = app.getSystemService(BatteryManager::class.java)
 
     private class Sums {
         var n = 0
         var watts = 0.0
+        var watts2 = 0.0
         var amps = 0.0
         var volts = 0.0
         var charging = 0
         var invalid = 0
-        var startMs = SystemClock.elapsedRealtime()
-        var chargeStart = Long.MIN_VALUE
-        var chargeEnd = Long.MIN_VALUE
-        var levelStart = -1
-        var levelEnd = -1
-        var tempStart = Double.NaN
-        var tempEnd = Double.NaN
         /** Messungen, deren Rohwert sich gegenüber der vorigen geändert hat. */
         var changed = 0
         var avgN = 0
         var avgAmps = 0.0
+        var startMs = SystemClock.elapsedRealtime()
+        var chargeStart = Long.MIN_VALUE
+        var chargeStartMs = 0L
+        var chargeEnd = Long.MIN_VALUE
+        var chargeEndMs = 0L
+        /** Kleinste Änderung des Ladungszählers (µAh) zwischen zwei Ablesungen. */
+        var chargeStep = Long.MAX_VALUE
         var energyStart = Long.MIN_VALUE
+        var energyStartMs = 0L
         var energyEnd = Long.MIN_VALUE
+        var energyEndMs = 0L
+        var levelStart = -1
+        var levelEnd = -1
+        var tempStart = Double.NaN
+        var tempEnd = Double.NaN
     }
 
     private val lock = Any()
     private var window = Sums()
     private var all = Sums()
-    private var last = ArrayDeque<Double>()
+    /** (Zeit, Watt) der letzten Sekunden für [recentWatts]. */
+    private val recent = ArrayDeque<Pair<Long, Double>>()
     @Volatile private var running = false
     private var thread: Thread? = null
-    /** Rohwerte der ersten Messung, damit sich die Einheit im Bericht nachprüfen lässt. */
+    /** Rohwerte der ersten Messung, damit sich die Einheiten im Bericht nachprüfen lassen. */
     private var firstRaw: JSONObject? = null
     private var previousRaw = Int.MIN_VALUE
+    private var previousCharge = Long.MIN_VALUE
+    // Aus der letzten Akku-Meldung (einmal pro Sekunde gelesen; nur der Mess-Thread).
+    private var volts = Double.NaN
+    private var plugged = false
+    private var errors = 0
 
-    /** Akkutemperatur der letzten Messung in °C (NaN: noch keine); für den Hitzestopp. */
+    /** Akkutemperatur der letzten Akku-Meldung in °C (NaN: noch keine); für den Hitzestopp. */
     @Volatile var lastTempC = Double.NaN
         private set
 
@@ -155,14 +170,26 @@ internal class PowerMeter(context: Context, private val periodMs: Long = 1000L) 
         synchronized(lock) {
             window = Sums()
             all = Sums()
-            last.clear()
+            recent.clear()
             previousRaw = Int.MIN_VALUE
+            previousCharge = Long.MIN_VALUE
+            errors = 0
         }
         thread = Thread({
+            val random = java.util.Random()
+            var nextSlow = 0L
             while (running) {
-                sample()
+                val now = SystemClock.elapsedRealtime()
+                val slow = now >= nextSlow
+                if (slow) nextSlow = now + SLOW_MS
+                // Eine Messung darf nie die App beenden.
                 try {
-                    Thread.sleep(periodMs)
+                    sample(slow)
+                } catch (_: Throwable) {
+                    synchronized(lock) { errors++ }
+                }
+                try {
+                    Thread.sleep(MIN_GAP_MS + random.nextInt(GAP_SPREAD_MS + 1))
                 } catch (_: InterruptedException) {
                     break
                 }
@@ -176,55 +203,85 @@ internal class PowerMeter(context: Context, private val periodMs: Long = 1000L) 
         thread = null
     }
 
-    private fun sample() {
+    private fun sample(slow: Boolean) {
         val bm = battery ?: return
+        val now = SystemClock.elapsedRealtime()
         val raw = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
-        val sticky = app.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-        val mv = sticky?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1) ?: -1
-        val plugged = (sticky?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0) != 0
-        val tenths = sticky?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE) ?: Int.MIN_VALUE
-        val level = sticky?.let {
-            val l = it.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
-            val s = it.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
-            if (l >= 0 && s > 0) l * 100 / s else -1
-        } ?: -1
-        val charge = bm.getLongProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)
-        val average = PowerMath.amps(bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_AVERAGE))
-        val energy = bm.getLongProperty(BatteryManager.BATTERY_PROPERTY_ENERGY_COUNTER)
+        val averageRaw = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_AVERAGE)
+        var level = -1
+        var temp = Double.NaN
+        var charge = Long.MIN_VALUE
+        var energy = Long.MIN_VALUE
+        if (slow) {
+            val sticky = app.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            if (sticky != null) {
+                volts = PowerMath.volts(sticky.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1))
+                plugged = sticky.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0
+                val tenths = sticky.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE)
+                if (tenths != Int.MIN_VALUE) {
+                    temp = tenths / 10.0
+                    lastTempC = temp
+                }
+                val l = sticky.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                val scale = sticky.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+                if (l >= 0 && scale > 0) level = l * 100 / scale
+            }
+            charge = bm.getLongProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)
+            energy = bm.getLongProperty(BatteryManager.BATTERY_PROPERTY_ENERGY_COUNTER)
+        }
         val amps = PowerMath.amps(raw)
-        val volts = PowerMath.volts(mv)
-        if (tenths != Int.MIN_VALUE) lastTempC = tenths / 10.0
+        val average = PowerMath.amps(averageRaw)
+        val v = volts
         synchronized(lock) {
             if (firstRaw == null) {
-                firstRaw = JSONObject().put("stromRoh", raw).put("spannungRohMv", mv).put("ladungRoh", charge)
-                    .put("durchschnittRoh", bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_AVERAGE))
-                    .put("energieRoh", energy)
+                firstRaw = JSONObject().put("stromRoh", raw).put("durchschnittRoh", averageRaw)
+                    .put("ladungRoh", charge).put("energieRoh", energy)
             }
             val changed = previousRaw != Int.MIN_VALUE && raw != previousRaw
             previousRaw = raw
+            val chargeValid = charge != Long.MIN_VALUE && charge > 0
+            var step = Long.MAX_VALUE
+            if (chargeValid) {
+                if (previousCharge != Long.MIN_VALUE && charge != previousCharge) step = kotlin.math.abs(charge - previousCharge)
+                previousCharge = charge
+            }
+            val energyValid = energy != Long.MIN_VALUE && energy > 0
             for (s in listOf(window, all)) {
-                if (s.levelStart < 0) s.levelStart = level
-                s.levelEnd = level
-                if (tenths != Int.MIN_VALUE) {
-                    if (s.tempStart.isNaN()) s.tempStart = tenths / 10.0
-                    s.tempEnd = tenths / 10.0
+                if (level >= 0) {
+                    if (s.levelStart < 0) s.levelStart = level
+                    s.levelEnd = level
                 }
-                if (charge != Long.MIN_VALUE && charge > 0) {
-                    if (s.chargeStart == Long.MIN_VALUE) s.chargeStart = charge
+                if (!temp.isNaN()) {
+                    if (s.tempStart.isNaN()) s.tempStart = temp
+                    s.tempEnd = temp
+                }
+                if (chargeValid) {
+                    if (s.chargeStart == Long.MIN_VALUE) {
+                        s.chargeStart = charge
+                        s.chargeStartMs = now
+                    }
                     s.chargeEnd = charge
+                    s.chargeEndMs = now
+                    if (step < s.chargeStep) s.chargeStep = step
                 }
-                if (energy != Long.MIN_VALUE && energy > 0) {
-                    if (s.energyStart == Long.MIN_VALUE) s.energyStart = energy
+                if (energyValid) {
+                    if (s.energyStart == Long.MIN_VALUE) {
+                        s.energyStart = energy
+                        s.energyStartMs = now
+                    }
                     s.energyEnd = energy
+                    s.energyEndMs = now
                 }
                 when {
                     plugged -> s.charging++
-                    amps.isNaN() || volts.isNaN() -> s.invalid++
+                    amps.isNaN() || v.isNaN() -> s.invalid++
                     else -> {
+                        val w = amps * v
                         s.n++
                         s.amps += amps
-                        s.volts += volts
-                        s.watts += amps * volts
+                        s.volts += v
+                        s.watts += w
+                        s.watts2 += w * w
                         if (changed) s.changed++
                         if (!average.isNaN()) {
                             s.avgN++
@@ -233,15 +290,15 @@ internal class PowerMeter(context: Context, private val periodMs: Long = 1000L) 
                     }
                 }
             }
-            if (!plugged && !amps.isNaN() && !volts.isNaN()) {
-                last.addLast(amps * volts)
-                while (last.size > RECENT) last.removeFirst()
+            if (!plugged && !amps.isNaN() && !v.isNaN()) {
+                recent.addLast(now to amps * v)
+                while (recent.isNotEmpty() && now - recent.first().first > RECENT_MS) recent.removeFirst()
             }
         }
     }
 
     /** Mittlere Leistung der letzten Sekunden (für die Anzeige), NaN ohne Messwerte. */
-    fun recentWatts(): Double = synchronized(lock) { if (last.isEmpty()) Double.NaN else last.sum() / last.size }
+    fun recentWatts(): Double = synchronized(lock) { if (recent.isEmpty()) Double.NaN else recent.sumOf { it.second } / recent.size }
 
     /** Abschnitt seit dem letzten Aufruf abschließen. */
     fun closeWindow(): JSONObject = synchronized(lock) {
@@ -250,7 +307,42 @@ internal class PowerMeter(context: Context, private val periodMs: Long = 1000L) 
         o
     }
 
-    fun total(): JSONObject = synchronized(lock) { json(all).also { o -> firstRaw?.let { o.put("ersteMessung", it) } } }
+    fun total(): JSONObject = synchronized(lock) {
+        json(all).also { o ->
+            firstRaw?.let { o.put("ersteMessung", it) }
+            if (errors > 0) o.put("messfehler", errors)
+        }
+    }
+
+    /**
+     * Liest den Strom [durationMs] lang alle [stepMs] als Rohwert mit Zeit. Daran sieht man, wie oft
+     * der Akkuwächter ihn erneuert und ob er ihn glättet. Blockiert: nicht auf dem Hauptthread.
+     */
+    fun probe(durationMs: Long = 3000L, stepMs: Long = 50L): JSONObject {
+        val bm = battery ?: return JSONObject().put("fehler", "kein Zugriff auf den Akku")
+        val ms = JSONArray()
+        val raw = JSONArray()
+        val distinct = HashSet<Int>()
+        var changes = 0
+        var previous = Int.MIN_VALUE
+        val t0 = SystemClock.elapsedRealtime()
+        try {
+            while (SystemClock.elapsedRealtime() - t0 < durationMs) {
+                val value = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
+                ms.put(SystemClock.elapsedRealtime() - t0)
+                raw.put(value)
+                if (previous != Int.MIN_VALUE && value != previous) changes++
+                previous = value
+                distinct.add(value)
+                Thread.sleep(stepMs)
+            }
+        } catch (_: InterruptedException) {
+        } catch (e: Exception) {
+            return JSONObject().put("fehler", e.toString().take(200))
+        }
+        return JSONObject().put("schrittMs", stepMs).put("wechsel", changes).put("verschiedeneWerte", distinct.size)
+            .put("ms", ms).put("roh", raw)
+    }
 
     private fun json(s: Sums): JSONObject {
         val o = JSONObject()
@@ -258,23 +350,33 @@ internal class PowerMeter(context: Context, private val periodMs: Long = 1000L) 
         o.put("sekunden", r1(seconds))
         o.put("messwerte", s.n)
         if (s.n > 0) {
-            o.put("watt", r2(s.watts / s.n))
-            o.put("ampere", r2(s.amps / s.n))
+            val mean = s.watts / s.n
+            o.put("watt", r2(mean))
+            o.put("ampere", r4(s.amps / s.n))
             o.put("volt", r2(s.volts / s.n))
+            if (s.n > 1) o.put("wattStreuung", r2(kotlin.math.sqrt(maxOf(0.0, (s.watts2 - s.n * mean * mean) / (s.n - 1)))))
             o.put("stromWechselProzent", Math.round(s.changed * 100.0 / s.n))
         }
-        if (s.avgN > 0) o.put("ampereDurchschnittAkku", r2(s.avgAmps / s.avgN))
+        if (s.avgN > 0) o.put("ampereDurchschnittAkku", r4(s.avgAmps / s.avgN))
         if (s.charging > 0) o.put("beimLaden", s.charging)
         if (s.invalid > 0) o.put("ungueltig", s.invalid)
-        // Gegenprobe über den Ladungszähler (µAh): mittlerer Strom aus der Abnahme.
-        if (s.chargeStart != Long.MIN_VALUE && s.chargeEnd != Long.MIN_VALUE && seconds >= 10) {
+        // Gegenproben über die Zähler: über die Zeit zwischen erster und letzter Ablesung, und erst
+        // ab einer Minute (sonst ist eine Zählerstufe ein großer Teil davon).
+        if (s.chargeStart != Long.MIN_VALUE && s.chargeEnd != Long.MIN_VALUE) {
             o.put("ladungAbnahmeMah", r1((s.chargeStart - s.chargeEnd) / 1000.0))
-            val amps = PowerMath.ampsFromCharge(s.chargeStart, s.chargeEnd, seconds)
-            if (!amps.isNaN()) o.put("ampereAusLadung", r2(amps))
+            if (s.chargeStep != Long.MAX_VALUE) o.put("ladungStufeUah", s.chargeStep)
+            val span = (s.chargeEndMs - s.chargeStartMs) / 1000.0
+            if (span >= CROSS_CHECK_S) {
+                val amps = PowerMath.ampsFromCharge(s.chargeStart, s.chargeEnd, span)
+                if (!amps.isNaN() && amps <= MAX_AMPS) o.put("ampereAusLadung", r2(amps))
+            }
         }
-        if (seconds >= 10) {
-            val watts = PowerMath.wattsFromEnergy(s.energyStart, s.energyEnd, seconds)
-            if (!watts.isNaN()) o.put("wattAusEnergie", r2(watts))
+        if (s.energyStart != Long.MIN_VALUE && s.energyEnd != Long.MIN_VALUE) {
+            val span = (s.energyEndMs - s.energyStartMs) / 1000.0
+            if (span >= CROSS_CHECK_S) {
+                val watts = PowerMath.wattsFromEnergy(s.energyStart, s.energyEnd, span)
+                if (!watts.isNaN() && watts <= MAX_WATTS) o.put("wattAusEnergie", r2(watts))
+            }
         }
         if (s.levelStart >= 0) o.put("akkuProzent", JSONArray().put(s.levelStart).put(s.levelEnd))
         if (!s.tempStart.isNaN()) o.put("akkuGrad", JSONArray().put(s.tempStart).put(s.tempEnd))
@@ -282,7 +384,18 @@ internal class PowerMeter(context: Context, private val periodMs: Long = 1000L) 
     }
 
     private companion object {
-        const val RECENT = 5
+        /** Abstand der Strommessungen: 150 bis 350 ms, zufällig. */
+        const val MIN_GAP_MS = 150L
+        const val GAP_SPREAD_MS = 200
+        /** So oft (ms) liest der Thread Spannung, Temperatur und Zähler. */
+        const val SLOW_MS = 1000L
+        /** Über so viele Millisekunden mittelt [recentWatts]. */
+        const val RECENT_MS = 5000L
+        /** Gegenproben über die Zähler erst ab dieser Zeitspanne (s). */
+        const val CROSS_CHECK_S = 60.0
+        /** Mehr ist nicht plausibel (ein Zählersprung), solche Gegenproben fallen weg. */
+        const val MAX_AMPS = 10.0
+        const val MAX_WATTS = 40.0
     }
 }
 

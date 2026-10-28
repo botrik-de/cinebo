@@ -315,6 +315,61 @@ class PipelineMathTest {
         assertTrue(PipelineMath.isCool("keine", Double.NaN, 31.7))
     }
 
+    /** Spielt die Live-KI über [frames] Bilder durch; die Pipeline legt die Tiefe bei, wenn sie angefordert war. */
+    private fun simulate(every: Int, frames: Int, startNeedsDepth: Boolean = true, tapAt: Set<Int> = emptySet()): List<PipelineMath.LivePlan> {
+        val out = mutableListOf<PipelineMath.LivePlan>()
+        var since = 1_000
+        var wantDepth = true
+        var started = false
+        var tapPending = false
+        for (i in 0 until frames) {
+            // Die Pipeline hat das Bild schon vorbereitet, bevor ein Tipp zu diesem Bild kommt.
+            val hasDepth = wantDepth || tapPending
+            if (i in tapAt) tapPending = true
+            val plan = PipelineMath.livePlan(tapPending || !started, startNeedsDepth, hasDepth, every, since)
+            out += plan
+            wantDepth = plan.wantDepth
+            if (plan.skip) continue
+            since = plan.sinceDepth
+            if (plan.start) {
+                started = true
+                tapPending = false
+            }
+        }
+        return out
+    }
+
+    @Test
+    fun liveTiefeImTaktUndVorDemStart() {
+        // Jedes 3. Mal: Start mit Tiefe vorher, dann die Tiefe jedes dritte Bild nach der Maske.
+        val plans = simulate(every = 3, frames = 10)
+        assertTrue(plans[0].start && plans[0].depthFirst && !plans[0].depthAfter)
+        assertEquals(listOf(false, false, false, true, false, false, true, false, false, true), plans.map { it.depthAfter })
+        assertTrue(plans.drop(1).none { it.start || it.depthFirst || it.skip })
+        // Jedes Mal (Strombedarf „KI mit Tiefe“) und nie (nur beim Start).
+        assertTrue(simulate(every = 1, frames = 6).drop(1).all { it.depthAfter })
+        assertTrue(simulate(every = 0, frames = 6).drop(1).none { it.depthAfter || it.wantDepth })
+    }
+
+    @Test
+    fun startOhneTiefeLaesstDasBildAus() {
+        // Ein Tipp auf ein Bild ohne Tiefe: auslassen, Tiefe anfordern, das nächste startet mit Tiefe.
+        val skip = PipelineMath.livePlan(wantStart = true, startNeedsDepth = true, hasDepth = false, every = 3, sinceDepth = 1)
+        assertTrue(skip.skip && skip.wantDepth && !skip.start)
+        assertEquals("der Takt der Tiefe bleibt", 1, skip.sinceDepth)
+        val start = PipelineMath.livePlan(wantStart = true, startNeedsDepth = true, hasDepth = true, every = 3, sinceDepth = 1)
+        assertTrue(start.start && start.depthFirst && !start.depthAfter && !start.skip)
+        assertEquals(0, start.sinceDepth)
+        // Über eine Folge: Der Tipp bei Bild 4 trifft ein Bild ohne Tiefe und startet beim nächsten.
+        val plans = simulate(every = 3, frames = 8, tapAt = setOf(4))
+        assertTrue(plans[4].skip)
+        assertTrue(plans[5].start && plans[5].depthFirst)
+        assertTrue(plans.drop(6).none { it.start || it.skip })
+        // Kann der Start nicht wählen (eine Maske), wartet er nicht auf die Tiefe.
+        val noChoice = PipelineMath.livePlan(wantStart = true, startNeedsDepth = false, hasDepth = false, every = 3, sinceDepth = 1)
+        assertTrue(noChoice.start && !noChoice.skip && !noChoice.depthFirst)
+    }
+
     @Test
     fun hitzestoppAbNotfallOderAkku44Grad() {
         assertFalse(PipelineMath.tooHot(0, 30.0))

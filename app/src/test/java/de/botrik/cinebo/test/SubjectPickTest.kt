@@ -181,6 +181,14 @@ class SubjectPickTest {
     }
 
     @Test
+    fun tiefeMitNanOderUnendlichTaugtNicht() {
+        val grid = scene()
+        assertTrue(SubjectPick.depthUsable(grid))
+        assertFalse(SubjectPick.depthUsable(grid.copyOf().also { it[100] = Float.NaN }))
+        assertFalse(SubjectPick.depthUsable(grid.copyOf().also { it[7] = Float.POSITIVE_INFINITY }))
+    }
+
+    @Test
     fun medianUndPerzentilWieNumpy() {
         val g = floatArrayOf(5f, 1f, 4f, 2f)
         assertEquals(3.0, SubjectPick.median(g) { true }, 0.0)

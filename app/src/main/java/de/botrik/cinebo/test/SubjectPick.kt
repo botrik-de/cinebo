@@ -91,12 +91,19 @@ internal object SubjectPick {
     }
 
     /**
+     * Ob die Tiefe für die Wahl taugt: alle Werte endlich. NaN oder Unendlich (etwa ein Überlauf auf
+     * dem KI-Chip) schalten sonst still die Tiefenprüfung ab; dann wählt die App wie Meta.
+     */
+    fun depthUsable(grid: FloatArray): Boolean = grid.all { it.isFinite() }
+
+    /**
      * Merkmale aller Masken; [masks]: je Maske N² Logits (größer 0 heißt Objekt) hintereinander,
      * [grid]: Tiefe je Zelle, ([tapU], [tapV]): Tipp von 0 bis 1 im aufrechten Bild.
      */
     fun evaluate(masks: FloatArray, count: Int, ious: FloatArray, grid: FloatArray, tapU: Float, tapV: Float): List<Candidate> {
         require(masks.size >= count * N * N && grid.size == N * N && ious.size >= count)
-        val norm = max(percentile(grid.copyOf(), 0.95, presorted = false) - percentile(grid.copyOf(), 0.05, presorted = false), 1e-6)
+        val sorted = grid.copyOf().also { it.sort() }
+        val norm = max(percentile(sorted, 0.95, presorted = true) - percentile(sorted, 0.05, presorted = true), 1e-6)
         val sx = (tapU * N).toInt().coerceIn(0, N - 1)
         val sy = (tapV * N).toInt().coerceIn(0, N - 1)
         val bits = Array(count) { i -> BooleanArray(N * N) { k -> masks[i * N * N + k] > 0f } }

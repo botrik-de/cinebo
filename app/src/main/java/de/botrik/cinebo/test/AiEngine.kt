@@ -92,13 +92,15 @@ internal class AiEngine(private val context: Context) : AiDemand {
     private val pendingTap = AtomicReference<Tap?>(null)
 
     /** Ein Tipp ins Bild: (u, v) von 0 bis 1 im aufrechten Bild; [rank] > 0 heißt gleich noch einmal an derselben Stelle. */
-    private class Tap(val u: Float, val v: Float, val rank: Int)
+    private class Tap(val u: Float, val v: Float, val rank: Int) {
+        val createdAt = SystemClock.elapsedRealtime()
 
-    // Letzter Tipp (Hauptthread), um ein erneutes Tippen an derselben Stelle zu erkennen.
-    private var lastTapU = -1f
-    private var lastTapV = -1f
-    private var lastTapAt = 0L
-    private var lastTapRank = 0
+        /** Wann die KI ihn angewandt hat (elapsedRealtime); 0 = noch nicht. Schreibt der KI-Thread. */
+        @Volatile var appliedAt = 0L
+    }
+
+    /** Letzter Tipp (nur Hauptthread), um ein erneutes Tippen an derselben Stelle zu erkennen. */
+    private var lastTap: Tap? = null
 
     // Takt für die Grafik-Pipeline (siehe AiDemand); schreibt nur der KI-Thread.
     @Volatile private var nextTake = 0L
@@ -1185,26 +1187,33 @@ internal class AiEngine(private val context: Context) : AiDemand {
     // ------------------------------------------------------------ Live
 
     /**
-     * Neues Ziel für die Verfolgung, (u, v) von 0 bis 1 im aufrechten Kamerabild (Hauptthread).
-     * Tippt man binnen 1,5 s noch einmal auf dieselbe Stelle (höchstens 3 % daneben), nimmt die KI
-     * die nächstkleinere glaubwürdige Maske ([SubjectPick.choose] mit Rang), reihum.
+     * Neues Ziel für die Verfolgung, (u, v) von 0 bis 1 im aufrechten Kamerabild (Hauptthread);
+     * [aspect] = Höhe / Breite der angetippten Fläche, damit „dieselbe Stelle“ in beiden Richtungen
+     * gleich weit reicht. Tippt man noch einmal auf dieselbe Stelle (höchstens 3 % der Breite
+     * daneben), nimmt die KI die nächstkleinere glaubwürdige Maske ([SubjectPick.choose] mit Rang,
+     * reihum), sofern sie den vorigen Tipp höchstens [RETAP_MS] vorher angewandt hat. Wartet der
+     * vorige noch auf die KI, gilt er nur am neuen Ort, ohne neuen Rang: Man sieht das Ganze, bevor
+     * ein Teil kommt.
      */
-    fun track(u: Float, v: Float) {
-        val now = SystemClock.elapsedRealtime()
-        val again = now - lastTapAt <= RETAP_MS && kotlin.math.abs(u - lastTapU) <= RETAP_DISTANCE && kotlin.math.abs(v - lastTapV) <= RETAP_DISTANCE
-        lastTapRank = if (again) lastTapRank + 1 else 0
-        lastTapU = u
-        lastTapV = v
-        lastTapAt = now
-        pendingTap.set(Tap(u, v, lastTapRank))
+    fun track(u: Float, v: Float, aspect: Float = 1f) {
+        val previous = lastTap
+        val near = previous != null && kotlin.math.hypot(u - previous.u, (v - previous.v) * aspect) <= RETAP_DISTANCE
+        val rank = when {
+            previous == null || !near -> 0
+            previous.appliedAt == 0L -> previous.rank
+            SystemClock.elapsedRealtime() - previous.appliedAt <= RETAP_MS -> previous.rank + 1
+            else -> 0
+        }
+        val tap = Tap(u, v, rank)
+        lastTap = tap
+        pendingTap.set(tap)
     }
 
     /** Vor jedem Start von [runLive] aufrufen (auf dem Hauptthread), damit ein frühes Stopp nicht verloren geht. */
     fun beginLive() {
         stopLive = false
         pendingTap.set(null)
-        lastTapAt = 0L
-        lastTapRank = 0
+        lastTap = null
     }
 
     fun requestStop() {
@@ -1232,8 +1241,8 @@ internal class AiEngine(private val context: Context) : AiDemand {
 
     /**
      * Die letzten Starts der Verfolgung (Antippen oder Bildmitte) mit allen Masken, der Wahl und
-     * einem kleinen Bild (gewählte Maske eingefärbt), für den Bericht. Das Bild entsteht auf einem
-     * eigenen Thread; deshalb ist alles hier unter [startsLock].
+     * einem kleinen Bild (gewählte Maske eingefärbt), für den Bericht; unter [startsLock], weil
+     * der Hauptthread sie liest.
      */
     private var starts = JSONArray()
     private val startsLock = Any()
@@ -1246,12 +1255,23 @@ internal class AiEngine(private val context: Context) : AiDemand {
     private val depthOut = FloatArray(FrameSlot.DEPTH * FrameSlot.DEPTH)
     private val depthGrid = FloatArray(MASK_SIZE * MASK_SIZE)
 
+    /** Was ein Start der Verfolgung für den Bericht festhält (siehe [noteStart]); füllt die Wahl beim Start. */
+    private class StartNote(val u: Float, val v: Float, val tap: Tap?) {
+        var masks: FloatArray? = null
+        var cands: List<SubjectPick.Candidate> = emptyList()
+        var chosen = -1
+        var meta = -1
+        var chooseMs = Double.NaN
+        var depthOk = true
+    }
+
     /**
      * Läuft, bis [requestStop] kommt: nimmt das jeweils neueste Kamerabild aus der Grafik-Pipeline,
-     * verfolgt das Motiv, gibt die Maske an [maskSink] und rechnet die Tiefe (jedes 3. Mal, bei
-     * Hitze seltener). Ein Start (erstes Bild oder Antippen) braucht ein Bild mit Tiefe: Mit ihr
-     * wählt [SubjectPick] die Maske, die das ganze Objekt trifft. Fehlt sie, verfolgt die KI für
-     * einen Durchgang weiter das alte Motiv, und die Pipeline legt dem nächsten Bild die Tiefe bei.
+     * verfolgt das Motiv, gibt die Maske an [maskSink] und rechnet danach die Tiefe (jedes 3. Mal,
+     * bei Hitze seltener; nur für die Messung). Ein Start (erstes Bild oder Antippen) braucht die
+     * Tiefe vorher: Mit ihr wählt [SubjectPick] die Maske, die das ganze Objekt trifft. Hat das
+     * Bild keine, fällt es weg, und die KI nimmt gleich das nächste, dem die Pipeline die Tiefe
+     * beilegt ([PipelineMath.livePlan]).
      */
     fun runLive(pool: FramePool) {
         val depth = models[ModelId.DEPTH] ?: error("Tiefenmodell nicht geladen")
@@ -1295,26 +1315,22 @@ internal class AiEngine(private val context: Context) : AiDemand {
                     aiWaiting = false
                 } ?: continue
                 try {
+                    // Startbild: neu angetippt oder der erste Durchgang (Mitte des Bildes).
+                    val tap = pendingTap.get()
+                    val wantStart = tap != null || !t.started
+                    val every = fixed?.depthEvery ?: heat.depthEvery()
+                    val plan = PipelineMath.livePlan(wantStart, t.canChoose, slot.hasDepth, every, sinceDepth)
+                    // Gleich zu Beginn entscheiden, auch fürs nächste Bild: Die Pipeline bereitet es
+                    // schon während dieses Durchgangs vor und spart sich das Tiefenbild, wenn es
+                    // nicht gebraucht wird.
+                    wantDepth = plan.wantDepth
+                    // Ein Start ohne Tiefe: Dieses Bild fällt weg, das nächste kommt gleich (ohne
+                    // Mindestabstand) mit Tiefe. Bis dahin gilt die alte Maske weiter.
+                    if (plan.skip) continue
+                    sinceDepth = plan.sinceDepth
                     val start = System.nanoTime()
                     val cpuStart = Debug.threadCpuTimeNanos()
                     lastStart = SystemClock.elapsedRealtime()
-                    // Startbild: neu angetippt oder der erste Durchgang (Mitte des Bildes). Es
-                    // braucht die Tiefe; ohne sie bleibt der Tipp liegen (siehe oben).
-                    val tap = pendingTap.get()
-                    val wantStart = tap != null || !t.started
-                    val startNow = wantStart && slot.hasDepth
-                    if (!t.started && !startNow) {
-                        wantDepth = true
-                        continue
-                    }
-                    // Wärmeregelung: Bei Hitze fällt zuerst die Tiefe weg (live nur fürs Antippen
-                    // gebraucht). Gleich zu Beginn entscheiden, auch fürs nächste Bild: Die Pipeline
-                    // bereitet es schon während dieses Durchgangs vor und spart sich das
-                    // Tiefenbild, wenn es nicht gebraucht wird.
-                    val every = fixed?.depthEvery ?: heat.depthEvery()
-                    val runDepth = startNow || (slot.hasDepth && every > 0 && sinceDepth + 1 >= every)
-                    sinceDepth = if (runDepth) 0 else min(sinceDepth + 1, 1_000)
-                    wantDepth = (every > 0 && sinceDepth + 1 >= every) || (wantStart && !startNow)
                     // Wann die KI voraussichtlich das nächste Bild nimmt: Danach richtet die
                     // Grafik-Pipeline das nächste Bild ein, damit es frisch ist.
                     nextTake = if (expectedMs.isNaN()) 0L else start + (max(expectedMs, gap.toDouble()) * 1e6).toLong()
@@ -1322,50 +1338,75 @@ internal class AiEngine(private val context: Context) : AiDemand {
                     // Kamera ab Systemstart mit oder ohne Tiefschlaf.
                     val age = frameAgeMs(slot.timestampNs)
                     var depthNative = Double.NaN
-                    if (runDepth) {
+                    if (plan.depthFirst) {
                         depth.run(arrayOf(slot.depth))
                         depthNative = depth.lastNativeMs
-                    } else {
-                        heat.noteDepthSkipped()
                     }
-                    if (startNow) {
+                    var note: StartNote? = null
+                    if (plan.start) {
                         // Nur diesen Tipp abholen; kam inzwischen ein neuer, bleibt er für den nächsten Durchgang.
-                        if (tap != null) pendingTap.compareAndSet(tap, null)
+                        if (tap != null) {
+                            pendingTap.compareAndSet(tap, null)
+                            tap.appliedAt = SystemClock.elapsedRealtime()
+                        }
                         generation++
                         val u = tap?.u ?: 0.5f
                         val v = tap?.v ?: 0.5f
                         val rank = tap?.rank ?: 0
-                        depth.output(0).asFloatBuffer().get(depthOut)
-                        val c = slot.depthContent
-                        SubjectPick.depthGrid(depthOut, FrameSlot.DEPTH, c.left, c.top, c.right, c.bottom, depthGrid)
-                        t.start(slot.enc, u, v) { masks, ious, n ->
-                            val t0 = System.nanoTime()
-                            val cands = SubjectPick.evaluate(masks, n, ious, depthGrid, u, v)
-                            val k = SubjectPick.choose(cands, rank)
-                            noteStart(slot, masks, u, v, tap != null, rank, cands, k, SubjectPick.bestIou(cands), (System.nanoTime() - t0) / 1e6)
-                            k
+                        val started = StartNote(u, v, tap)
+                        note = started
+                        if (plan.depthFirst) {
+                            depth.output(0).asFloatBuffer().get(depthOut)
+                            val c = slot.depthContent
+                            SubjectPick.depthGrid(depthOut, FrameSlot.DEPTH, c.left, c.top, c.right, c.bottom, depthGrid)
+                            t.start(slot.enc, u, v) { masks, ious, n ->
+                                val t0 = System.nanoTime()
+                                val cands = SubjectPick.evaluate(masks, n, ious, depthGrid, u, v)
+                                val usable = SubjectPick.depthUsable(depthGrid)
+                                // Ungültige Tiefe (NaN, Unendlich): lieber wie Meta wählen als blind.
+                                val k = if (usable) SubjectPick.choose(cands, rank) else SubjectPick.bestIou(cands)
+                                started.masks = masks
+                                started.cands = cands
+                                started.chosen = k
+                                started.meta = SubjectPick.bestIou(cands)
+                                started.depthOk = usable
+                                started.chooseMs = (System.nanoTime() - t0) / 1e6
+                                k
+                            }
+                        } else {
+                            t.start(slot.enc, u, v)
                         }
                     } else {
                         t.step(slot.enc)
                     }
                     // Die Maske gehört zu genau diesem Kamerabild (Zeitstempel); die Pipeline legt
                     // sie auf dasselbe Bild, wenn sie es verzögert ausgibt (siehe BokehProcessor).
-                    val masks = maskSink
-                    if (masks != null) {
+                    val sink = maskSink
+                    if (sink != null) {
                         PipelineMath.maskProbabilities(t.mask(), maskBytes)
-                        masks.onMask(slot.timestampNs, maskBytes, t.present, generation)
+                        sink.onMask(slot.timestampNs, maskBytes, t.present, generation)
                     }
+                    val maskMs = (System.nanoTime() - start) / 1e6
+                    // Die Tiefe im Takt (nur für die Messung) erst nach der Maske: Die Pipeline
+                    // wartet mit jedem Bild auf die Maske danach, nicht auf die Tiefe.
+                    if (plan.depthAfter) {
+                        depth.run(arrayOf(slot.depth))
+                        depthNative = depth.lastNativeMs
+                    } else if (!plan.depthFirst) {
+                        heat.noteDepthSkipped()
+                    }
+                    note?.let { noteStart(slot, it, t) }
                     val aiMs = (System.nanoTime() - start) / 1e6
                     val cpuEnd = Debug.threadCpuTimeNanos()
                     val cpuMs = if (cpuStart >= 0 && cpuEnd >= cpuStart) (cpuEnd - cpuStart) / 1e6 else Double.NaN
                     expectedMs = if (expectedMs.isNaN()) aiMs else expectedMs * 0.8 + aiMs * 0.2
-                    // Das Ergebnis ist fertig, wenn das Bild so alt ist wie beim Aufnehmen plus die Rechenzeit.
+                    // Das Ergebnis ist fertig, wenn das Bild so alt ist wie beim Aufnehmen plus die Zeit bis zur Maske.
                     stats.add(
                         aiMs = aiMs, depthMs = depthNative, encMs = t.encMs,
-                        attnMs = if (startNow) Double.NaN else t.attnMs, decMs = t.decMs,
+                        attnMs = if (plan.start) Double.NaN else t.attnMs, decMs = t.decMs,
                         memMs = t.memMs, trackMs = t.totalMs, prepMs = slot.prepMs,
-                        ageMs = age, resultAgeMs = age + aiMs, cpuMs = cpuMs,
-                        present = t.present, restart = tap != null && startNow
+                        ageMs = age, resultAgeMs = age + maskMs, cpuMs = cpuMs,
+                        present = t.present, restart = tap != null && plan.start
                     )
                 } finally {
                     pool.release(slot)
@@ -1381,52 +1422,62 @@ internal class AiEngine(private val context: Context) : AiDemand {
 
     /**
      * Ein Start der Verfolgung für den Bericht: alle Masken mit Merkmalen, die Wahl, was Meta
-     * genommen hätte, und ein kleines Bild des KI-Eingangs mit der gewählten Maske (eingefärbt)
-     * und dem Tipp (weißes Kreuz). Die Bildpunkte entstehen hier (schnell), das JPEG auf einem
-     * eigenen Thread, damit die KI nicht wartet.
+     * genommen hätte, wie lange der Tipp bis zur KI brauchte, und ein kleines Bild des KI-Eingangs
+     * mit der gewählten Maske (eingefärbt) und dem Tipp (weißes Kreuz). Läuft nach der Maske, damit
+     * die Pipeline nicht wartet. Eine Angabe für den Bericht darf die KI nie anhalten: Fehler hier
+     * bleiben folgenlos.
      */
-    private fun noteStart(
-        slot: FrameSlot, masks: FloatArray, u: Float, v: Float, tapped: Boolean, rank: Int,
-        cands: List<SubjectPick.Candidate>, chosen: Int, meta: Int, ms: Double,
-    ) {
-        val list = JSONArray()
-        for (c in cands) {
-            list.put(JSONObject().put("flaeche", r4(c.area)).put("iouSchaetzung", r4(c.iou.toDouble()))
-                .put("kontrast", num2(c.contrast)).put("hinten", r4(c.behind)).put("spanne", num2(c.spread))
-                .put("tippAbstand", num2(c.tapDistance)).put("verschachtelt", r4(c.nested)).put("glaubwuerdig", c.plausible))
-        }
-        val o = JSONObject()
-            .put("s", r1((SystemClock.elapsedRealtime() - liveStartedAt) / 1000.0))
-            .put("angetippt", tapped).put("u", r4(u.toDouble())).put("v", r4(v.toDouble()))
-            .put("erneutGetippt", rank).put("masken", list).put("wahl", chosen).put("wieMeta", meta).put("wahlMs", r1(ms))
-        synchronized(startsLock) {
-            if (starts.length() >= MAX_STARTS) starts.remove(0)
-            starts.put(o)
-        }
+    private fun noteStart(slot: FrameSlot, note: StartNote, t: Tracker) {
         try {
+            val o = JSONObject()
+                .put("s", r1((SystemClock.elapsedRealtime() - liveStartedAt) / 1000.0))
+                .put("angetippt", note.tap != null).put("u", r4(note.u.toDouble())).put("v", r4(note.v.toDouble()))
+                .put("erneutGetippt", note.tap?.rank ?: 0).put("motivGefunden", t.present)
+            note.tap?.let { tap -> o.put("tippBisKiMs", tap.appliedAt - tap.createdAt) }
+            if (note.cands.isEmpty()) {
+                o.put("ohneWahl", if (!t.present) "kein Motiv am Tipp" else "der Decoder liefert nur eine Maske")
+            } else {
+                val list = JSONArray()
+                for (c in note.cands) {
+                    list.put(JSONObject().put("flaeche", r4(c.area)).put("iouSchaetzung", num2(c.iou.toDouble()))
+                        .put("kontrast", num2(c.contrast)).put("hinten", num2(c.behind)).put("spanne", num2(c.spread))
+                        .put("tippAbstand", num2(c.tapDistance)).put("verschachtelt", num2(c.nested)).put("glaubwuerdig", c.plausible))
+                }
+                o.put("masken", list).put("wahl", note.chosen).put("wieMeta", note.meta).put("wahlMs", num2(note.chooseMs))
+                if (!note.depthOk) o.put("tiefeUngueltig", true)
+            }
             val size = FrameSlot.THUMBNAIL
             val pixels = slot.thumbnailPixels(size)
-            val plane = chosen * MASK_SIZE * MASK_SIZE
+            // Eingefärbt: die gewählte Maske, ohne Wahl die Maske der Verfolgung.
+            val masks = note.masks
+            val chosen = note.chosen
+            val plane: FloatArray
+            val offset: Int
+            if (masks != null && chosen >= 0) {
+                plane = masks
+                offset = chosen * MASK_SIZE * MASK_SIZE
+            } else {
+                plane = t.mask()
+                offset = 0
+            }
             for (y in 0 until size) {
                 for (x in 0 until size) {
                     val mx = (x * MASK_SIZE / size).coerceIn(0, MASK_SIZE - 1)
                     val my = (y * MASK_SIZE / size).coerceIn(0, MASK_SIZE - 1)
-                    if (masks[plane + my * MASK_SIZE + mx] > 0f) pixels[y * size + x] = tint(pixels[y * size + x])
+                    if (plane[offset + my * MASK_SIZE + mx] > 0f) pixels[y * size + x] = tint(pixels[y * size + x])
                 }
             }
-            val cx = (u * size).toInt().coerceIn(0, size - 1)
-            val cy = (v * size).toInt().coerceIn(0, size - 1)
+            val cx = (note.u * size).toInt().coerceIn(0, size - 1)
+            val cy = (note.v * size).toInt().coerceIn(0, size - 1)
             for (d in -3..3) {
                 if (cx + d in 0 until size) pixels[cy * size + cx + d] = -1
                 if (cy + d in 0 until size) pixels[(cy + d) * size + cx] = -1
             }
-            Thread({
-                try {
-                    val jpeg = FrameSlot.jpegBase64(pixels, size)
-                    synchronized(startsLock) { o.put("bildJpegBase64", jpeg) }
-                } catch (_: Throwable) {
-                }
-            }, "start-bild").start()
+            o.put("bildJpegBase64", FrameSlot.jpegBase64(pixels, size))
+            synchronized(startsLock) {
+                if (starts.length() >= MAX_STARTS) starts.remove(0)
+                starts.put(o)
+            }
         } catch (_: Throwable) {
         }
     }
@@ -1454,8 +1505,12 @@ internal class AiEngine(private val context: Context) : AiDemand {
         /** So viele Starts der Verfolgung behält der Bericht (die letzten). */
         const val MAX_STARTS = 12
 
-        /** Erneutes Tippen: binnen dieser Zeit (ms) und höchstens so weit daneben (Bruchteil des Bildes). */
-        const val RETAP_MS = 1500L
+        /**
+         * Erneutes Tippen: binnen dieser Zeit (ms), nachdem die KI den vorigen Tipp angewandt hat
+         * (sein Ergebnis ist erst 0,4 s später zu sehen), und höchstens so weit daneben (Bruchteil
+         * der Bildbreite).
+         */
+        const val RETAP_MS = 2500L
         const val RETAP_DISTANCE = 0.03f
 
         /** Die volle Kette, die live läuft: „voll“ mit unserem Decoder wie im Original, sonst „vollQualcomm“. */

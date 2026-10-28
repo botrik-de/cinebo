@@ -25,6 +25,7 @@ class PowerMathTest {
     fun spannungInMillivoltOderVolt() {
         assertEquals(3.87, PowerMath.volts(3870), 1e-9)
         assertEquals(4.0, PowerMath.volts(4), 1e-9)
+        assertEquals(3.87, PowerMath.volts(3_870_000), 1e-9) // µV
         assertTrue(PowerMath.volts(0).isNaN())
         assertTrue(PowerMath.volts(-1).isNaN())
     }
