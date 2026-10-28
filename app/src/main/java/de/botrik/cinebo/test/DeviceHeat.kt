@@ -60,34 +60,45 @@ object DeviceHeat {
 }
 
 /**
- * Wärmeregelung der KI: liest die Wärmestufe höchstens alle 2 s und sagt, wie oft die KI die
- * Tiefe rechnet ([PipelineMath.depthEvery]) und wie viel Abstand zwei Durchgänge mindestens haben
- * sollen ([PipelineMath.minIntervalMs]). Zählt mit, wie lange jede Stufe galt, wie oft die KI
- * deshalb wartete und wie oft sie die Tiefe ausließ. Nur vom KI-Thread benutzen.
+ * Wärmeregelung der KI: liest die Wärmestufe höchstens alle 2 s und führt daraus die Stufe der
+ * Regelung ([PipelineMath.nextLevel]: steigt sofort, sinkt erst nach 90 s und dann um eine Stufe).
+ * Sie sagt, wie viel Abstand zwei Durchgänge mindestens haben ([PipelineMath.minIntervalMs]) und
+ * wie oft die KI die Tiefe rechnet ([PipelineMath.depthEvery]). Zählt mit, wie lange jede Wärme-
+ * und jede Regelstufe galt, wie oft die KI deshalb wartete und wie oft sie die Tiefe ausließ.
+ * Nur vom KI-Thread benutzen (außer [status] und [level]).
  */
 internal class HeatGovernor(context: Context) {
     private val pm = context.getSystemService(PowerManager::class.java)
     private val seconds = DoubleArray(7)
+    private val levelSeconds = DoubleArray(7)
     private var lastRead = 0L
     private var lastAccount = 0L
+    private var belowSince = 0L
     private var waits = 0
     private var waitedMs = 0L
     private var depthSkipped = 0
     private var running = false
 
-    /** Aktuelle Wärmestufe (0 keine bis 6 Abschaltung). */
-    var status = 0
+    /** Aktuelle Wärmestufe von Android (0 keine bis 6 Abschaltung); auch vom Hauptthread lesbar. */
+    @Volatile var status = 0
+        private set
+
+    /** Stufe der Regelung (folgt der Wärmestufe nach oben sofort, nach unten verzögert). */
+    @Volatile var level = 0
         private set
 
     /** Beim Start der Live-Schleife: Zählung von vorn. */
     fun reset() {
         seconds.fill(0.0)
+        levelSeconds.fill(0.0)
         lastRead = 0L
         lastAccount = SystemClock.elapsedRealtime()
+        belowSince = 0L
         waits = 0
         waitedMs = 0L
         depthSkipped = 0
         status = 0
+        level = 0
         running = true
     }
 
@@ -98,15 +109,18 @@ internal class HeatGovernor(context: Context) {
         running = false
     }
 
-    /** Mindestabstand zwischen zwei Durchgängen in ms (0 = keiner). */
+    /** Mindestabstand zwischen zwei Durchgängen in ms. */
     fun minIntervalMs(): Long {
         val now = SystemClock.elapsedRealtime()
         if (now - lastRead >= 2000L) {
             account(now)
             status = pm.currentThermalStatus.coerceIn(0, 6)
+            val (next, since) = PipelineMath.nextLevel(level, status, belowSince, now)
+            level = next
+            belowSince = since
             lastRead = now
         }
-        return PipelineMath.minIntervalMs(status)
+        return PipelineMath.minIntervalMs(level)
     }
 
     /** Die KI hat [ms] gewartet, weil die Wärmeregelung bremste. */
@@ -115,8 +129,8 @@ internal class HeatGovernor(context: Context) {
         waitedMs += ms
     }
 
-    /** Wie oft die KI gerade die Tiefe rechnen soll (1 = immer, 4 = jedes vierte Mal, 0 = nie); gilt bis zum nächsten [minIntervalMs]. */
-    fun depthEvery(): Int = PipelineMath.depthEvery(status)
+    /** Wie oft die KI gerade die Tiefe rechnen soll (3 = jedes dritte Mal, 0 = nie); gilt bis zum nächsten [minIntervalMs]. */
+    fun depthEvery(): Int = PipelineMath.depthEvery(level)
 
     /** Ein Durchgang lief ohne Tiefe. */
     fun noteDepthSkipped() {
@@ -124,7 +138,11 @@ internal class HeatGovernor(context: Context) {
     }
 
     private fun account(now: Long) {
-        if (lastAccount > 0L) seconds[status] += (now - lastAccount) / 1000.0
+        if (lastAccount > 0L) {
+            val dt = (now - lastAccount) / 1000.0
+            seconds[status] += dt
+            levelSeconds[level] += dt
+        }
         lastAccount = now
     }
 
@@ -132,11 +150,16 @@ internal class HeatGovernor(context: Context) {
         if (running) account(SystemClock.elapsedRealtime())
         val stages = JSONObject()
         for (i in seconds.indices) if (seconds[i] > 0.0) stages.put(DeviceHeat.stageNameAt(i), r1(seconds[i]))
+        val levels = JSONObject()
+        for (i in levelSeconds.indices) if (levelSeconds[i] > 0.0) levels.put(DeviceHeat.stageNameAt(i), r1(levelSeconds[i]))
         return JSONObject()
             .put("sekundenJeStufe", stages)
+            .put("sekundenJeRegelstufe", levels)
             .put("gebremsteDurchgaenge", waits)
             .put("gewartetS", r1(waitedMs / 1000.0))
             .put("durchgaengeOhneTiefe", depthSkipped)
-            .put("regel", "ab stark Tiefe nur jedes 4. Mal und höchstens 6/s, ab kritisch ohne Tiefe und höchstens 5/s, ab Notfall höchstens 3/s")
+            .put("regel", "keine: höchstens 5/s, Tiefe jedes 3. Mal; leicht: 5/s, jedes 4. Mal; mittel: 4/s, jedes 6. Mal; " +
+                "stark: 3/s ohne Tiefe; kritisch: 2/s ohne Tiefe; eine Stufe zurück erst nach 90 s darunter; " +
+                "ab Notfall oder Akku 44 °C beendet die App den Test")
     }
 }

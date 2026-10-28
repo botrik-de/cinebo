@@ -284,6 +284,18 @@ internal interface MaskDecoder {
      * heißt, das Objekt ist im Bild.
      */
     fun run(embeddings: ByteBuffer, hr1: ByteBuffer, hr2: ByteBuffer, sparse: ByteBuffer, mask: ByteBuffer, ptr: FloatArray): Float
+
+    /** Wie viele Masken der letzte Lauf zur Wahl stellte (1: keine Wahl). */
+    val candidates: Int get() = 1
+
+    /** Welche davon [run] genommen hat. */
+    val lastChoice: Int get() = 0
+
+    /** Alle Masken des letzten Laufs (je 256 · 256 Logits hintereinander) und ihre IoU-Schätzungen. */
+    fun candidateMasks(masks: FloatArray, ious: FloatArray) {}
+
+    /** Statt der Wahl von [run] die Maske [index] des letzten Laufs samt ihrem Zeiger nehmen. */
+    fun select(index: Int, mask: ByteBuffer, ptr: FloatArray) {}
 }
 
 /**
@@ -347,8 +359,10 @@ internal class MetaDecoder(private val dec: NpuModel) : MaskDecoder {
         private set
 
     /** Welche der drei Masken zuletzt zählte (0 bis 2). */
-    var lastChoice = 0
+    override var lastChoice = 0
         private set
+
+    override val candidates: Int = 3
 
     init {
         require(dec.inputCount == 4 && dec.inputBytes(3) == (points + 1) * PromptEncoder.D * 4) {
@@ -364,13 +378,29 @@ internal class MetaDecoder(private val dec: NpuModel) : MaskDecoder {
         dec.output(outIous).asFloatBuffer().get(ious)
         var best = 0
         for (i in 1 until 3) if (ious[i] > ious[best]) best = i // wie argmax: bei Gleichstand die erste
-        lastChoice = best
-        dec.output(outMasks).asFloatBuffer().apply { position(best * plane.size) }.get(plane)
+        write(best, mask, ptr)
+        return dec.output(outScore).getFloat(0)
+    }
+
+    override fun candidateMasks(masks: FloatArray, ious: FloatArray) {
+        require(masks.size >= 3 * plane.size && ious.size >= 3)
+        dec.output(outMasks).asFloatBuffer().get(masks, 0, 3 * plane.size)
+        System.arraycopy(this.ious, 0, ious, 0, 3)
+    }
+
+    override fun select(index: Int, mask: ByteBuffer, ptr: FloatArray) {
+        require(index in 0 until 3)
+        write(index, mask, ptr)
+    }
+
+    /** Maske und Zeiger [index] des letzten Laufs nach [mask] und [ptr]. */
+    private fun write(index: Int, mask: ByteBuffer, ptr: FloatArray) {
+        lastChoice = index
+        dec.output(outMasks).asFloatBuffer().apply { position(index * plane.size) }.get(plane)
         mask.rewind()
         mask.asFloatBuffer().put(plane)
         mask.rewind()
-        dec.output(outPtrs).asFloatBuffer().apply { position(best * PromptEncoder.D) }.get(ptr)
-        return dec.output(outScore).getFloat(0)
+        dec.output(outPtrs).asFloatBuffer().apply { position(index * PromptEncoder.D) }.get(ptr)
     }
 
     companion object {

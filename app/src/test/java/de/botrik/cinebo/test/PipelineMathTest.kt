@@ -256,17 +256,73 @@ class PipelineMathTest {
 
     @Test
     fun waermeregelung() {
-        assertEquals(0L, PipelineMath.minIntervalMs(0))
-        assertEquals(0L, PipelineMath.minIntervalMs(2))
-        assertEquals(167L, PipelineMath.minIntervalMs(3))
-        assertEquals(200L, PipelineMath.minIntervalMs(4))
-        assertEquals(333L, PipelineMath.minIntervalMs(5))
-        assertEquals(333L, PipelineMath.minIntervalMs(6))
-        // Zuerst fällt die Tiefe weg, die Verfolgung bleibt bis „stark“ über 5,7 pro Sekunde.
-        assertEquals(1, PipelineMath.depthEvery(2))
-        assertEquals(4, PipelineMath.depthEvery(3))
-        assertEquals(0, PipelineMath.depthEvery(4))
-        assertTrue(1000.0 / PipelineMath.minIntervalMs(3) >= 5.7)
+        // Von Anfang an höchstens 5 pro Sekunde, dann 4, 3 und 2.
+        assertEquals(200L, PipelineMath.minIntervalMs(0))
+        assertEquals(200L, PipelineMath.minIntervalMs(1))
+        assertEquals(250L, PipelineMath.minIntervalMs(2))
+        assertEquals(333L, PipelineMath.minIntervalMs(3))
+        assertEquals(500L, PipelineMath.minIntervalMs(4))
+        assertEquals(500L, PipelineMath.minIntervalMs(6))
+        for (s in 1..6) assertTrue("Stufe $s bremst nicht weniger als Stufe ${s - 1}", PipelineMath.minIntervalMs(s) >= PipelineMath.minIntervalMs(s - 1))
+        // Tiefe jedes 3., 4., 6. Mal, ab „stark“ gar nicht.
+        assertEquals(3, PipelineMath.depthEvery(0))
+        assertEquals(4, PipelineMath.depthEvery(1))
+        assertEquals(6, PipelineMath.depthEvery(2))
+        assertEquals(0, PipelineMath.depthEvery(3))
+        assertEquals(0, PipelineMath.depthEvery(6))
+        assertEquals(5, PipelineMath.EMERGENCY_STATUS)
+    }
+
+    @Test
+    fun regelstufeSteigtSofortUndSinktVerzoegert() {
+        val hold = PipelineMath.LEVEL_HOLD_MS
+        // Steigt sofort mit.
+        assertEquals(3 to 0L, PipelineMath.nextLevel(1, 3, 0L, 1_000L))
+        // Sinkt die Wärmestufe, bleibt die Regelung erst stehen und merkt sich, seit wann.
+        assertEquals(3 to 5_000L, PipelineMath.nextLevel(3, 1, 0L, 5_000L))
+        assertEquals(3 to 5_000L, PipelineMath.nextLevel(3, 1, 5_000L, 5_000L + hold - 1))
+        // Nach 90 s eine Stufe zurück; liegt die Wärmestufe weiter darunter, beginnen neue 90 s.
+        assertEquals(2 to 5_000L + hold, PipelineMath.nextLevel(3, 1, 5_000L, 5_000L + hold))
+        // Nach 90 s genau auf die Wärmestufe: Die Uhr ist aus.
+        assertEquals(1 to 0L, PipelineMath.nextLevel(2, 1, 1_000L, 1_000L + hold))
+        // Kurz wieder hoch: Die Uhr beginnt beim nächsten Absinken von vorn.
+        assertEquals(3 to 0L, PipelineMath.nextLevel(3, 3, 5_000L, 50_000L))
+        // Schritt für Schritt von kritisch bis keine: viermal 90 s.
+        var level = 4
+        var since = 0L
+        var t = 0L
+        while (level > 0 && t < 10 * hold) {
+            val (l, s) = PipelineMath.nextLevel(level, 0, since, t)
+            level = l
+            since = s
+            t += 2_000L
+        }
+        assertEquals(0, level)
+        assertTrue("etwa 4 × 90 s", t in 4 * hold..4 * hold + 10_000L)
+    }
+
+    @Test
+    fun abkuehlenVorDemDauertest() {
+        // 3 °C über dem Start des Schnelltests, aber zwischen 31 und 34 °C; ohne Wert 33 °C.
+        assertEquals(31.7, PipelineMath.coolTarget(28.7), 1e-9)
+        assertEquals(31.0, PipelineMath.coolTarget(25.0), 1e-9)
+        assertEquals(34.0, PipelineMath.coolTarget(33.0), 1e-9)
+        assertEquals(33.0, PipelineMath.coolTarget(Double.NaN), 1e-9)
+        assertTrue(PipelineMath.isCool("keine", 31.5, 31.7))
+        assertTrue(PipelineMath.isCool("keine", 31.7, 31.7))
+        assertFalse(PipelineMath.isCool("keine", 31.8, 31.7))
+        assertFalse(PipelineMath.isCool("leicht", 30.0, 31.7))
+        assertTrue(PipelineMath.isCool("keine", Double.NaN, 31.7))
+    }
+
+    @Test
+    fun hitzestoppAbNotfallOderAkku44Grad() {
+        assertFalse(PipelineMath.tooHot(0, 30.0))
+        assertFalse("kritisch allein reicht nicht", PipelineMath.tooHot(4, 43.9))
+        assertTrue(PipelineMath.tooHot(4, 44.0))
+        assertTrue(PipelineMath.tooHot(PipelineMath.EMERGENCY_STATUS, 35.0))
+        assertTrue("ohne Akkutemperatur zählt die Stufe", PipelineMath.tooHot(6, Double.NaN))
+        assertFalse(PipelineMath.tooHot(3, Double.NaN))
     }
 
     @Test

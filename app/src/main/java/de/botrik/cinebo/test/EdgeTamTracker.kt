@@ -18,12 +18,22 @@ internal interface Tracker {
     val convertMs: Double
     val totalMs: Double
 
-    fun start(image: ByteBuffer, u: Float, v: Float)
+    /**
+     * Startbild: Objekt an Stelle (u, v), beides 0 bis 1 im aufrechten Kamerabild. Mit [chooser]
+     * wählt die App unter den Masken des Decoders (sonst wie im Original die beste Schätzung).
+     */
+    fun start(image: ByteBuffer, u: Float, v: Float, chooser: StartChooser? = null)
     fun step(image: ByteBuffer)
 
     /** Maske des letzten Bildes (256 × 256 Logits, größer 0 heißt Objekt). */
     fun mask(): FloatArray
     fun reset()
+}
+
+/** Wählt beim Startbild unter den Masken des Decoders (siehe [SubjectPick]). */
+internal fun interface StartChooser {
+    /** [masks]: [count] Masken zu je 256 · 256 Logits hintereinander, [ious] ihre Schätzungen; gibt den Index zurück. */
+    fun choose(masks: FloatArray, ious: FloatArray, count: Int): Int
 }
 
 /**
@@ -92,8 +102,11 @@ internal class EdgeTamTracker(
 
     override val started: Boolean get() = condMem != null
 
-    /** Startbild: Objekt an Stelle (u, v), beides 0 bis 1 im aufrechten Kamerabild. */
-    override fun start(image: ByteBuffer, u: Float, v: Float) {
+    /** Masken und Schätzungen des Startbilds für [StartChooser]; erst beim ersten Bedarf angelegt. */
+    private var candMasks: FloatArray? = null
+    private val candIous = FloatArray(3)
+
+    override fun start(image: ByteBuffer, u: Float, v: Float, chooser: StartChooser?) {
         val t = System.nanoTime()
         point(u, v, positive = true)
         encoder.run(image, coords, labels)
@@ -102,6 +115,15 @@ internal class EdgeTamTracker(
         writePrompt(u, v, 1)
         // Beim Startbild geht pix_feat (mit no_mem_embed) direkt in den Decoder.
         decode(encoder.pixFeat)
+        // Die App wählt die Maske selbst (ganzes Objekt statt angetippter Fläche); Maske und Zeiger
+        // des Startbilds und damit der Speicher kommen dann von dieser Maske.
+        val n = decoder.candidates
+        if (chooser != null && present && n > 1) {
+            val masks = candMasks ?: FloatArray(n * MASK_SIZE * MASK_SIZE).also { candMasks = it }
+            decoder.candidateMasks(masks, candIous)
+            val k = chooser.choose(masks, candIous, n)
+            if (k in 0 until n && k != decoder.lastChoice) decoder.select(k, maskBuf, currentPtr)
+        }
         attnMs = 0.0
         val mem = encodeMemory(encoder.embeddings, startFrame = true)
         condMem = mem
@@ -299,11 +321,19 @@ internal class FastTracker(
     override var convertMs = 0.0; private set
     override var totalMs = 0.0; private set
 
-    override fun start(image: ByteBuffer, u: Float, v: Float) {
+    override fun start(image: ByteBuffer, u: Float, v: Float, chooser: StartChooser?) {
         val t = System.nanoTime()
         encode(image)
         writePrompt(u, v)
         decode()
+        val n = decoder.candidates
+        if (chooser != null && present && n > 1) {
+            val masks = FloatArray(n * MASK_SIZE * MASK_SIZE)
+            val ious = FloatArray(n)
+            decoder.candidateMasks(masks, ious)
+            val k = chooser.choose(masks, ious, n)
+            if (k in 0 until n && k != decoder.lastChoice) decoder.select(k, maskBuf, ptrScratch)
+        }
         started = true
         // Fehlt die Maske, sucht der nächste Schritt wieder am Tipp-Punkt.
         if (!updatePoint()) {

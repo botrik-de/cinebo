@@ -42,6 +42,13 @@ internal data class ChipSetting(val perf: PerfMode, val opt: OptLevel, val manua
     val key: String get() = perf.key + "-" + opt.key + if (manualVote) "-fest" else ""
     val title: String get() = "${perf.title.replaceFirstChar { it.uppercase() }}, ${opt.title}" + if (manualVote) ", Takt festgehalten" else ""
 
+    /**
+     * Für live (Vorschau und Aufnahmen): Dauerleistung mit derselben Übersetzung, ohne
+     * festgehaltenen Takt. Die Spitzenleistung ist rund 18 % schneller, ließ das Handy in 0.3.15
+     * aber nach 3–4 Minuten Dauertest überhitzen.
+     */
+    fun forLive(): ChipSetting = ChipSetting(PerfMode.SUSTAINED, opt)
+
     companion object {
         /** So lief Stufe 2. */
         val DEFAULT = ChipSetting(PerfMode.SUSTAINED, OptLevel.STANDARD)

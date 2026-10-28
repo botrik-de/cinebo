@@ -78,10 +78,24 @@ internal class BokehProcessor(
     private val requestedDelay: Int = DEFAULT_DELAY,
     /** Bekommt die Bilder für die KI; null = keine KI. */
     private val aiPool: FramePool? = null,
-    private val aiDemand: AiDemand? = null,
+    aiDemand: AiDemand? = null,
     /** Nach so vielen KI-Bildern ein Vorschaubild für den Bericht (0 = keins). */
     private val thumbnailAfter: Int = THUMBNAIL_AFTER,
+    staticMask: ByteArray? = null,
 ) : SurfaceProcessor, MaskSink {
+
+    /** Wer die KI-Bilder abnimmt (Takt, Tiefenbild); lässt sich für den Strombedarf mitten im Lauf wechseln. */
+    @Volatile var aiDemand: AiDemand? = aiDemand
+
+    /**
+     * Für den Strombedarf: eine feste Maske (256² Wahrscheinlichkeiten) für jedes Bild statt der
+     * KI. Die Unschärfe läuft dann voll, ohne dass die KI etwas rechnet; Masken der KI zählen
+     * nicht. Null = normal. Lässt sich mitten im Lauf ein- und ausschalten.
+     */
+    @Volatile var staticMask: ByteArray? = staticMask
+
+    /** Ob gerade die feste Maske im Maskenring liegt (nur Pipeline-Thread). */
+    private var staticShown = false
 
     // Hohe Priorität wie bei der Bildausgabe: Wer hier zu spät kommt, verliert Bilder.
     private val thread = HandlerThread("pipeline", Process.THREAD_PRIORITY_URGENT_DISPLAY).apply { start() }
@@ -433,7 +447,11 @@ internal class BokehProcessor(
      */
     private fun emit(slot: Slot, upright: Int) {
         try {
-            var pick = PipelineMath.pickMasks(maskNs, maskCount, slot.ts, MAX_MASK_DISTANCE_NS)
+            var pick = if (staticShown) {
+                if (maskCount > 0) PipelineMath.MaskPick(0, 0, 0f, 0L) else null
+            } else {
+                PipelineMath.pickMasks(maskNs, maskCount, slot.ts, MAX_MASK_DISTANCE_NS)
+            }
             var fade = 1f
             var stale = false
             if (pick == null) {
@@ -673,6 +691,32 @@ internal class BokehProcessor(
     // ---------------------------------------------------- Masken
 
     private fun uploadMasks() {
+        val fixed = staticMask
+        if (fixed == null && staticShown) {
+            // Zurück zur KI: Die feste Maske gehört nicht zu ihren Bildern.
+            staticShown = false
+            maskCount = 0
+            maskNext = 0
+        }
+        if (fixed != null) {
+            // Feste Maske: einmal hochladen, danach gilt sie für jedes Bild; Masken der KI fallen weg.
+            synchronized(pendingLock) { pending.clear() }
+            if (!staticShown || maskCount == 0) {
+                staticShown = true
+                maskUpload.clear()
+                maskUpload.put(fixed, 0, MASK_SIZE * MASK_SIZE)
+                maskUpload.rewind()
+                GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, maskTex[0])
+                GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, 0, MASK_SIZE, MASK_SIZE, GLES30.GL_RED, GLES30.GL_UNSIGNED_BYTE, maskUpload)
+                maskNs[0] = 0L
+                maskPresent[0] = true
+                maskGeneration[0] = 0
+                maskCount = 1
+                maskNext = 1
+            }
+            return
+        }
         while (true) {
             val m = synchronized(pendingLock) { pending.removeFirstOrNull() } ?: return
             // Masken zu Bildern vor dem letzten Neubeginn (neuer Eingang, neue Lage) passen nicht mehr.
@@ -1127,12 +1171,14 @@ internal class BokehProcessor(
 
     companion object {
         /**
-         * 10 Bilder ≈ 333 ms: So lange braucht es, bis zu jedem Bild die KI-Masken davor und
-         * danach da sind (KI-Takt ≈ 130 ms, Bildalter ≈ 40 ms, Verfolgung ≈ 100 ms); gilt ab
-         * etwa 5,7 KI-Durchgängen pro Sekunde (siehe PipelineMath.minIntervalMs).
+         * 12 Bilder ≈ 400 ms: So lange braucht es, bis zu jedem Bild die KI-Masken davor und
+         * danach da sind, bei 5 KI-Durchgängen pro Sekunde (Abstand 200 ms, Bildalter ≈ 100 ms,
+         * Rechenzeit ≈ 120 ms; jedes Kamerabild kommt erst gut 50 ms nach seinem Zeitstempel hier
+         * an). In 0.3.15 reichten 10 Bilder bei 7,5 Durchgängen pro Sekunde; seither rechnet die
+         * KI wegen der Wärme seltener (siehe PipelineMath.minIntervalMs).
          */
-        const val DEFAULT_DELAY = 10
-        const val MAX_DELAY = 12
+        const val DEFAULT_DELAY = 12
+        const val MAX_DELAY = 14
         /** Breite der Unschärfe in Pixeln des Achtel-Bildes (≈ 28 Pixel in 4K). */
         const val BLUR_SIGMA = 3.5
         /** Bis 0,4 s Abstand gilt eine Maske als aktuell; ältere lassen die Unschärfe ausklingen. */

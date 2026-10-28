@@ -228,29 +228,71 @@ internal object PipelineMath {
     }
 
     /**
-     * Wärmeregelung: kürzester Abstand zwischen zwei KI-Durchgängen je Wärmestufe von Android
-     * (0 keine, 1 leicht, 2 mittel, 3 stark, 4 kritisch, 5 Notfall, 6 Abschaltung). Unter etwa
-     * 5,7 Durchgängen pro Sekunde reichen 10 Bilder Verzögerung nicht mehr für Masken vor und
-     * nach jedem Bild; deshalb spart die Regelung zuerst die Tiefe ein ([depthEvery]) und bremst
-     * die Verfolgung erst ab „kritisch“ unter 6 pro Sekunde.
+     * Wärmeregelung: kürzester Abstand zwischen zwei KI-Durchgängen je Stufe der Regelung
+     * (0 keine, 1 leicht, 2 mittel, 3 stark, 4 kritisch, 5 Notfall, 6 Abschaltung; siehe
+     * [nextLevel]). In 0.3.15 rechnete die KI ungebremst 7,5-mal pro Sekunde auf Spitzenleistung,
+     * und OPPO beendete die App nach 3–4 Minuten Dauertest wegen Hitze. Jetzt von Anfang an
+     * höchstens 5-mal pro Sekunde (keine, leicht), dann 4 (mittel), 3 (stark) und 2 (kritisch).
+     * Ab „Notfall“ beendet die App den Test selbst ([EMERGENCY_STATUS]). Mit 12 Bildern
+     * Verzögerung hat jedes Bild bis 5 Durchgänge pro Sekunde Masken davor und danach.
      */
-    fun minIntervalMs(thermalStatus: Int): Long = when {
-        thermalStatus >= 5 -> 333L
-        thermalStatus >= 4 -> 200L
-        thermalStatus >= 3 -> 167L
-        else -> 0L
+    fun minIntervalMs(level: Int): Long = when {
+        level >= 4 -> 500L
+        level >= 3 -> 333L
+        level >= 2 -> 250L
+        else -> 200L
+    }
+
+    /** So lange (ms) muss die Wärmestufe unter der Regelstufe liegen, bevor diese eine Stufe zurückgeht. */
+    const val LEVEL_HOLD_MS = 90_000L
+
+    /**
+     * Nächste Stufe der Regelung: Steigt die Wärmestufe, folgt die Regelung sofort; sinkt sie, geht
+     * die Regelung erst nach [LEVEL_HOLD_MS] darunter eine Stufe zurück (dann wieder 90 s für die
+     * nächste). Android meldet die Stufen mit Verzögerung, und das Handy kühlt langsamer, als es
+     * sich erwärmt. Gibt (Stufe, seit wann die Wärmestufe darunter liegt; 0 = nicht) zurück.
+     */
+    fun nextLevel(level: Int, status: Int, belowSinceMs: Long, nowMs: Long): Pair<Int, Long> = when {
+        status >= level -> status to 0L
+        belowSinceMs == 0L -> level to nowMs
+        nowMs - belowSinceMs >= LEVEL_HOLD_MS -> (level - 1) to (if (status < level - 1) nowMs else 0L)
+        else -> level to belowSinceMs
     }
 
     /**
-     * Wie oft die KI live die Tiefe rechnet: 1 = jeden Durchgang, 4 = jeden vierten, 0 = gar nicht.
-     * In Stufe 3 braucht die Unschärfe die Tiefe noch nicht; sie läuft für die Messung mit und
-     * fällt bei Hitze als Erstes weg.
+     * Wie oft die KI live die Tiefe rechnet: 3 = jeden dritten Durchgang, 0 = gar nicht (nur beim
+     * Antippen). In Stufe 3 braucht die Unschärfe die Tiefe noch nicht (nur die Wahl des ganzen
+     * Objekts, siehe [SubjectPick]); sie läuft für die Messung mit, seltener als die Verfolgung,
+     * und fällt bei Hitze zuerst weg.
      */
-    fun depthEvery(thermalStatus: Int): Int = when {
-        thermalStatus >= 4 -> 0
-        thermalStatus >= 3 -> 4
-        else -> 1
+    fun depthEvery(level: Int): Int = when {
+        level >= 3 -> 0
+        level >= 2 -> 6
+        level >= 1 -> 4
+        else -> 3
     }
+
+    /** Ab dieser Wärmestufe (Notfall) beendet die App einen laufenden Test selbst, bevor das System eingreift. */
+    const val EMERGENCY_STATUS = 5
+
+    /** Ab dieser Akkutemperatur (°C) beendet die App einen laufenden Test selbst; in Stufe 2b lief es bei 42 °C noch. */
+    const val MAX_BATTERY_C = 44.0
+
+    /**
+     * Zu heiß, um weiterzumachen: Wärmestufe ab „Notfall“ ([EMERGENCY_STATUS]) oder der Akku ab
+     * [MAX_BATTERY_C]. Ohne Akkutemperatur (NaN) zählt nur die Wärmestufe.
+     */
+    fun tooHot(status: Int, batteryC: Double): Boolean =
+        status >= EMERGENCY_STATUS || (!batteryC.isNaN() && batteryC >= MAX_BATTERY_C)
+
+    /**
+     * Zieltemperatur des Akkus vor dem Dauertest: 3 °C über dem Start des Schnelltests, aber
+     * zwischen 31 und 34 °C (ohne Wert 33 °C). So beginnt jeder Dauertest ähnlich kühl.
+     */
+    fun coolTarget(quickStartC: Double): Double = if (quickStartC.isNaN()) 33.0 else (quickStartC + 3.0).coerceIn(31.0, 34.0)
+
+    /** Abgekühlt: Wärmestufe „keine“ und Akku höchstens [targetC] (ohne Temperatur zählt nur die Stufe). */
+    fun isCool(stage: String, tempC: Double, targetC: Double): Boolean = stage == "keine" && (tempC.isNaN() || tempC <= targetC)
 
     /**
      * Stärke der Unschärfe nach dem Alter der nächsten KI-Maske: voll bis 0,4 s, dann gleichmäßig
